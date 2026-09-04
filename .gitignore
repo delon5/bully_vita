@@ -6,3 +6,4 @@ build/*
 *.bin
 *.out
 *.o
+tests/out/

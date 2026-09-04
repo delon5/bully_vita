@@ -81,6 +81,7 @@ typedef struct {
   uint32_t serial;
   uint32_t backup_offset; // where its records live in the cache file
   uint32_t backup_bytes; // how many bytes of records it has
+  uint32_t backup_seq; // queue position its last record was staged at
   int32_t min_filter; // the game's last glTexParameteri, clobbered while evicted
   uint8_t backup_bucket;
   uint8_t levels;
@@ -178,10 +179,11 @@ static TextureInfo *texture_info(GLuint id) {
 static int is_restorable(const TextureInfo *info) {
   if (!backup_ready || info->unbacked || info->levels == 0)
     return 0;
-  // Everything still queued is by definition not on the card yet. Records are
-  // written in the order they were staged, so a texture is safe to drop once the
-  // writer has consumed everything up to and including its own records.
-  return 1;
+  // Anything still sitting in the queue has not reached the card yet, and
+  // dropping a texture whose copy is not written is how you lose it. Records go
+  // out in the order they were staged, so a texture is safe once the writer has
+  // consumed past the position its last one took.
+  return (int32_t)(__atomic_load_n(&queue_tail, __ATOMIC_ACQUIRE) - info->backup_seq) >= 0;
 }
 
 /*
@@ -444,6 +446,7 @@ static int backup_stage(TextureInfo *info, GLuint id, GLint level, GLsizei width
 
   info->backup_bytes += sizeof(BackupRecord) + size;
   info->levels++;
+  info->backup_seq = head + 1;
   queued_bytes += size;
 
   __atomic_store_n(&queue_head, head + 1, __ATOMIC_RELEASE);

@@ -52,6 +52,11 @@ jobs:
           git -C vitaGL checkout --detach "$VITAGL_REV"
           make -C vitaGL SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 -j"$(nproc)" install
 
+      # Runs before the vpk so a logic regression fails fast, and after vitaGL
+      # so the tests see the same headers the vpk is built against.
+      - name: Run texture cache tests
+        run: make -C tests check
+
       - name: Build SceLibcBridge stubs
         run: make -C libc_bridge install
 
