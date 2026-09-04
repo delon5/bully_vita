@@ -41,8 +41,9 @@ target_link_libraries(Bully
   openal
   vitaGL
   vitashark
-  # vitaShaRK now reaches into the ShaccCg extension library, which patches the
-  # ShaccCg module through taiHEN
+  # vitaShaRK references these to patch the ShaccCg module through taiHEN. The
+  # loader disables the runtime shader compiler so none of it ever runs, but the
+  # symbols still have to resolve.
   SceShaccCgExt
   taihen_stub
   stdc++

@@ -98,14 +98,12 @@ void mem_free(void *p, void *ptr) {
   free(ptr);
 }
 
-// sceAvPlayer needs physically contiguous buffers. vitaGL used to call this pool
-// VGL_MEM_SLOW; same pool, newer name.
 void *gpu_alloc(void *p, uint32_t align, uint32_t size) {
   if (align < FB_ALIGNMENT) {
     align = FB_ALIGNMENT;
   }
   size = ALIGN_MEM(size, align);
-  return vglAlloc(size, VGL_MEM_PHYCONT);
+  return vglAlloc(size, VGL_MEM_SLOW);
 }
 
 void gpu_free(void *p, void *ptr) {

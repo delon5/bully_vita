@@ -965,9 +965,10 @@ int main(int argc, char *argv[]) {
 
   texture_cache_init();
 
-  // No vglEnableRuntimeShaderCompiler call: vitaGL now only starts the runtime
-  // shader compiler when something actually needs compiling, and this port feeds
-  // it precompiled .gxp binaries through glShaderBinary instead.
+  // This must stay. The game's shaders are supplied as precompiled .gxp through
+  // glShaderBinary, and without this vitaGL loads SceShaccCg and taiHEN-patches
+  // it during vglInit, which most people have no reason to have installed.
+  vglEnableRuntimeShaderCompiler(GL_FALSE);
   vglSetupGarbageCollector(127, 0x20000);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
 

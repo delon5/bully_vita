@@ -16,11 +16,12 @@ jobs:
       # toolchain and package set for exactly this; the stock hard-float one
       # cannot link these objects at all.
       VITASDK_CHANNEL: nightly-softfp
-      # Pinned so a build that passed keeps passing. vitaGL in particular moves
-      # quickly and has already renamed things this loader uses. To take a newer
-      # one, bump these and fix whatever it breaks in the same commit.
-      VITAGL_REV: cd3791e29ff7f1c0ab349f12c7231f4871ce6a75
-      VITASHARK_REV: df24065e65098b2d1ac533760109ad4367573f28
+      # The last vitaGL that still has vglEnableRuntimeShaderCompiler. After it,
+      # vitaGL always starts the runtime shader compiler during vglInit, which
+      # loads SceShaccCg and patches it through taiHEN -- this port supplies
+      # precompiled .gxp instead and must not go anywhere near that. Do not bump
+      # this without a way to keep the compiler switched off.
+      VITAGL_REV: 5204a96097c1c653c5357cf896ab989b737b9808
 
     steps:
       - uses: actions/checkout@v4
@@ -34,23 +35,21 @@ jobs:
           echo "$HOME/vitasdk/bin" >> "$GITHUB_PATH"
 
       - name: Install prebuilt dependencies
-        run: VDPM_NONINTERACTIVE=1 vdpm install libmathneon mpg123 openal-soft kubridge taihen SceShaccCgExt
+        run: VDPM_NONINTERACTIVE=1 vdpm install libmathneon mpg123 openal-soft kubridge taihen SceShaccCgExt vitaShaRK
 
-      # vitaGL needs a newer vitaShaRK than the published package, and both have
-      # to be built here anyway: the port depends on vitaGL compile-time options
-      # (unpure textures, phycont on demand) that the prebuilt package does not
-      # set.
-      - name: Build vitaShaRK
-        run: |
-          git clone https://github.com/Rinnegatamante/vitaShaRK
-          git -C vitaShaRK checkout --detach "$VITASHARK_REV"
-          make -C vitaShaRK SOFTFP_ABI=1 install
-
+      # Built from source rather than taken from the package set, because the
+      # port depends on compile-time options (unpure textures, phycont on
+      # demand) the published package does not set. The overridden CC demotes
+      # two diagnostics GCC 14 promoted to errors: this is 2022 code that was
+      # written and tested under the older default, so demoting them preserves
+      # its behaviour rather than changing it.
       - name: Build vitaGL
         run: |
           git clone https://github.com/Rinnegatamante/vitaGL
           git -C vitaGL checkout --detach "$VITAGL_REV"
-          make -C vitaGL SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 -j"$(nproc)" install
+          make -C vitaGL \
+            CC="arm-vita-eabi-gcc -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration" \
+            SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 -j"$(nproc)" install
 
       # Runs before the vpk so a logic regression fails fast, and after vitaGL
       # so the tests see the same headers the vpk is built against.

@@ -56,19 +56,27 @@ export PATH="$VITASDK/bin:$PATH"
 Most dependencies are then a one-liner:
 
 ```bash
-vdpm install libmathneon mpg123 openal-soft kubridge taihen SceShaccCgExt
+vdpm install libmathneon mpg123 openal-soft kubridge taihen SceShaccCgExt vitaShaRK
 ```
 
-`vitaShaRK` and `vitaGL` have to be built from source, because the port depends
-on vitaGL compile-time options the published package does not set:
+`vitaGL` has to be built from source, because the port depends on compile-time
+options the published package does not set, and it has to be **this revision**:
 
 ```bash
-git clone https://github.com/Rinnegatamante/vitaShaRK
-make -C vitaShaRK SOFTFP_ABI=1 install
-
 git clone https://github.com/Rinnegatamante/vitaGL
-make -C vitaGL SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 install
+git -C vitaGL checkout --detach 5204a96097c1c653c5357cf896ab989b737b9808
+make -C vitaGL \
+  CC="arm-vita-eabi-gcc -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration" \
+  SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 install
 ```
+
+That is the last vitaGL with `vglEnableRuntimeShaderCompiler`. Every revision
+after it starts the runtime shader compiler during `vglInit`, which loads
+`SceShaccCg` and patches it through taiHEN. This port supplies precompiled
+`.gxp` shaders and must not go near that, so do not take a newer vitaGL without
+a way to keep the compiler switched off. The overridden `CC` demotes two
+diagnostics GCC 14 turned into errors; this is 2022 code written under the older
+default, so demoting them preserves its behaviour rather than changing it.
 
 Do not turn on vitaGL's `HAVE_TEXTURE_CACHE` or `TEXTURE_UPLOADS_SPEEDHACK`.
 The loader does its own texture eviction and both of those change the ownership
@@ -85,9 +93,12 @@ cmake --build build
 The result is `build/Bully.vpk`.
 
 [`.github/workflows/build.yml`](.github/workflows/build.yml) runs exactly these
-steps on every push, and pins the vitaGL and vitaShaRK revisions it was last
-verified against. If you take a newer vitaGL, bump the pin there in the same
-commit as whatever it breaks.
+steps on every push and pins the same vitaGL revision.
+
+If the game misbehaves and you want to rule the texture cache out, create an
+empty file at `ux0:data/Bully/no_texcache`. The loader then leaves the game's
+texture handling exactly as it was, with no tracking, no eviction and no cache
+file. Delete it to turn the cache back on; no rebuild either way.
 
 ## Credits
 

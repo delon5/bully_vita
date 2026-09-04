@@ -14,6 +14,14 @@
 #endif
 #define MEMORY_VITAGL_THRESHOLD_MB 8
 
+// Create this file to turn the texture cache off: nothing is tracked, nothing
+// is evicted and no backing store is opened, leaving the game's texture
+// handling exactly as it was. It is a runtime switch rather than a build option
+// so the binary is identical either way, which matters both for telling a
+// problem in here apart from a problem elsewhere and because changing the size
+// of the loader can upset how vita-elf-create lays out its segments.
+#define TEXTURE_CACHE_DISABLE_PATH DATA_PATH "/" "no_texcache"
+
 // How much texture data the game is allowed to keep resident. The Android
 // build never evicts anything, so this is what keeps it inside what vitaGL can
 // hand out on a Vita (128MB of CDRAM plus whatever is left of main RAM once the

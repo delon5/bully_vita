@@ -124,6 +124,7 @@ static SceUID backup_fd = -1;
 static SceUID backup_sema = -1;
 static uint8_t *restore_scratch;
 static int backup_ready;
+static int cache_enabled = 1;
 
 // Cache file allocator.
 static uint32_t file_cursor;
@@ -306,6 +307,13 @@ static int backup_thread(SceSize args, void *argp) {
 }
 
 void texture_cache_init(void) {
+  SceIoStat stat;
+  cache_enabled = sceIoGetstat(TEXTURE_CACHE_DISABLE_PATH, &stat) < 0;
+  if (!cache_enabled) {
+    debugPrintf("texture cache: disabled by %s\n", TEXTURE_CACHE_DISABLE_PATH);
+    return;
+  }
+
   for (GLuint id = 0; id < MAX_TEXTURES; id++)
     textures[id].min_filter = GL_LINEAR;
 
@@ -664,6 +672,9 @@ static int evict_textures(size_t target_bytes, uint32_t min_idle_frames, int los
 }
 
 void texture_cache_tick(void) {
+  if (!cache_enabled)
+    return;
+
   frame_counter++;
 
   // A texture stays bound to its unit until something displaces it, so one the
@@ -719,7 +730,7 @@ void glActiveTextureHook(GLenum texture) {
 void glBindTextureHook(GLenum target, GLuint texture) {
   bound_textures[active_unit] = texture;
 
-  TextureInfo *info = texture_info(texture);
+  TextureInfo *info = cache_enabled ? texture_info(texture) : NULL;
   if (info && info->evicted && target == GL_TEXTURE_2D) {
     // The game is about to draw with a texture we dropped. Put it back.
     if (!is_restorable(info) || !restore_texture(texture))
@@ -756,6 +767,9 @@ void glFramebufferTexture2DHook(GLenum target, GLenum attachment, GLenum textarg
 static void upload_finished(GLenum target, GLint level, GLsizei width, GLsizei height,
                             uint32_t source_bytes, uint32_t resident_bytes, GLint internalformat,
                             GLenum format, GLenum type, int compressed, const void *data) {
+  if (!cache_enabled)
+    return;
+
   // Cube map faces go through the same entry points but are six buffers behind
   // one name. Tracking one as if it were a flat texture would let us free all
   // six and "restore" a single face as a 2D texture, so leave them alone.

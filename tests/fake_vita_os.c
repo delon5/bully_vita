@@ -69,6 +69,13 @@ SceOff sceIoLseek(SceUID fd, SceOff offset, int whence) { return lseek(fd, offse
 int sceIoMkdir(const char *dir, SceMode mode) { return mkdir(host_path(dir), 0777); }
 int sceIoRemove(const char *file) { return unlink(host_path(file)); }
 
+// The cache checks for a file that turns it off. Tests want it on, so report
+// that it is not there -- unless a test deliberately creates it.
+int sceIoGetstat(const char *file, SceIoStat *out) {
+  struct stat probe;
+  return stat(host_path(file), &probe) == 0 ? 0 : -1;
+}
+
 #define MAX_SEMA 8
 static sem_t semas[MAX_SEMA];
 static int sema_count;
