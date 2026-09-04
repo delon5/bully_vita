@@ -368,6 +368,7 @@ int BullyApplication__OrigContinue(void *this, int a2, int a3, int a4) {
 }
 
 int Application__Exit(void *this) {
+  texture_cache_shutdown();
   return sceKernelExitProcess(0);
 }
 
@@ -736,8 +737,8 @@ static so_default_dynlib default_dynlib[] = {
   { "glStencilMask", (uintptr_t)&glStencilMask },
   { "glStencilOp", (uintptr_t)&glStencilOp },
   { "glTexImage2D", (uintptr_t)&glTexImage2DHook },
-  { "glTexParameterf", (uintptr_t)&glTexParameterf },
-  { "glTexParameteri", (uintptr_t)&glTexParameteri },
+  { "glTexParameterf", (uintptr_t)&glTexParameterfHook },
+  { "glTexParameteri", (uintptr_t)&glTexParameteriHook },
   { "glTexSubImage2D", (uintptr_t)&glTexSubImage2DHook },
   { "glUniform1i", (uintptr_t)&glUniform1i },
   { "glUniform4fv", (uintptr_t)&glUniform4fv },
@@ -956,6 +957,8 @@ int main(int argc, char *argv[]) {
 
   if (fios_init() < 0)
     fatal_error("Error could not initialize fios.");
+
+  texture_cache_init();
 
   vglEnableRuntimeShaderCompiler(GL_FALSE);
   vglSetupGarbageCollector(127, 0x20000);

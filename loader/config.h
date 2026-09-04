@@ -30,6 +30,30 @@
 // memory does not turn into a visible hitch.
 #define TEXTURE_EVICTIONS_PER_FRAME 64
 
+// Where the source bytes of uploaded textures are kept so that an evicted one
+// can be uploaded again when the game draws with it. Truncated on every boot,
+// since texture names are handed out afresh each run.
+#define TEXTURE_BACKUP_PATH DATA_PATH "/" "texcache.bin"
+// Ceiling on the cache file. Past this we stop taking copies; the textures that
+// miss out simply stay resident instead of being evicted.
+#define TEXTURE_BACKUP_MAX_MB 768
+// Largest texture, all mipmap levels together, we are willing to copy. This is
+// also the size of the buffer we read one back through.
+#define TEXTURE_BACKUP_MAX_KB 4096
+// How much waiting-to-be-written texture data may sit in memory. If a streaming
+// burst outruns the card we skip copies rather than stall the render thread.
+#define TEXTURE_BACKUP_STAGING_KB 4096
+// The writer thread only ever touches the memory card, so it runs below every
+// thread the game creates (which sit at 64-65) and shares the streaming core.
+// How long an upload may wait for the writer to make room. While we are far
+// from the budget a missed copy costs nothing, so we do not wait at all; the
+// longer bound only applies once we are over budget, where stalling briefly
+// beats losing the ability to free the texture at all.
+#define TEXTURE_BACKUP_WAIT_MS 8
+#define TEXTURE_BACKUP_WAIT_MS_MAX 120
+#define TEXTURE_BACKUP_THREAD_PRIORITY 0x7F
+#define TEXTURE_BACKUP_THREAD_AFFINITY 0x40000
+
 #define DATA_PATH "ux0:data/Bully"
 #define SO_PATH DATA_PATH "/" "libBully.so"
 #define CONFIG_PATH DATA_PATH "/" "config.txt"
