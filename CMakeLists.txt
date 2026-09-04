@@ -31,13 +31,23 @@ add_executable(Bully
 
 target_link_libraries(Bully
   -Wl,--whole-archive pthread -Wl,--no-whole-archive
-  stdc++
-  m
+  # These depend on each other in both directions -- vitaGL calls into mathneon
+  # and libstdc++, openal calls into libm -- and a linker only resolves an
+  # archive's undefined symbols from archives listed after it. Group them so it
+  # iterates until everything is resolved instead of relying on one true order.
+  -Wl,--start-group
   mathneon
   mpg123
   openal
   vitaGL
   vitashark
+  # vitaShaRK now reaches into the ShaccCg extension library, which patches the
+  # ShaccCg module through taiHEN
+  SceShaccCgExt
+  taihen_stub
+  stdc++
+  m
+  -Wl,--end-group
   kubridge_stub
   SceAppMgr_stub
   SceAppUtil_stub

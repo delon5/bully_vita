@@ -8,6 +8,7 @@
 
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
@@ -17,7 +18,6 @@
 #include <psp2/power.h>
 #include <psp2/rtc.h>
 #include <psp2/touch.h>
-#include <taihen.h>
 #include <kubridge.h>
 #include <vitashark.h>
 #include <vitaGL.h>
@@ -144,9 +144,14 @@ int ProcessEvents(void) {
   return 0; // 1 is exit!
 }
 
-#define CLOCK_MONOTONIC 0
-int clock_gettime(int clk_id, struct timespec *tp) {
-  if (clk_id == CLOCK_MONOTONIC) {
+// The game is an Android binary and passes Bionic's clock ids, which do not
+// match newlib's, so match on the raw numbers this port has always used rather
+// than on whatever CLOCK_MONOTONIC happens to mean to the host headers.
+#define ANDROID_CLOCK_ID_0 0
+#define ANDROID_CLOCK_ID_1 1
+
+int clock_gettime(clockid_t clk_id, struct timespec *tp) {
+  if (clk_id == ANDROID_CLOCK_ID_0) {
     SceKernelSysClock ticks;
     sceKernelGetProcessTime(&ticks);
 
@@ -154,7 +159,7 @@ int clock_gettime(int clk_id, struct timespec *tp) {
     tp->tv_nsec = (ticks * 1000) % (1000 * 1000 * 1000);
 
     return 0;
-  } else if (clk_id == CLOCK_REALTIME) {
+  } else if (clk_id == ANDROID_CLOCK_ID_1) {
     time_t seconds;
     SceDateTime time;
     sceRtcGetCurrentClockLocalTime(&time);
@@ -960,7 +965,9 @@ int main(int argc, char *argv[]) {
 
   texture_cache_init();
 
-  vglEnableRuntimeShaderCompiler(GL_FALSE);
+  // No vglEnableRuntimeShaderCompiler call: vitaGL now only starts the runtime
+  // shader compiler when something actually needs compiling, and this port feeds
+  // it precompiled .gxp binaries through glShaderBinary instead.
   vglSetupGarbageCollector(127, 0x20000);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
 

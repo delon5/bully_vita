@@ -40,70 +40,54 @@ In order to properly install the game, you'll have to follow these steps precise
 
 ## Build Instructions (For Developers)
 
-In order to build the loader, you'll need a [vitasdk](https://github.com/vitasdk) build fully compiled with softfp usage.  
-You can find a precompiled version here: https://github.com/vitasdk/buildscripts/actions/runs/1102643776.  
-Additionally, you'll need these libraries to be compiled as well with `-mfloat-abi=softfp` added to their CFLAGS:
+Every object in the build has to use the soft-float calling convention, because
+the loader calls back and forth into the game's Android `.so`. VitaSDK publishes
+a toolchain and package set for exactly this, so this no longer means building
+the SDK yourself:
 
-- [mpg123](http://www.mpg123.de/download/mpg123-1.25.10.tar.bz2)
+```bash
+curl -sSLO https://raw.githubusercontent.com/vitasdk/vdpm/master/bootstrap-vitasdk.sh
+chmod +x bootstrap-vitasdk.sh
+VITASDK_CHANNEL=nightly-softfp ./bootstrap-vitasdk.sh --install-dir "$HOME/vitasdk"
+export VITASDK="$HOME/vitasdk"
+export PATH="$VITASDK/bin:$PATH"
+```
 
-  - Apply [mpg123.patch](https://github.com/vitasdk/packages/blob/master/mpg123/mpg123.patch) using `patch -Np0 -i mpg123.patch`.
+Most dependencies are then a one-liner:
 
-  - ```bash
-    autoreconf -fi
-    CFLAGS="-DPSP2 -mfloat-abi=softfp" ./configure --host=arm-vita-eabi --prefix=$VITASDK/arm-vita-eabi --disable-shared --enable-static --enable-fifo=no --enable-ipv6=no --enable-network=no --enable-int-quality=no --with-cpu=neon --with-default-audio=dummy --with-optimization=3
-    make install
-    ```
+```bash
+vdpm install libmathneon mpg123 openal-soft kubridge taihen SceShaccCgExt
+```
 
-- [openal-soft](https://github.com/isage/openal-soft/tree/vita-1.19.1)
+`vitaShaRK` and `vitaGL` have to be built from source, because the port depends
+on vitaGL compile-time options the published package does not set:
 
-  - ```bash
-    cd build
-    cmake -DCMAKE_TOOLCHAIN_FILE=${VITASDK}/share/vita.toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-mfloat-abi=softfp .. && make install
-    ```
+```bash
+git clone https://github.com/Rinnegatamante/vitaShaRK
+make -C vitaShaRK SOFTFP_ABI=1 install
 
-- [libmathneon](https://github.com/Rinnegatamante/math-neon)
+git clone https://github.com/Rinnegatamante/vitaGL
+make -C vitaGL SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 install
+```
 
-  - ```bash
-    make install
-    ```
+Do not turn on vitaGL's `HAVE_TEXTURE_CACHE` or `TEXTURE_UPLOADS_SPEEDHACK`.
+The loader does its own texture eviction and both of those change the ownership
+of texture memory underneath it.
 
-- [vitaShaRK](https://github.com/Rinnegatamante/vitaShaRK)
-
-  - ```bash
-    make install
-    ```
-
-- [imgui-vita](https://github.com/Rinnegatamante/imgui-vita)
-
-  - ```bash
-    make install
-    ```
-
-- [kubridge](https://github.com/TheOfficialFloW/kubridge)
-
-  - ```bash
-    mkdir build && cd build
-    cmake .. && make install
-    ```
-
-- [vitaGL](https://github.com/Rinnegatamante/vitaGL)
-
-  - ````bash
-    make SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 install
-    ````
-
-Finally, in the folder of `bully_vita`, install SceLibc stubs using:
+Finally, install the SceLibc stubs and build:
 
 ```bash
 make -C libc_bridge install
+cmake -B build -S .
+cmake --build build
 ```
 
-After all these requirements are met, you can compile the loader with the following commands:
+The result is `build/Bully.vpk`.
 
-```bash
-mkdir build && cd build
-cmake .. && make
-```
+[`.github/workflows/build.yml`](.github/workflows/build.yml) runs exactly these
+steps on every push, and pins the vitaGL and vitaShaRK revisions it was last
+verified against. If you take a newer vitaGL, bump the pin there in the same
+commit as whatever it breaks.
 
 ## Credits
 

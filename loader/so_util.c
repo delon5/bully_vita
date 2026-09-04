@@ -11,6 +11,13 @@
 #include <psp2/kernel/sysmem.h>
 #include <kubridge.h>
 
+// kuKernelAllocMemBlock takes kernel memblock types, and vitasdk now keeps this
+// one in the kernel-side headers, which cannot be included from user code here
+// without dragging in types that clash with kubridge's own.
+#ifndef SCE_KERNEL_MEMBLOCK_TYPE_USER_RX
+#define SCE_KERNEL_MEMBLOCK_TYPE_USER_RX (0x0C20D050)
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
