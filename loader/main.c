@@ -97,6 +97,24 @@ int debugPrintf(char *text, ...) {
   return 0;
 }
 
+int traceLog(char *text, ...) {
+#ifdef LOADER_TRACE
+  va_list list;
+  char string[512];
+
+  va_start(list, text);
+  vsnprintf(string, sizeof(string), text, list);
+  va_end(list);
+
+  SceUID fd = sceIoOpen("ux0:data/bully_trace.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+  if (fd >= 0) {
+    sceIoWrite(fd, string, strlen(string));
+    sceIoClose(fd);
+  }
+#endif
+  return 0;
+}
+
 int __android_log_assert(const char *cond, const char *tag, const char *fmt, ...) {
   return 0;
 }
@@ -262,6 +280,7 @@ void *OS_ThreadLaunch(int (* func)(), void *arg, int cpu, char *name, int unused
     }
   }
 
+  traceLog("thread: %s starting (priority %d, affinity 0x%x)\n", name, vita_priority, vita_affinity);
   SceUID thid = sceKernelCreateThread(name, (SceKernelThreadEntry)thread_stub, vita_priority, 128 * 1024, 0, vita_affinity, NULL);
   if (thid >= 0) {
     char *out = malloc(0x48);
@@ -942,38 +961,48 @@ int main(int argc, char *argv[]) {
     _oal_thread_affinity = 0x10000;
   }
 
+  traceLog("boot: reached kubridge check\n");
   if (check_kubridge() < 0)
     fatal_error("Error kubridge.skprx is not installed.");
 
+  traceLog("boot: loading %s\n", SO_PATH);
   if (so_load(&bully_mod, SO_PATH, LOAD_ADDRESS) < 0)
     fatal_error("Error could not load %s.", SO_PATH);
 
   stderr_fake = stderr;
   stdin_fake = stdin;
+  traceLog("boot: so_load ok, relocating\n");
   so_relocate(&bully_mod);
   so_resolve(&bully_mod, default_dynlib, sizeof(default_dynlib), 0);
 
+  traceLog("boot: resolved imports, patching\n");
   patch_openal();
   patch_game();
   patch_movie();
   so_flush_caches(&bully_mod);
 
+  traceLog("boot: patched, running .so initializers\n");
   so_initialize(&bully_mod);
 
+  traceLog("boot: initializers done, starting fios\n");
   if (fios_init() < 0)
     fatal_error("Error could not initialize fios.");
 
+  traceLog("boot: fios ok, starting texture cache\n");
   texture_cache_init();
 
   // This must stay. The game's shaders are supplied as precompiled .gxp through
   // glShaderBinary, and without this vitaGL loads SceShaccCg and taiHEN-patches
   // it during vglInit, which most people have no reason to have installed.
+  traceLog("boot: texture cache done, initialising vitaGL\n");
   vglEnableRuntimeShaderCompiler(GL_FALSE);
   vglSetupGarbageCollector(127, 0x20000);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
 
+  traceLog("boot: vitaGL up, setting up movie player\n");
   movie_setup_player();
 
+  traceLog("boot: handing over to the game\n");
   jni_load();
 
   return 0;

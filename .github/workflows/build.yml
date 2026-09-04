@@ -16,12 +16,13 @@ jobs:
       # toolchain and package set for exactly this; the stock hard-float one
       # cannot link these objects at all.
       VITASDK_CHANNEL: nightly-softfp
-      # The last vitaGL that still has vglEnableRuntimeShaderCompiler. After it,
-      # vitaGL always starts the runtime shader compiler during vglInit, which
-      # loads SceShaccCg and patches it through taiHEN -- this port supplies
-      # precompiled .gxp instead and must not go anywhere near that. Do not bump
-      # this without a way to keep the compiler switched off.
-      VITAGL_REV: 5204a96097c1c653c5357cf896ab989b737b9808
+      # The revision this port was written and released against. Two things
+      # since then break it outright: glShaderBinary now expects vitaGL's own
+      # serialized shader-cache format rather than a raw GXP, which is what the
+      # .gxp files in gamefiles are; and vglEnableRuntimeShaderCompiler is gone,
+      # so vglInit always loads SceShaccCg and patches it through taiHEN. Do not
+      # bump this without checking both.
+      VITAGL_REV: 4e4f5b6ad0bf43754935250a1707fad67eb4e450
 
     steps:
       - uses: actions/checkout@v4
@@ -48,7 +49,7 @@ jobs:
           git clone https://github.com/Rinnegatamante/vitaGL
           git -C vitaGL checkout --detach "$VITAGL_REV"
           make -C vitaGL \
-            CC="arm-vita-eabi-gcc -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration" \
+            CC="arm-vita-eabi-gcc -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion" \
             SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 -j"$(nproc)" install
 
       # Runs before the vpk so a logic regression fails fast, and after vitaGL

@@ -64,18 +64,25 @@ options the published package does not set, and it has to be **this revision**:
 
 ```bash
 git clone https://github.com/Rinnegatamante/vitaGL
-git -C vitaGL checkout --detach 5204a96097c1c653c5357cf896ab989b737b9808
+git -C vitaGL checkout --detach 4e4f5b6ad0bf43754935250a1707fad67eb4e450
 make -C vitaGL \
-  CC="arm-vita-eabi-gcc -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration" \
+  CC="arm-vita-eabi-gcc -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion" \
   SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 install
 ```
 
-That is the last vitaGL with `vglEnableRuntimeShaderCompiler`. Every revision
-after it starts the runtime shader compiler during `vglInit`, which loads
-`SceShaccCg` and patches it through taiHEN. This port supplies precompiled
-`.gxp` shaders and must not go near that, so do not take a newer vitaGL without
-a way to keep the compiler switched off. The overridden `CC` demotes two
-diagnostics GCC 14 turned into errors; this is 2022 code written under the older
+That is the revision this port was written and released against, and two later
+changes break it outright:
+
+- `glShaderBinary` now expects vitaGL's own serialized shader-cache format
+  instead of a raw GXP. The `.gxp` files in `gamefiles.zip` are raw GXPs, so a
+  newer vitaGL reads one as a cache blob, takes a garbage length out of it and
+  allocates on that. This is what made the game crash on launch.
+- `vglEnableRuntimeShaderCompiler` was removed, so `vglInit` always starts the
+  runtime shader compiler, which loads `SceShaccCg` and patches it through
+  taiHEN. This port supplies precompiled shaders and has no reason to.
+
+Do not take a newer vitaGL without checking both. The overridden `CC` demotes
+diagnostics GCC 14 turned into errors; this is 2021 code written under the older
 default, so demoting them preserves its behaviour rather than changing it.
 
 Do not turn on vitaGL's `HAVE_TEXTURE_CACHE` or `TEXTURE_UPLOADS_SPEEDHACK`.

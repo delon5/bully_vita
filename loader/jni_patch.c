@@ -208,13 +208,20 @@ float GetGamepadAxis(int port, int axis) {
   return 0.0f;
 }
 
+static int frames_swapped;
+
 int swapBuffers(void) {
+  if (frames_swapped < 3 || frames_swapped == 60 || frames_swapped == 600)
+    traceLog("frame: %d presented\n", frames_swapped);
+  frames_swapped++;
+
   texture_cache_tick();
   vglSwapBuffers(GL_FALSE);
   return 1;
 }
 
 int InitEGLAndGLES2(void) {
+  traceLog("game: InitEGLAndGLES2\n");
   vglWaitVblankStart(GL_FALSE);
   return 1;
 }

@@ -7,6 +7,7 @@
 extern so_module bully_mod;
 
 int debugPrintf(char *text, ...);
+int traceLog(char *text, ...);
 
 int ret0();
 

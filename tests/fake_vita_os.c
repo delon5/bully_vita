@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 int debugPrintf(char *text, ...) { (void)text; return 0; }
+int traceLog(char *text, ...) { (void)text; return 0; }
 
 // Set by a test to hold the writer thread inside its write, so that "this copy
 // has not reached the card yet" is a state the test can actually observe.

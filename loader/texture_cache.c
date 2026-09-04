@@ -310,7 +310,7 @@ void texture_cache_init(void) {
   SceIoStat stat;
   cache_enabled = sceIoGetstat(TEXTURE_CACHE_DISABLE_PATH, &stat) < 0;
   if (!cache_enabled) {
-    debugPrintf("texture cache: disabled by %s\n", TEXTURE_CACHE_DISABLE_PATH);
+    traceLog("texture cache: disabled by %s\n", TEXTURE_CACHE_DISABLE_PATH);
     return;
   }
 
@@ -350,7 +350,7 @@ void texture_cache_init(void) {
   }
 
   backup_ready = 1;
-  debugPrintf("texture cache: backing store at %s\n", TEXTURE_BACKUP_PATH);
+  traceLog("texture cache: backing store open at %s\n", TEXTURE_BACKUP_PATH);
 }
 
 void texture_cache_shutdown(void) {
