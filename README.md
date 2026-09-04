@@ -35,7 +35,7 @@ In order to properly install the game, you'll have to follow these steps precise
 
 ## Notice
 
-- The official game does not free unused textures (as modern smartphones have more RAM than the PS Vita) and as such, the game will crash after a long gameplay.
+- The official game does not free unused textures (as modern smartphones have more RAM than the PS Vita), which used to make the game crash after a long gameplay session. The loader now keeps track of the textures the game uploads and drops the ones it has stopped drawing with once they no longer fit in the *PS Vita*'s video memory. A texture that gets dropped and is then needed again without the game reloading it will show up white until the game uploads it anew.
 - If the game crashes, and there are files available in `ux0:data/Bully/glsl`, please send them to us. If there are too many, then it is because you forgot to install `gamefiles.zip`, in which case do not send us the files.
 
 ## Build Instructions (For Developers)

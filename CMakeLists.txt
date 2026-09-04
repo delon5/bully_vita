@@ -26,6 +26,7 @@ add_executable(Bully
   loader/movie_patch.c
   loader/openal_patch.c
   loader/sha1.c
+  loader/texture_cache.c
 )
 
 target_link_libraries(Bully

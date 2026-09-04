@@ -18,6 +18,7 @@
 #include "main.h"
 #include "config.h"
 #include "so_util.h"
+#include "texture_cache.h"
 
 enum MethodIDs {
   UNKNOWN = 0,
@@ -208,6 +209,7 @@ float GetGamepadAxis(int port, int axis) {
 }
 
 int swapBuffers(void) {
+  texture_cache_tick();
   vglSwapBuffers(GL_FALSE);
   return 1;
 }

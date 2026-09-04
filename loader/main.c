@@ -49,6 +49,7 @@
 #include "jni_patch.h"
 #include "movie_patch.h"
 #include "openal_patch.h"
+#include "texture_cache.h"
 
 #include "sha1.h"
 
@@ -545,17 +546,6 @@ GLint glGetAttribLocationHook(GLuint prog, const GLchar *name) {
   return glGetAttribLocation(prog, new_name);
 }
 
-void glTexImage2DHook(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *data) {
-  if (level == 0)
-    glTexImage2D(target, level, internalformat, width, height, border, format, type, data);
-}
-
-void glCompressedTexImage2DHook(GLenum target, GLint level, GLenum format, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void * data) {
-  // mips for PVRTC textures break when they're under 1 block in size
-  if (level == 0 || ((width >= 4 && height >= 4) || (format != 0x8C01 && format != 0x8C02)))
-    glCompressedTexImage2D(target, level, format, width, height, border, imageSize, data);
-}
-
 extern void *__aeabi_dcmplt;
 extern void *__aeabi_dmul;
 extern void *__aeabi_dsub;
@@ -683,13 +673,13 @@ static so_default_dynlib default_dynlib[] = {
   { "getenv", (uintptr_t)&getenv },
   // { "gettid", (uintptr_t)&gettid },
 
-  { "glActiveTexture", (uintptr_t)&glActiveTexture },
+  { "glActiveTexture", (uintptr_t)&glActiveTextureHook },
   { "glAttachShader", (uintptr_t)&glAttachShader },
   { "glBindAttribLocation", (uintptr_t)&glBindAttribLocationHook },
   { "glBindBuffer", (uintptr_t)&glBindBuffer },
   { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer },
   { "glBindRenderbuffer", (uintptr_t)&ret0 },
-  { "glBindTexture", (uintptr_t)&glBindTexture },
+  { "glBindTexture", (uintptr_t)&glBindTextureHook },
   { "glBlendFunc", (uintptr_t)&glBlendFunc },
   { "glBlendFuncSeparate", (uintptr_t)&glBlendFuncSeparate },
   { "glBufferData", (uintptr_t)&glBufferData },
@@ -709,7 +699,7 @@ static so_default_dynlib default_dynlib[] = {
   { "glDeleteProgram", (uintptr_t)&glDeleteProgram },
   { "glDeleteRenderbuffers", (uintptr_t)&ret0 },
   { "glDeleteShader", (uintptr_t)&glDeleteShader },
-  { "glDeleteTextures", (uintptr_t)&glDeleteTextures },
+  { "glDeleteTextures", (uintptr_t)&glDeleteTexturesHook },
   { "glDepthFunc", (uintptr_t)&glDepthFunc },
   { "glDepthMask", (uintptr_t)&glDepthMask },
   { "glDisable", (uintptr_t)&glDisable },
@@ -719,12 +709,12 @@ static so_default_dynlib default_dynlib[] = {
   { "glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray },
   { "glFinish", (uintptr_t)&glFinish },
   { "glFramebufferRenderbuffer", (uintptr_t)&ret0 },
-  { "glFramebufferTexture2D", (uintptr_t)&glFramebufferTexture2D },
+  { "glFramebufferTexture2D", (uintptr_t)&glFramebufferTexture2DHook },
   { "glFrontFace", (uintptr_t)&glFrontFace },
   { "glGenBuffers", (uintptr_t)&glGenBuffers },
   { "glGenFramebuffers", (uintptr_t)&glGenFramebuffers },
   { "glGenRenderbuffers", (uintptr_t)&ret0 },
-  { "glGenTextures", (uintptr_t)&glGenTextures },
+  { "glGenTextures", (uintptr_t)&glGenTexturesHook },
   { "glGetAttribLocation", (uintptr_t)&glGetAttribLocationHook },
   { "glGetBooleanv", (uintptr_t)&glGetBooleanv },
   { "glGetError", (uintptr_t)&glGetError },
@@ -748,7 +738,7 @@ static so_default_dynlib default_dynlib[] = {
   { "glTexImage2D", (uintptr_t)&glTexImage2DHook },
   { "glTexParameterf", (uintptr_t)&glTexParameterf },
   { "glTexParameteri", (uintptr_t)&glTexParameteri },
-  { "glTexSubImage2D", (uintptr_t)&glTexSubImage2D },
+  { "glTexSubImage2D", (uintptr_t)&glTexSubImage2DHook },
   { "glUniform1i", (uintptr_t)&glUniform1i },
   { "glUniform4fv", (uintptr_t)&glUniform4fv },
   { "glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv },
