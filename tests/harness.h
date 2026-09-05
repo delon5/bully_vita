@@ -70,14 +70,6 @@ static void wander(const GLuint *ids, int count, int frame_count) {
 
 static void harness_start(size_t driver_memory) {
   fake_reset(driver_memory);
-  // The loader's cache is opt-in on a console, since vitaGL's own one is what
-  // the build uses. These tests are about this cache, so switch it on.
-  const char *base = getenv("TEXCACHE_DIR");
-  char path[512];
-  snprintf(path, sizeof(path), "%s/use_texcache", base ? base : ".");
-  FILE *f = fopen(path, "w");
-  if (f)
-    fclose(f);
   texture_cache_init();
 }
 

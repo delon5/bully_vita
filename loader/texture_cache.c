@@ -231,12 +231,11 @@ static void texture_pin(GLuint id) {
 
 void texture_cache_init(void) {
   SceIoStat stat;
-  cache_enabled = sceIoGetstat(TEXTURE_CACHE_ENABLE_PATH, &stat) >= 0;
+  cache_enabled = sceIoGetstat(TEXTURE_CACHE_DISABLE_PATH, &stat) < 0;
   if (!cache_enabled) {
-    traceLog("texture cache: off, vitaGL's own cache is in use\n");
+    traceLog("texture cache: disabled by %s\n", TEXTURE_CACHE_DISABLE_PATH);
     return;
   }
-  traceLog("texture cache: enabled by %s\n", TEXTURE_CACHE_ENABLE_PATH);
 
   for (GLuint id = 0; id < MAX_TEXTURES; id++)
     textures[id].min_filter = GL_LINEAR;

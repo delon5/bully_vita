@@ -38,19 +38,21 @@
 // texture cache works to.
 #define MEMORY_VITAGL_CIRCULAR_POOL_MB 48
 
-// vitaGL's own texture cache (HAVE_TEXTURE_CACHE, see README) does this job
-// from inside the library, where it owns the texture data outright. It is what
-// the build uses. The loader's own cache below predates that discovery and is
-// off unless this file exists, because it works by intercepting the game's GL
-// calls -- which is both more fragile and, on hardware, what crashed once the
-// game reached actual gameplay.
-#define TEXTURE_CACHE_ENABLE_PATH DATA_PATH "/" "use_texcache"
+// Create this file to turn the loader's texture cache off.
+//
+// vitaGL's own cache (HAVE_TEXTURE_CACHE) is enabled too, but it cannot carry
+// this alone: it only reclaims when a GPU allocation fails, and vitaGL's
+// allocator falls back from CDRAM to RAM to the newlib heap, so an allocation
+// does not fail until everything is gone. On hardware CDRAM reached zero with
+// its sweep never once having run and its folder empty. Reclaiming has to start
+// from a budget, while there is still memory to reclaim into.
+#define TEXTURE_CACHE_DISABLE_PATH DATA_PATH "/" "no_texcache"
 
 // How much texture data the game is allowed to keep resident. The Android
 // build never evicts anything, so this is what keeps it inside what vitaGL can
 // hand out on a Vita (128MB of CDRAM plus whatever is left of main RAM once the
 // game heap above has been carved out).
-#define TEXTURE_BUDGET_MB 128
+#define TEXTURE_BUDGET_MB 64
 // Evict regardless of the budget once vitaGL has less than this much free, so
 // that memory pressure coming from anywhere else does not kill us either.
 #define TEXTURE_RESERVE_MB 32
