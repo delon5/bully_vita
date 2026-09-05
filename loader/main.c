@@ -181,6 +181,8 @@ int OS_ScreenGetWidth(void) {
 // whether the game is still doing work at all, and five numbers on each
 // heartbeat answer that without thousands of lines.
 int trace_files, trace_textures, trace_buffers, trace_clears, trace_draws;
+extern char trace_last_open[128];
+extern int trace_failed_opens;
 #endif
 
 int ProcessEvents(void) {
@@ -189,9 +191,9 @@ int ProcessEvents(void) {
   // that is running but never drawing from one that is not running at all.
   static int events;
   if (events % 600 == 0)
-    traceLog("loop: %d | files %d tex %d buf %d clear %d draw %d | cdram %d KB\n",
-             events, trace_files, trace_textures, trace_buffers, trace_clears, trace_draws,
-             (int)(vglMemFree(VGL_MEM_VRAM) / 1024));
+    traceLog("loop: %d | files %d (%d failed) tex %d buf %d draw %d | last: %s\n",
+             events, trace_files, trace_failed_opens, trace_textures, trace_buffers,
+             trace_draws, trace_last_open);
   events++;
 #endif
   movie_draw_frame();
@@ -630,13 +632,26 @@ void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, con
 // The game goes quiet after the intro movie without linking a program or
 // drawing anything, so log what it opens: the last name before it stops is
 // what it is waiting on.
+char trace_last_open[128];
+int trace_failed_opens;
+
 static FILE *fopen_hook(const char *name, const char *mode) {
-  // Only the first few by name -- after that the counter in the heartbeat is
-  // what matters, since the question is whether the game is still working.
-  if (trace_files < 40)
+  if (trace_files < 20)
     traceLog("file: open %s\n", name ? name : "(null)");
   trace_files++;
-  return sceLibcBridge_fopen(name, mode);
+  if (name)
+    snprintf(trace_last_open, sizeof(trace_last_open), "%s", name);
+
+  FILE *f = sceLibcBridge_fopen(name, mode);
+
+  // The opens that fail are the interesting ones: the game is spinning on
+  // something it cannot find, and the name it keeps asking for is the answer.
+  if (!f) {
+    if (trace_failed_opens < 30)
+      traceLog("file: FAILED %s\n", name ? name : "(null)");
+    trace_failed_opens++;
+  }
+  return f;
 }
 #endif
 
