@@ -2,10 +2,18 @@
 #define __CONFIG_H__
 
 // #define DEBUG
-// Writes a line to ux0:data/bully_trace.txt at each step of startup. Separate
-// from DEBUG on purpose: DEBUG also forwards every one of the game's own log
-// lines, which is thousands of file opens and slow enough to look like a hang.
-// #define LOADER_TRACE
+// Writes a line to ux0:data/bully_trace.txt at each step of startup, and a
+// heartbeat with the memory figures every 600 iterations of the game's main
+// loop. Separate from DEBUG on purpose: DEBUG also forwards every one of the
+// game's own log lines, which is thousands of file opens and slow enough to
+// look like a hang. This is about 230 lines in a full session, which costs
+// nothing.
+//
+// ON DELIBERATELY, and it stays on until the game stops crashing. A crash
+// without a trace is a guess, and guessing is what cost this port a day: the
+// eviction rule that never once fired was invisible until a heartbeat printed
+// "cdram 0 ... ev 0". Turn it off once a session survives.
+#define LOADER_TRACE
 // #define HAVE_RAZOR
 
 #define LOAD_ADDRESS 0x98000000

@@ -124,6 +124,10 @@ static int card_writes_this_frame;
 // Counted for the trace, to tell an eviction that cost a memcpy from one that
 // cost a write.
 static uint32_t ram_evicted_count, card_evicted_count, ram_restored_count;
+// Evictions the cache wanted to make and could not this frame -- the heap tier
+// full and the frame's card write already spent. Reclaiming that is blocked
+// looks identical to reclaiming that is not needed unless this is counted.
+static uint32_t deferred_count;
 
 
 // vglMemFree refuses VGL_MEM_ALL: it is the enum terminator and the wrapper
@@ -333,7 +337,7 @@ void texture_cache_init(void) {
   card_writes_this_frame = 0;
   starved_frames = 0;
   evicted_count = restored_count = restore_failed_count = 0;
-  ram_evicted_count = card_evicted_count = ram_restored_count = 0;
+  ram_evicted_count = card_evicted_count = ram_restored_count = deferred_count = 0;
   memset(pool_start, 0, sizeof(pool_start));
 
   // The store lives next to the game's own files, in the data directory the
@@ -670,6 +674,8 @@ static void evict_texture(GLuint id) {
     // could not get to and the cache would stop reclaiming.
     if (captured == 0)
       info->unbacked = 1;
+    else
+      deferred_count++;
     evicted_count--;
     return;
   }
@@ -764,8 +770,18 @@ void texture_cache_tick(void) {
 
   size_t free_now[VGL_POOLS];
   vitagl_free_per_pool(free_now);
-  if (!pool_start[1]) // the RAM pool is never zero once vitaGL is up
+  if (!pool_start[1]) { // the RAM pool is never zero once vitaGL is up
     vitagl_free_per_pool(pool_start);
+    // Logged once, because every later judgement is made against these and a
+    // trace that does not say what the thresholds were cannot be read.
+    traceLog("texture cache: pools at start cdram %d ram %d phycont %d MB, "
+             "reclaiming below %d / %d / %d MB\n",
+             (int)(pool_start[0] / (1024 * 1024)), (int)(pool_start[1] / (1024 * 1024)),
+             (int)(pool_start[2] / (1024 * 1024)),
+             (int)(pool_start[0] / 100 * TEXTURE_FREE_HEADROOM_PERCENT / (1024 * 1024)),
+             (int)(pool_start[1] / 100 * TEXTURE_FREE_HEADROOM_PERCENT / (1024 * 1024)),
+             (int)(pool_start[2] / 100 * TEXTURE_FREE_HEADROOM_PERCENT / (1024 * 1024)));
+  }
 
   // How far below its share any pool has fallen, added up. A pool is judged
   // against what it started with, not against the total, because they are not
@@ -979,4 +995,5 @@ void texture_cache_stats(TextureCacheStats *out) {
   out->failed = (int)restore_failed_count;
   out->spilled = (int)card_evicted_count;
   out->starved = (int)starved_frames;
+  out->deferred = (int)deferred_count;
 }

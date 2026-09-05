@@ -43,6 +43,7 @@ typedef struct {
   int evicted, restored, failed;
   int spilled; // evictions that had to reach the memory card
   int starved; // frames it failed to get back under its limits
+  int deferred; // evictions it wanted to make and could not, for want of a copy
 } TextureCacheStats;
 
 void texture_cache_stats(TextureCacheStats *out);

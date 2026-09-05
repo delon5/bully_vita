@@ -32,6 +32,9 @@
 
 int debugPrintf(char *text, ...) { (void)text; return 0; }
 int traceLog(char *text, ...) { (void)text; return 0; }
+// The loader's heartbeat counters, which live in main.c on the console. Defined
+// here so the tests compile the cache with the trace on, exactly as it ships.
+int trace_textures;
 
 // Set by a test to hold the writer thread inside its write, so that "this copy
 // has not reached the card yet" is a state the test can actually observe.
