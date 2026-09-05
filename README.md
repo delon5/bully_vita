@@ -105,6 +105,15 @@ changes break it outright:
   runtime shader compiler, which loads `SceShaccCg` and patches it through
   taiHEN. This port supplies precompiled shaders and has no reason to.
 
+Delete `libvitaGL.a` before building it, both in the vitaGL checkout and in
+`$VITASDK/arm-vita-eabi/lib`. The Makefile finishes with `ar -rc`, which adds
+to an existing archive instead of replacing it, so an archive left behind by a
+different revision keeps objects that revision no longer builds. The file lists
+differ enough between revisions that the link then contains two incompatible
+versions of vitaGL at once: it links cleanly, `sceGxmInitialize`,
+`sceGxmBeginScene` and `sceGxmEndScene` all return success, and nothing is ever
+drawn.
+
 Do not take a newer vitaGL without checking both. The overridden `CC` demotes
 diagnostics GCC 14 turned into errors; this is 2021 code written under the older
 default, so demoting them preserves its behaviour rather than changing it.

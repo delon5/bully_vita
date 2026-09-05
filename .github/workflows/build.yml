@@ -49,9 +49,25 @@ jobs:
         run: |
           git clone https://github.com/Rinnegatamante/vitaGL
           git -C vitaGL checkout --detach "$VITAGL_REV"
+          # vitaGL's Makefile finishes with "ar -rc libvitaGL.a ...", and -r
+          # replaces or adds members without ever removing the ones that are no
+          # longer built. An archive left over from a different revision keeps
+          # its stale objects and they get linked alongside the new ones: the
+          # file lists differ enough between revisions (vertex_buffers.o and
+          # math_utils.o on one side, buffers.o and display_lists.o on the
+          # other) that the result is two incompatible versions of vitaGL in
+          # one binary. It links, sceGxm accepts every call, and nothing is
+          # ever drawn. Delete both copies first so the archive can only ever
+          # hold what this build produced.
+          rm -f vitaGL/libvitaGL.a "$VITASDK/arm-vita-eabi/lib/libvitaGL.a"
           make -C vitaGL \
             CC="arm-vita-eabi-gcc -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion" \
             SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 -j"$(nproc)" install
+          # Fail loudly rather than silently shipping a mixed archive.
+          if arm-vita-eabi-ar t "$VITASDK/arm-vita-eabi/lib/libvitaGL.a" | grep -qx 'buffers.o'; then
+            echo "libvitaGL.a contains objects from another vitaGL revision" >&2
+            exit 1
+          fi
 
       # Runs before the vpk so a logic regression fails fast, and after vitaGL
       # so the tests see the same headers the vpk is built against.
