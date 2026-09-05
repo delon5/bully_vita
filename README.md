@@ -80,6 +80,15 @@ build survives it, a build with a current compiler does not, and it crashes in
 `aluMixData` before the first frame. Asking for 8-byte alignment costs nothing on
 this hardware and makes the store legal either way.
 
+**Do not pass `SOFTFP_ABI=1`.** The 2021 instructions specify it, and against a
+hardfp SDK it is right: it replaces `sceGxmSetViewport` with a shim that moves
+the float arguments from `r1`-`r3` into `s0`-`s5`. Against the softfp SDK this
+port needs they are already in the core registers, so the shim moves them again
+and the viewport becomes garbage. Every primitive is clipped, `glGetError`
+returns clean, and the screen is black -- a plain `glClear` included, because
+vitaGL sets the viewport before drawing its clear quad. `-mfloat-abi=softfp`
+still applies; it comes from the SDK.
+
 `vitaGL` has to be built from source, because the port depends on compile-time
 options the published package does not set, and it has to be **this revision**:
 

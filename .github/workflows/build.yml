@@ -60,9 +60,18 @@ jobs:
           # ever drawn. Delete both copies first so the archive can only ever
           # hold what this build produced.
           rm -f vitaGL/libvitaGL.a "$VITASDK/arm-vita-eabi/lib/libvitaGL.a"
+          # NOT SOFTFP_ABI=1. That option exists for building vitaGL softfp against
+          # a hardfp SDK: it swaps sceGxmSetViewport for a hand written shim that
+          # moves the float arguments from r1-r3 into s0-s5. Against the softfp
+          # SDK this port requires, they are already there, so the shim moves
+          # them a second time and the viewport is garbage. Every primitive is
+          # then clipped away -- draws succeed, no GL error is set, and the
+          # screen stays black, including a plain glClear, since vitaGL sets the
+          # viewport before drawing its clear quad. -mfloat-abi=softfp still
+          # applies, it comes from the SDK.
           make -C vitaGL \
-            CC="arm-vita-eabi-gcc -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion" \
-            SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 NO_SPLASHSCREEN=1 \
+            CC="arm-vita-eabi-gcc -mfloat-abi=softfp -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion" \
+            UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 NO_SPLASHSCREEN=1 \
             HAVE_SHADER_CACHE=1 \
             -j"$(nproc)" install
           # Fail loudly rather than silently shipping a mixed archive.
