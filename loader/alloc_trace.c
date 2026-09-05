@@ -345,6 +345,23 @@ static int from_the_game(void *return_address) {
   return (uintptr_t)return_address >= LOAD_ADDRESS;
 }
 
+// The moment an allocation fails is the moment the game dies, and until now it
+// passed in silence: only operator new was watched, and a plain malloc that
+// returns NULL just gets used and faults somewhere unrelated a few frames
+// later. Every crash today was found by inference from a coredump because of
+// this. Report the first handful, with the size and who asked.
+static void report_failure(size_t size, void *return_address) {
+  static uint32_t reported;
+  if (reported >= 8)
+    return;
+  reported++;
+  traceLog("OUT OF MEMORY: %s asked for %d bytes and got nothing (caller %s0x%x)\n",
+           from_the_game(return_address) ? "the game" : "the loader", (int)size,
+           from_the_game(return_address) ? "libBully.so+" : "eboot ",
+           from_the_game(return_address) ? (unsigned)((uintptr_t)return_address - LOAD_ADDRESS)
+                                         : (unsigned)(uintptr_t)return_address);
+}
+
 static void account_alloc(void *ptr, void *return_address) {
   if (!ptr)
     return;
@@ -405,7 +422,10 @@ void alloc_trace_loader_report(void) {
  * forward to the real allocator.
  */
 
-#ifndef LOADER_ALLOC_TRACE
+#ifdef LOADER_ALLOC_TRACE
+#define note_failure(size, ra) report_failure(size, ra)
+#else
+#define note_failure(size, ra) ((void)0)
 void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
 void *__real_realloc(void *ptr, size_t size);
@@ -417,18 +437,24 @@ void __real_free(void *ptr);
 
 void *__wrap_malloc(size_t size) {
   void *ptr = __real_malloc(size);
+  if (!ptr)
+    note_failure(size, __builtin_return_address(0));
   account_alloc(ptr, __builtin_return_address(0));
   return ptr;
 }
 
 void *__wrap_calloc(size_t count, size_t size) {
   void *ptr = __real_calloc(count, size);
+  if (!ptr)
+    note_failure(count * size, __builtin_return_address(0));
   account_alloc(ptr, __builtin_return_address(0));
   return ptr;
 }
 
 void *__wrap_memalign(size_t alignment, size_t size) {
   void *ptr = __real_memalign(alignment, size);
+  if (!ptr)
+    note_failure(size, __builtin_return_address(0));
   account_alloc(ptr, __builtin_return_address(0));
   return ptr;
 }
@@ -437,6 +463,8 @@ void *__wrap_realloc(void *ptr, size_t size) {
   if (ptr)
     account_free(ptr);
   void *out = __real_realloc(ptr, size);
+  if (!out && size)
+    note_failure(size, __builtin_return_address(0));
   account_alloc(out, __builtin_return_address(0));
   return out;
 }

@@ -11,6 +11,7 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/appmgr.h>
 #include <psp2/apputil.h>
@@ -228,6 +229,11 @@ int ProcessEvents(void) {
     // is what has been freed and is sitting in the free lists. A large fordblks
     // is fragmentation, not a leak, and no amount of freeing things fixes it.
     struct mallinfo heap = mallinfo();
+    // A high-water mark, because everything else here is an instant reading and
+    // a spike between two heartbeats leaves no trace at all.
+    static size_t heap_peak;
+    if ((size_t)heap.uordblks > heap_peak)
+      heap_peak = (size_t)heap.uordblks;
     traceLog("loop: %d | tex %d draw %d | vgl ram %d cdram %d phycont %d MB | heap %d MB | "
              "cache %d MB parked %d ev %d re %d lost %d spill %d starve %d defer %d block %d\n",
              events, trace_textures, trace_draws,
@@ -251,9 +257,27 @@ int ProcessEvents(void) {
     last_frames = frames_swapped;
     last_us = us;
     traceLog("fps: %d over the last %d frames\n", fps, drawn);
-    traceLog("heapinfo: arena %d MB, live %d MB, free-listed %d MB, top %d KB\n",
+    traceLog("heapinfo: arena %d MB, live %d MB, free-listed %d MB, top %d KB, peak %d MB\n",
              (int)(heap.arena / (1024 * 1024)), (int)(heap.uordblks / (1024 * 1024)),
-             (int)(heap.fordblks / (1024 * 1024)), (int)(heap.keepcost / 1024));
+             (int)(heap.fordblks / (1024 * 1024)), (int)(heap.keepcost / 1024),
+             (int)(heap_peak / (1024 * 1024)));
+
+    // What the kernel thinks is left, which is the only figure that covers the
+    // whole process. mallinfo sees the newlib heap and vglMemFree sees vitaGL's
+    // pools, and everything allocated as a memory block straight from the
+    // kernel -- GXM's buffers, the movie player's, OpenAL's, the pools
+    // themselves -- appears in neither. Two sub-allocators are not the process,
+    // and assuming they were is why the heap figures never added up.
+    SceKernelFreeMemorySizeInfo freemem;
+    freemem.size = sizeof(freemem);
+    if (sceKernelGetFreeMemorySize(&freemem) >= 0)
+      traceLog("system: %d MB user, %d MB cdram, %d MB phycont free to the kernel\n",
+               freemem.size_user / (1024 * 1024), freemem.size_cdram / (1024 * 1024),
+               freemem.size_phycont / (1024 * 1024));
+
+    // vitaGL's fourth pool. Reported because it is a real pool that textures
+    // fall back to, and nothing here has ever looked at it.
+    traceLog("vgl: budget pool %d MB free\n", (int)(vglMemFree(VGL_MEM_BUDGET) / (1024 * 1024)));
 
     StreamingStats stream;
     streaming_patch_stats(&stream);
