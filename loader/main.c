@@ -264,8 +264,10 @@ int ProcessEvents(void) {
 #ifdef LOADER_ALLOC_TRACE
     // Less often than the heartbeat: this one walks a table and prints several
     // lines, and the question it answers changes over minutes, not frames.
-    if (events % 6000 == 0)
+    if (events % 6000 == 0) {
       alloc_trace_report();
+      alloc_trace_loader_report();
+    }
 #endif
   }
   events++;
@@ -700,20 +702,15 @@ static so_default_dynlib default_dynlib[] = {
   { "tan", (uintptr_t)&tan },
   { "tanf", (uintptr_t)&tanf },
 
-#ifdef LOADER_ALLOC_TRACE
-  // Same allocators, wrapped so the trace can say who is holding the heap.
-  { "calloc", (uintptr_t)&bully_calloc },
-  { "free", (uintptr_t)&bully_free },
-  { "malloc", (uintptr_t)&bully_malloc },
-  { "memalign", (uintptr_t)&bully_memalign },
-  { "realloc", (uintptr_t)&bully_realloc },
-#else
+  // These names resolve to __wrap_malloc and friends when the allocation trace
+  // is on, so the game's allocations and the eboot's are counted in the same
+  // place and told apart by return address. No separate wrappers: two layers
+  // would count everything twice.
   { "calloc", (uintptr_t)&calloc },
   { "free", (uintptr_t)&free },
   { "malloc", (uintptr_t)&malloc },
   { "memalign", (uintptr_t)&memalign },
   { "realloc", (uintptr_t)&realloc },
-#endif
 
   { "atoi", (uintptr_t)&atoi },
 

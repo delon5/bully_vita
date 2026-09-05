@@ -9,6 +9,8 @@
 
 #include <stddef.h>
 
+#include "config.h"
+
 // The game's allocators. Every allocation the .so makes comes through these,
 // because the loader is what resolves malloc and friends for it.
 void *bully_malloc(size_t size);
@@ -25,5 +27,13 @@ void *bully_operator_new_array(size_t size);
 
 // Writes what the heap is holding and who asked for it to the trace.
 void alloc_trace_report(void);
+
+// The same for the memory the eboot allocates -- vitaGL, OpenAL, the loader
+// itself -- which the game-side wrappers never saw.
+#ifdef LOADER_ALLOC_TRACE
+void alloc_trace_loader_report(void);
+#else
+#define alloc_trace_loader_report() ((void)0)
+#endif
 
 #endif

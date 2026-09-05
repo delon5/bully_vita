@@ -30,6 +30,14 @@
 
 #ifdef LOADER_ALLOC_TRACE
 
+// The genuine allocators, behind the --wrap layer installed at the bottom of
+// this file.
+void *__real_malloc(size_t size);
+void *__real_calloc(size_t count, size_t size);
+void *__real_realloc(void *ptr, size_t size);
+void *__real_memalign(size_t alignment, size_t size);
+void __real_free(void *ptr);
+
 // Live allocations of SMALL_BYTES or more, open addressed by pointer. Only
 // large blocks reach it, so it can be a fraction of the size the first version
 // needed -- 384 KB rather than three megabytes, which matters on a port that is
@@ -117,26 +125,12 @@ static CallerTotals *caller_slot(uint32_t caller) {
   return NULL; // more distinct call sites than slots; the rest go uncredited
 }
 
-static void remember(void *ptr, size_t size, void *return_address) {
-  if (!ptr)
-    return;
-  // What the heap actually gave up, not what was asked for, so that these
-  // figures can be compared with mallinfo and so that a block is classified the
-  // same way when it is freed as when it was taken.
-  (void)size;
-  size = malloc_usable_size(ptr);
-
-  // Small blocks never touch the table or the lock: atomics on two counters,
-  // which is the difference between an observation and a stall.
-  if (size < SMALL_BYTES) {
-    __atomic_add_fetch(&small_live_bytes, size, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&small_live_count, 1, __ATOMIC_RELAXED);
-    return;
-  }
-
-  uint32_t caller = so_offset(return_address);
-  lock_table();
+// Put one block in the table, credited to a call site. The caller value is
+// whatever identifies the code that asked: an offset into the .so for the
+// game, an eboot address for the loader.
+static void remember_block(void *ptr, size_t size, uint32_t caller) {
   uint32_t i = hash_ptr(ptr) & LIVE_MASK;
+  lock_table();
   for (uint32_t probe = 0; probe < 64; probe++) {
     LiveBlock *b = &live[(i + probe) & LIVE_MASK];
     if (!b->ptr) {
@@ -158,25 +152,16 @@ static void remember(void *ptr, size_t size, void *return_address) {
   unlock_table();
 }
 
-static void forget(void *ptr) {
-  if (!ptr)
-    return;
-
-  // Small blocks are most of the traffic and are not in the table, so settle
-  // that first rather than probing for something that was never put there.
-  size_t size = malloc_usable_size(ptr);
-  if (size < SMALL_BYTES) {
-    __atomic_sub_fetch(&small_live_bytes, size, __ATOMIC_RELAXED);
-    __atomic_sub_fetch(&small_live_count, 1, __ATOMIC_RELAXED);
-    return;
-  }
-
-  lock_table();
+// Take a block back out, returning how big it was, or 0 if it was never in
+// there -- which is how the caller tells a tabled block from a bulk-counted one.
+static size_t forget_block(void *ptr) {
   uint32_t i = hash_ptr(ptr) & LIVE_MASK;
+  lock_table();
   for (uint32_t probe = 0; probe < 64; probe++) {
     LiveBlock *b = &live[(i + probe) & LIVE_MASK];
     if (b->ptr == ptr) {
-      large_live_bytes -= b->size;
+      size_t size = b->size;
+      large_live_bytes -= size;
       CallerTotals *c = caller_slot(b->caller);
       if (c && c->caller == b->caller) {
         c->live_bytes -= b->size;
@@ -186,13 +171,48 @@ static void forget(void *ptr) {
       b->size = 0;
       b->caller = 0;
       unlock_table();
-      return;
+      return size ? size : 1;
     }
     if (!b->ptr)
-      break; // the run ended, so it was never a tracked block
+      break; // the run ended, so it was never tabled
   }
-  untracked_frees++; // allocated before tracking began, or lost to a full table
   unlock_table();
+  return 0;
+}
+
+static void remember(void *ptr, size_t size, void *return_address) {
+  if (!ptr)
+    return;
+  // What the heap actually gave up, not what was asked for, so that these
+  // figures can be compared with mallinfo and so that a block is classified the
+  // same way when it is freed as when it was taken.
+  (void)size;
+  size = malloc_usable_size(ptr);
+
+  // Small blocks never touch the table or the lock: atomics on two counters,
+  // which is the difference between an observation and a stall.
+  if (size < SMALL_BYTES) {
+    __atomic_add_fetch(&small_live_bytes, size, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&small_live_count, 1, __ATOMIC_RELAXED);
+    return;
+  }
+
+  remember_block(ptr, size, so_offset(return_address));
+}
+
+static void forget(void *ptr) {
+  if (!ptr)
+    return;
+
+  size_t size = malloc_usable_size(ptr);
+  if (size < SMALL_BYTES) {
+    __atomic_sub_fetch(&small_live_bytes, size, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&small_live_count, 1, __ATOMIC_RELAXED);
+    return;
+  }
+
+  if (!forget_block(ptr))
+    untracked_frees++; // allocated before tracking began, or lost to a full table
 }
 
 void *bully_malloc(size_t size) {
@@ -246,7 +266,10 @@ void bully_free(void *ptr) {
 static void *op_new(size_t size, void *return_address) {
   if (size == 0)
     size = 1;
-  void *ptr = malloc(size);
+  // __real_malloc, not malloc: going through the wrap layer would record this
+  // frame as the caller, and every C++ allocation in the game would be credited
+  // to the loader -- which is the exact figure this is trying to measure.
+  void *ptr = __real_malloc(size);
   if (!ptr)
     fatal_error("out of memory: the game asked for %d bytes and the heap had none left.\n"
                 "This is the leak, caught at the moment it ran out.",
@@ -289,3 +312,137 @@ void alloc_trace_report(void) {
 }
 
 #endif
+
+/*
+ * Linker-level accounting
+ *
+ * Everything above only sees what the game asks for, because those are the
+ * allocators the loader resolves for the .so. That left 79 MB of live heap
+ * unaccounted for: vitaGL, OpenAL, the movie player and the loader's own code
+ * are linked into the eboot and call malloc directly, so none of it came
+ * through those wrappers -- and it is the larger share of the leak.
+ *
+ * --wrap catches all of it. Every reference to malloc anywhere in the eboot --
+ * the game's included, since its calls arrive through the loader's exported
+ * symbol -- becomes a call to __wrap_malloc, with __real_malloc the genuine
+ * article. The build already used --wrap for memcpy, so the mechanism is known
+ * to work here.
+ *
+ * Who asked is decided by the return address: the .so is mapped at
+ * LOAD_ADDRESS, so anything at or above that is the game. The game's
+ * allocations are counted in bulk -- there are 177000 of them and they are
+ * already understood -- while the eboot's are tabled individually whatever
+ * their size, because they are far rarer and they are the ones we cannot
+ * currently name.
+ */
+
+#ifdef LOADER_ALLOC_TRACE
+
+static size_t loader_live_bytes;
+static uint32_t loader_live_count;
+
+static int from_the_game(void *return_address) {
+  return (uintptr_t)return_address >= LOAD_ADDRESS;
+}
+
+static void account_alloc(void *ptr, void *return_address) {
+  if (!ptr)
+    return;
+
+  if (from_the_game(return_address)) {
+    remember(ptr, 0, return_address);
+    return;
+  }
+
+  size_t size = malloc_usable_size(ptr);
+  __atomic_add_fetch(&loader_live_bytes, size, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&loader_live_count, 1, __ATOMIC_RELAXED);
+  // Tabled at any size: the eboot allocates orders of magnitude less often than
+  // the game, so the lock is uncontended, and a leak made of small blocks needs
+  // naming just as much as one made of large ones.
+  remember_block(ptr, size, (uint32_t)(uintptr_t)return_address);
+}
+
+static void account_free(void *ptr) {
+  size_t reclaimed = forget_block(ptr);
+  if (reclaimed) {
+    __atomic_sub_fetch(&loader_live_bytes, reclaimed, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&loader_live_count, 1, __ATOMIC_RELAXED);
+    return;
+  }
+  forget(ptr);
+}
+
+void alloc_trace_loader_report(void) {
+  traceLog("loader heap: %d MB in %u blocks not allocated by the game\n",
+           (int)(loader_live_bytes / (1024 * 1024)), loader_live_count);
+
+  uint32_t ceiling = 0xffffffffu;
+  for (int rank = 0; rank < 8; rank++) {
+    CallerTotals *best = NULL;
+    for (int i = 0; i < CALLERS; i++) {
+      CallerTotals *c = &callers[i];
+      if (c->total_count == 0 || c->live_bytes >= ceiling || c->caller < 0x81000000u)
+        continue;
+      if (!best || c->live_bytes > best->live_bytes)
+        best = c;
+    }
+    if (!best || best->live_bytes < 256 * 1024)
+      break;
+    traceLog("loader heap:   eboot 0x%x holds %d KB in %u blocks (%u ever)\n", best->caller,
+             (int)(best->live_bytes / 1024), best->live_count, best->total_count);
+    ceiling = best->live_bytes;
+  }
+}
+
+#endif
+
+/*
+ * The wrappers themselves are defined whatever the trace setting, because the
+ * link always asks for them: --wrap turns every reference to malloc in the
+ * eboot into a reference to __wrap_malloc, so a build with the accounting
+ * switched off would otherwise fail to link. With it off they are a straight
+ * forward to the real allocator.
+ */
+
+#ifndef LOADER_ALLOC_TRACE
+void *__real_malloc(size_t size);
+void *__real_calloc(size_t count, size_t size);
+void *__real_realloc(void *ptr, size_t size);
+void *__real_memalign(size_t alignment, size_t size);
+void __real_free(void *ptr);
+#define account_alloc(ptr, ra) ((void)0)
+#define account_free(ptr) ((void)0)
+#endif
+
+void *__wrap_malloc(size_t size) {
+  void *ptr = __real_malloc(size);
+  account_alloc(ptr, __builtin_return_address(0));
+  return ptr;
+}
+
+void *__wrap_calloc(size_t count, size_t size) {
+  void *ptr = __real_calloc(count, size);
+  account_alloc(ptr, __builtin_return_address(0));
+  return ptr;
+}
+
+void *__wrap_memalign(size_t alignment, size_t size) {
+  void *ptr = __real_memalign(alignment, size);
+  account_alloc(ptr, __builtin_return_address(0));
+  return ptr;
+}
+
+void *__wrap_realloc(void *ptr, size_t size) {
+  if (ptr)
+    account_free(ptr);
+  void *out = __real_realloc(ptr, size);
+  account_alloc(out, __builtin_return_address(0));
+  return out;
+}
+
+void __wrap_free(void *ptr) {
+  if (ptr)
+    account_free(ptr);
+  __real_free(ptr);
+}
