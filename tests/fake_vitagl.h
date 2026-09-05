@@ -24,7 +24,13 @@ extern GLuint fake_bound;
 
 // Memory the driver has left. Running it dry is the crash this cache exists to
 // prevent, so the driver aborts rather than letting a test pass through it.
+// 0 CDRAM, 1 RAM, 2 phycont, matching vglMemFree's enum.
+#define FAKE_POOLS 3
 extern size_t fake_free_memory;
+extern size_t fake_pool_free[FAKE_POOLS];
+extern size_t fake_pool_start[FAKE_POOLS];
+// Split the driver's memory across pools instead of putting it all in CDRAM.
+void fake_set_pools(size_t cdram, size_t ram, size_t phycont);
 extern size_t fake_low_water;
 
 // Set to make the next upload behave the way vitaGL does when it rejects one:

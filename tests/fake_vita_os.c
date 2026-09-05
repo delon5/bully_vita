@@ -21,6 +21,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdio.h>
@@ -203,3 +204,14 @@ int sceKernelStartThread(SceUID thid, SceSize arglen, void *argp) {
   return pthread_create(&threads[thid].thread, NULL, trampoline, &threads[thid]);
 }
 int sceKernelExitDeleteThread(int status) { pthread_exit(NULL); return 0; }
+
+// The cache asks the heap how full it is before parking a texture there. On the
+// host that answer would be the test process's own heap, which says nothing
+// about the console, so a test sets it directly.
+size_t fake_heap_used;
+struct mallinfo mallinfo(void) {
+  struct mallinfo m;
+  memset(&m, 0, sizeof(m));
+  m.uordblks = (int)fake_heap_used;
+  return m;
+}

@@ -6,6 +6,11 @@
  * their own. Running out of memory aborts, because that is the failure this
  * whole feature exists to prevent.
  *
+ * Memory is split across pools the way vitaGL splits it, and allocation prefers
+ * CDRAM and falls back to RAM. That is not a detail: on hardware CDRAM ran to
+ * zero while the total still read 101 MB free, and a cache watching the total
+ * evicted nothing at all. A single-pool fake cannot see that.
+ *
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
  */
@@ -23,7 +28,13 @@ void *fake_slot_data[FAKE_SLOTS];
 uint32_t fake_slot_content[FAKE_SLOTS];
 int fake_slot_alive[FAKE_SLOTS];
 GLuint fake_bound;
-size_t fake_free_memory;
+size_t fake_free_memory;   // the total, across every pool
+size_t fake_pool_free[FAKE_POOLS];
+size_t fake_pool_start[FAKE_POOLS];
+// How much of each texture came out of each pool. Needed so that freeing gives
+// the memory back where it came from: an approximation that refilled CDRAM last
+// made eviction look like it could not recover CDRAM at all.
+static size_t fake_slot_take[FAKE_SLOTS][FAKE_POOLS];
 size_t fake_low_water;
 int fake_reject_next_upload;
 
@@ -31,10 +42,26 @@ void fake_reset(size_t free_memory) {
   memset(fake_slot_bytes, 0, sizeof(fake_slot_bytes));
   memset(fake_slot_content, 0, sizeof(fake_slot_content));
   memset(fake_slot_alive, 0, sizeof(fake_slot_alive));
+  memset(fake_slot_take, 0, sizeof(fake_slot_take));
   fake_bound = 0;
   fake_free_memory = free_memory;
+  // All of it in CDRAM unless a test asks for a split, so the existing tests
+  // keep meaning what they meant.
+  fake_pool_free[0] = free_memory;
+  for (int i = 1; i < FAKE_POOLS; i++)
+    fake_pool_free[i] = 0;
+  memcpy(fake_pool_start, fake_pool_free, sizeof(fake_pool_start));
   fake_low_water = free_memory;
   fake_reject_next_upload = 0;
+}
+
+void fake_set_pools(size_t cdram, size_t ram, size_t phycont) {
+  fake_pool_free[0] = cdram;
+  fake_pool_free[1] = ram;
+  fake_pool_free[2] = phycont;
+  memcpy(fake_pool_start, fake_pool_free, sizeof(fake_pool_start));
+  fake_free_memory = cdram + ram + phycont;
+  fake_low_water = fake_free_memory;
 }
 
 uint32_t fake_fingerprint_of(uint32_t tag) { return tag; }
@@ -61,11 +88,23 @@ static uint32_t fingerprint(const void *data, size_t size) {
 
 static void set_slot(GLuint id, size_t size, uint32_t content) {
   fake_free_memory += fake_slot_bytes[id];
+  for (int pool = 0; pool < FAKE_POOLS; pool++) {
+    fake_pool_free[pool] += fake_slot_take[id][pool];
+    fake_slot_take[id][pool] = 0;
+  }
   free(fake_slot_data[id]);
   fake_slot_data[id] = NULL;
   fake_slot_bytes[id] = size;
   assert(fake_free_memory >= size && "driver ran out of memory: this is the crash being fixed");
   fake_free_memory -= size;
+  // CDRAM first, then RAM, then whatever is left -- vitaGL's own order.
+  size_t left = size;
+  for (int pool = 0; pool < FAKE_POOLS && left; pool++) {
+    size_t take = fake_pool_free[pool] < left ? fake_pool_free[pool] : left;
+    fake_pool_free[pool] -= take;
+    fake_slot_take[id][pool] = take;
+    left -= take;
+  }
   if (fake_free_memory < fake_low_water)
     fake_low_water = fake_free_memory;
   fake_slot_content[id] = content;
@@ -157,5 +196,5 @@ void *vglGetTexDataPointer(GLenum target) {
 size_t vglMemFree(vglMemType type) {
   if (type >= VGL_MEM_ALL)
     return 0;
-  return type == VGL_MEM_VRAM ? fake_free_memory : 0;
+  return (int)type < FAKE_POOLS ? fake_pool_free[type] : 0;
 }

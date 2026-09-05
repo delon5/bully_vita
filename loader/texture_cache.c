@@ -37,6 +37,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <malloc.h>
 #include <string.h>
 
 #include "main.h"
@@ -48,6 +49,9 @@
 // are left untracked, which only costs us the ability to evict them.
 #define MAX_TEXTURES 16384
 #define MAX_TEXTURE_UNITS 16
+// vitaGL's allocation pools: 0 CDRAM, 1 RAM, 2 phycont. 3 is the newlib entry
+// and always reads 0.
+#define VGL_POOLS 3
 
 // Stamped into every record so a torn write, or a record left over from an
 // upload the game has since replaced, can never be replayed into a texture.
@@ -102,7 +106,12 @@ static uint32_t frame_counter = 1;
 static size_t tracked_bytes = 0;
 static uint32_t upload_serial = 1;
 static uint32_t starved_frames; // frames the lossless pass has failed to keep up
-static size_t pool_total; // vitaGL's free memory once it was up, sampled on the first tick
+// What each pool had free once the game was drawing, sampled on the first tick.
+// Kept per pool rather than as a total: on hardware CDRAM ran to zero while the
+// sum still read 101 MB free, because the RAM pool had plenty -- and the cache
+// sat there having evicted nothing while vitaGL spilled textures past CDRAM,
+// past RAM, and into the newlib heap the game needed.
+static size_t pool_start[VGL_POOLS];
 // Counted for the trace: this is the first time any of this has run on hardware.
 static uint32_t evicted_count, restored_count, restore_failed_count;
 
@@ -123,12 +132,14 @@ static uint32_t ram_evicted_count, card_evicted_count, ram_restored_count;
 // Ask for each pool instead. The names have changed between vitaGL versions but
 // the order has not: 0 is CDRAM, 1 is RAM, 2 is phycont, and 3 is either a
 // fourth pool or the newlib entry, which always reports 0.
-static size_t vitagl_free_memory(void) {
-  size_t total = 0;
-  for (int pool = 0; pool < 4; pool++)
-    total += vglMemFree((vglMemType)pool);
-  return total;
+//
+// Keeping them apart rather than summing them is the point. They are not
+// interchangeable, and a total hides a pool that has run dry.
+static void vitagl_free_per_pool(size_t out[VGL_POOLS]) {
+  for (int pool = 0; pool < VGL_POOLS; pool++)
+    out[pool] = vglMemFree((vglMemType)pool);
 }
+
 
 // vitaGL reports a rejected upload by quietly not allocating anything, and it
 // frees the old data before it tries, so asking what the texture ended up with
@@ -148,6 +159,15 @@ static uint32_t checksum(const void *data, uint32_t size) {
     hash *= 0x01000193;
   }
   return hash;
+}
+
+// Whether the newlib heap is too far gone to be parking textures in. mallinfo
+// walks the free list, so it is not free -- it is called once per eviction,
+// never per upload.
+static int heap_is_tight(void) {
+  struct mallinfo info = mallinfo();
+  size_t limit = (size_t)MEMORY_NEWLIB_MB * 1024 * 1024 / 100 * TEXTURE_HEAP_PARK_PERCENT;
+  return (size_t)info.uordblks > limit;
 }
 
 static TextureInfo *texture_info(GLuint id) {
@@ -312,7 +332,9 @@ void texture_cache_init(void) {
   ram_cache_bytes = 0;
   card_writes_this_frame = 0;
   starved_frames = 0;
-  pool_total = 0;
+  evicted_count = restored_count = restore_failed_count = 0;
+  ram_evicted_count = card_evicted_count = ram_restored_count = 0;
+  memset(pool_start, 0, sizeof(pool_start));
 
   // The store lives next to the game's own files, in the data directory the
   // user installed them into, and is kept across runs. Check there is room for
@@ -409,6 +431,11 @@ static int backup_stage(TextureInfo *info, GLuint id, GLint level, GLsizei width
 // write of a few hundred KB in the middle of a frame. Doing every eviction
 // through the card is what made the framerate collapse on hardware.
 //
+// Except when the heap is the thing under pressure. The game allocates its
+// level data out of the same heap, and on hardware it reached 153 MB of 160
+// while the cache sat on textures; parking more there would take the game down
+// rather than save it.
+//
 // Returns 1 once the bytes are safe, 0 if this texture can never be saved, and
 // -1 if it could be but not in this frame. The caller has to keep those apart:
 // only the middle one is a reason to stop considering the texture.
@@ -422,7 +449,8 @@ static int backup_capture(TextureInfo *info, GLuint id) {
 
   // Decided before reading the texture back, so that a frame which has used up
   // its card writes does not pay for a bind and a pointer fetch to find out.
-  int to_card = ram_cache_bytes + info->resident_size > (size_t)TEXTURE_RAM_CACHE_MB * 1024 * 1024;
+  int to_card = ram_cache_bytes + info->resident_size > (size_t)TEXTURE_RAM_CACHE_MB * 1024 * 1024 ||
+                heap_is_tight();
   if (to_card && card_writes_this_frame >= TEXTURE_CARD_WRITES_PER_FRAME)
     return -1; // out of writes for this frame, not out of options
 
@@ -734,14 +762,25 @@ void texture_cache_tick(void) {
 
   const size_t budget = (size_t)TEXTURE_BUDGET_MB * 1024 * 1024;
 
-  // How much vitaGL had to give out once it was up and the game had started
-  // drawing. Sampled here rather than at init, which runs before vglInit.
-  size_t free_now = vitagl_free_memory();
-  if (!pool_total)
-    pool_total = free_now;
-  size_t headroom = pool_total / 100 * TEXTURE_FREE_HEADROOM_PERCENT;
+  size_t free_now[VGL_POOLS];
+  vitagl_free_per_pool(free_now);
+  if (!pool_start[1]) // the RAM pool is never zero once vitaGL is up
+    vitagl_free_per_pool(pool_start);
 
-  if (tracked_bytes <= budget && free_now >= headroom) {
+  // How far below its share any pool has fallen, added up. A pool is judged
+  // against what it started with, not against the total, because they are not
+  // interchangeable: textures prefer CDRAM, and once it is gone vitaGL falls
+  // back to RAM and then to the newlib heap rather than failing, so an
+  // exhausted CDRAM shows up as the game running out of heap somewhere else
+  // entirely.
+  size_t deficit = 0;
+  for (int pool = 0; pool < VGL_POOLS; pool++) {
+    size_t reserve = pool_start[pool] / 100 * TEXTURE_FREE_HEADROOM_PERCENT;
+    if (free_now[pool] < reserve)
+      deficit += reserve - free_now[pool];
+  }
+
+  if (tracked_bytes <= budget && deficit == 0) {
     starved_frames = 0;
     return;
   }
@@ -753,13 +792,11 @@ void texture_cache_tick(void) {
   size_t target = tracked_bytes;
   if (tracked_bytes > budget)
     target = budget - budget / 8;
-  if (free_now < headroom) {
-    size_t needed = headroom - free_now;
-    target = target > needed ? target - needed : 0;
-  }
+  if (deficit)
+    target = target > deficit ? target - deficit : 0;
   evict_textures(target, TEXTURE_IDLE_FRAMES);
 
-  if (tracked_bytes <= budget && vitagl_free_memory() >= headroom) {
+  if (tracked_bytes <= budget) {
     starved_frames = 0;
     return;
   }

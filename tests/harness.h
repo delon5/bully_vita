@@ -46,6 +46,7 @@ static void tex_reupload(GLuint id, uint32_t tag, GLsizei width, GLsizei height,
 }
 
 unsigned fake_store_files(void);
+extern size_t fake_heap_used;
 unsigned fake_store_writes(void);
 
 // Backups are written on the uploading thread now, so a record is on disk by

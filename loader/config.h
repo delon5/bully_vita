@@ -66,8 +66,9 @@
 // normally be doing the reclaiming. Set too low it evicts constantly while
 // there is memory to spare, and every eviction is work in the middle of a
 // frame: at 64 MB that showed up on hardware as the framerate falling off 30
-// down to nothing.
-#define TEXTURE_BUDGET_MB 144
+// down to nothing. Set too high it never fires at all: at 144 MB a session that
+// crashed had reached 110 MB tracked having evicted nothing.
+#define TEXTURE_BUDGET_MB 96
 // Evict regardless of the budget once vitaGL has less than this much free, so
 // that memory pressure coming from anywhere else does not kill us either.
 #define TEXTURE_RESERVE_MB 32
@@ -89,7 +90,12 @@
 // this cache exists to reclaim -- and putting it back is a memcpy rather than a
 // read off the card. Kept well short of the heap so the game still has its own
 // room; when it is full, or the heap will not give, eviction uses the card.
-#define TEXTURE_RAM_CACHE_MB 48
+#define TEXTURE_RAM_CACHE_MB 24
+// And never past this share of the heap, whatever the ceiling above allows. The
+// heap is the game's before it is ours: a session that crashed had it at 153 MB
+// of 160, so parking textures by our own ceiling alone would have been what
+// killed it. Past this, eviction spills to the card instead.
+#define TEXTURE_HEAP_PARK_PERCENT 60
 
 // Where the source bytes of uploaded textures are kept so that an evicted one
 // can be uploaded again when the game draws with it. Truncated on every boot,
