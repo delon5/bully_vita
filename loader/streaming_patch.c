@@ -54,21 +54,50 @@
 #define ORIGINAL_MAX_REQUEST (10 * 1024 * 1024)
 
 static volatile int *ms_memory_used;
+static void (*update_memory_used)(void);
 static uint32_t refusal_count, backoff_count;
+static size_t budget;
 static int installed;
 
-// The heap, sampled. mallinfo walks the free list and this gate is consulted
-// thousands of times through an area load, so it is read now and then rather
-// than per call.
-static size_t heap_used(void) {
+// How much the streamer is holding, by the game's own reckoning.
+//
+// The obvious thing to measure was the newlib heap, and it is the wrong thing.
+// The game does not take a model's memory from malloc: CMemoryHeap grabs large
+// blocks and sub-allocates, so evicting a model returns its memory to a free
+// list inside the game and mallinfo never moves. On hardware that showed up as
+// 24389 refusals with the heap sitting at 179 MB the entire time -- the gate
+// asking for something eviction could not deliver, and the game stripping the
+// world trying to deliver it.
+//
+// CStreaming::UpdateMemoryUsed sums CMemoryHeap::GetMemoryUsed over the
+// streaming memory IDs, which is exactly the figure that moves when a model is
+// freed. Nothing calls it -- the Android build stopped maintaining the
+// accounting when it stubbed the memory check -- but it is still there and
+// still correct, so the loader calls it.
+static size_t streamer_used(void) {
   static uint32_t calls;
   static size_t cached;
 
+  if (!update_memory_used || !ms_memory_used)
+    return 0;
   if ((calls++ & 31) == 0) {
-    struct mallinfo info = mallinfo();
-    cached = (size_t)info.uordblks;
+    update_memory_used();
+    int used = *ms_memory_used;
+    cached = used > 0 ? (size_t)used : 0;
   }
   return cached;
+}
+
+// The budget, taken from what the game turns out to need rather than from a
+// number picked in advance. One area's worth is whatever it is holding once it
+// has settled into play; the margin is what it may grow to beyond that before
+// being asked to let go of something.
+static void calibrate(size_t used) {
+  if (budget || frames_swapped < STREAMING_CALIBRATE_FRAMES || used == 0)
+    return;
+  budget = used + (size_t)STREAMING_BUDGET_MARGIN_MB * 1024 * 1024;
+  traceLog("streaming: settled at %d MB, budget set to %d MB\n",
+           (int)(used / (1024 * 1024)), (int)(budget / (1024 * 1024)));
 }
 
 // Saying "no" makes the game evict its least recently used model and ask again.
@@ -88,17 +117,21 @@ static size_t heap_used(void) {
 #define BACKOFF_CALLS 4096
 
 static int should_refuse(void) {
-  static size_t heap_at_last_progress;
+  static size_t used_at_last_progress;
   static uint32_t fruitless;
   static uint32_t backoff;
 
-  size_t used = heap_used();
-  size_t limit = (size_t)(MEMORY_NEWLIB_MB - STREAMING_HEAP_KEEP_FREE_MB) * 1024 * 1024;
+  size_t used = streamer_used();
+  calibrate(used);
+  if (!budget)
+    return 0; // not calibrated yet: behave as the game always has
+
+  size_t limit = budget;
 
   if (used <= limit) {
     // Under the limit: nothing to do, and the next time we are over it we start
     // judging progress afresh.
-    heap_at_last_progress = 0;
+    used_at_last_progress = 0;
     fruitless = 0;
     return 0;
   }
@@ -109,8 +142,8 @@ static int should_refuse(void) {
     return 0;
   }
 
-  if (!heap_at_last_progress || used + PROGRESS_BYTES < heap_at_last_progress) {
-    heap_at_last_progress = used; // evicting is freeing something; keep going
+  if (!used_at_last_progress || used + PROGRESS_BYTES < used_at_last_progress) {
+    used_at_last_progress = used; // evicting is freeing something; keep going
     fruitless = 0;
     return 1;
   }
@@ -118,7 +151,7 @@ static int should_refuse(void) {
   if (++fruitless >= REFUSALS_WITHOUT_PROGRESS) {
     // Refusing has stopped helping. Let the game load what it needs.
     fruitless = 0;
-    heap_at_last_progress = 0;
+    used_at_last_progress = 0;
     backoff = BACKOFF_CALLS;
     backoff_count++;
     return 0;
@@ -157,14 +190,22 @@ void streaming_patch_init(void) {
   }
 
   ms_memory_used = (volatile int *)so_symbol(&bully_mod, "_ZN10CStreaming13ms_memoryUsedE");
+  update_memory_used =
+      (void (*)(void))so_symbol(&bully_mod, "_ZN10CStreaming16UpdateMemoryUsedEv");
+  if (!ms_memory_used || !update_memory_used) {
+    traceLog("streaming: no memory accounting to read, leaving the gate alone\n");
+    return;
+  }
+
   hook_addr(gate, (uintptr_t)&IsThereEnoughFreeMemory);
   installed = 1;
-  traceLog("streaming: memory gate hooked, streamer capped at %d MB of heap\n",
-           MEMORY_NEWLIB_MB - STREAMING_HEAP_KEEP_FREE_MB);
+  traceLog("streaming: memory gate hooked, budget set after %d frames\n",
+           STREAMING_CALIBRATE_FRAMES);
 }
 
 void streaming_patch_stats(StreamingStats *out) {
-  out->memory_used_mb = (int)(heap_used() / (1024 * 1024));
+  out->memory_used_mb = (int)(streamer_used() / (1024 * 1024));
+  out->budget_mb = (int)(budget / (1024 * 1024));
   out->refusals = (int)refusal_count;
   out->backoffs = (int)backoff_count;
   out->installed = installed;

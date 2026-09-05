@@ -50,10 +50,15 @@
 // dropped; too large and it runs out before it is ever asked to free anything.
 // A traced session reached 194 MB of a 208 MB heap before dying, so there is
 // real room to reclaim here.
-// Kept above what the game actually needs to run. Set below it, every answer is
-// "no" for ever: the game evicts until the world itself is gone, which on
-// hardware left a black corridor with the characters still in it.
-#define STREAMING_HEAP_KEEP_FREE_MB 24
+// The streamer's budget is not a fixed number: it is whatever the game has
+// settled at once it is properly in play, plus this much room to grow before it
+// is asked to let something go. Measured rather than chosen, because a figure
+// picked in advance was wrong in the dangerous direction -- below what the game
+// needs, so every answer was "no" and it evicted the world.
+#define STREAMING_BUDGET_MARGIN_MB 16
+// Frames to let pass before taking that measurement, so it is a settled figure
+// and not the middle of the first area load.
+#define STREAMING_CALIBRATE_FRAMES 1800
 // An empty file here turns the streaming fix off, the way no_texcache does for
 // the texture cache.
 #define STREAMING_DISABLE_PATH DATA_PATH "/" "no_streamfix"

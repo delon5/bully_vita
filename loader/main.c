@@ -247,9 +247,9 @@ int ProcessEvents(void) {
 
     StreamingStats stream;
     streaming_patch_stats(&stream);
-    traceLog("stream: gate %s, game holds %d MB, %d refusals, %d backoffs\n",
-             stream.installed ? "on" : "OFF", stream.memory_used_mb, stream.refusals,
-             stream.backoffs);
+    traceLog("stream: gate %s, streamer holds %d MB of %d, %d refusals, %d backoffs\n",
+             stream.installed ? "on" : "OFF", stream.memory_used_mb, stream.budget_mb,
+             stream.refusals, stream.backoffs);
 
 #ifdef LOADER_ALLOC_TRACE
     // Less often than the heartbeat: this one walks a table and prints several
@@ -525,9 +525,9 @@ void patch_game(void) {
 
     StreamingStats stream;
     streaming_patch_stats(&stream);
-    traceLog("stream: gate %s, game holds %d MB, %d refusals, %d backoffs\n",
-             stream.installed ? "on" : "OFF", stream.memory_used_mb, stream.refusals,
-             stream.backoffs);
+    traceLog("stream: gate %s, streamer holds %d MB of %d, %d refusals, %d backoffs\n",
+             stream.installed ? "on" : "OFF", stream.memory_used_mb, stream.budget_mb,
+             stream.refusals, stream.backoffs);
 #ifdef LOADER_ALLOC_TRACE
   hook_addr(so_symbol(&bully_mod, "_Znwj"), (uintptr_t)&bully_operator_new);
   hook_addr(so_symbol(&bully_mod, "_Znaj"), (uintptr_t)&bully_operator_new_array);
