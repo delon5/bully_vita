@@ -21,6 +21,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++11")
 add_executable(Bully
   loader/main.c
   loader/alloc_trace.c
+  loader/streaming_patch.c
   loader/dialog.c
   loader/fios.c
   loader/so_util.c

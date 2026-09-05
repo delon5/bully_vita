@@ -54,6 +54,7 @@
 #include "movie_patch.h"
 #include "openal_patch.h"
 #include "alloc_trace.h"
+#include "streaming_patch.h"
 #include "texture_cache.h"
 
 #include "sha1.h"
@@ -229,6 +230,11 @@ int ProcessEvents(void) {
              (int)(heap.uordblks / (1024 * 1024)),
              cache.tracked_mb, cache.parked_mb, cache.evicted, cache.restored, cache.failed,
              cache.spilled, cache.starved, cache.deferred, cache.blocked);
+    StreamingStats stream;
+    streaming_patch_stats(&stream);
+    traceLog("stream: gate %s, game holds %d MB, %d refusals\n",
+             stream.installed ? "on" : "OFF", stream.memory_used_mb, stream.refusals);
+
 #ifdef LOADER_ALLOC_TRACE
     // Less often than the heartbeat: this one walks a table and prints several
     // lines, and the question it answers changes over minutes, not frames.
@@ -486,10 +492,15 @@ extern void *__cxa_guard_acquire;
 extern void *__cxa_guard_release;
 
 void patch_game(void) {
+    StreamingStats stream;
+    streaming_patch_stats(&stream);
+    traceLog("stream: gate %s, game holds %d MB, %d refusals\n",
+             stream.installed ? "on" : "OFF", stream.memory_used_mb, stream.refusals);
 #ifdef LOADER_ALLOC_TRACE
   hook_addr(so_symbol(&bully_mod, "_Znwj"), (uintptr_t)&bully_operator_new);
   hook_addr(so_symbol(&bully_mod, "_Znaj"), (uintptr_t)&bully_operator_new_array);
 #endif
+  streaming_patch_init();
   hook_addr(so_symbol(&bully_mod, "__cxa_guard_acquire"), (uintptr_t)&__cxa_guard_acquire);
   hook_addr(so_symbol(&bully_mod, "__cxa_guard_release"), (uintptr_t)&__cxa_guard_release);
 

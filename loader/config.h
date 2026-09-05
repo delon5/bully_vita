@@ -37,6 +37,21 @@
 #endif
 #define MEMORY_VITAGL_THRESHOLD_MB 8
 
+// How much of the newlib heap to keep clear of the game's streamer.
+//
+// The game's CStreaming::IsThereEnoughFreeMemory never looked at memory at all
+// -- it answered "yes" to any request under 10 MB -- so nothing streamed was
+// ever freed. The loader answers it honestly instead, and this is the figure it
+// answers against: once the heap is fuller than MEMORY_NEWLIB_MB minus this,
+// the streamer is told to make room and evicts its least recently used models
+// through its own code.
+//
+// Set too small and the game evicts constantly and re-streams what it just
+// dropped; too large and it runs out before it is ever asked to free anything.
+// A traced session reached 194 MB of a 208 MB heap before dying, so there is
+// real room to reclaim here.
+#define STREAMING_HEAP_KEEP_FREE_MB 32
+
 // How long a texture must go undrawn before vitaGL's own cache is allowed to
 // write it out and free it, in frames. vitaGL defaults to 3600 -- two minutes
 // at the frame rate this runs at -- and it only reclaims when an allocation has
