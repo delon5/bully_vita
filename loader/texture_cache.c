@@ -381,12 +381,11 @@ void texture_cache_init(void) {
   purge_store();
   sceIoMkdir(TEXTURE_CACHE_DIR, 0777);
 
-  restore_scratch = malloc((size_t)TEXTURE_BACKUP_MAX_KB * 1024);
-  if (!restore_scratch) {
-    debugPrintf("texture cache: no scratch buffer, textures will not be reloadable\n");
-    return;
-  }
-
+  // The scratch buffer is allocated when a texture is first read back from the
+  // card, not here. Spilling to the card is an emergency now and a whole
+  // session can pass without one, so holding four megabytes of the game's heap
+  // against the possibility is four megabytes the game could have had -- and it
+  // is dying of exactly that.
   backup_ready = 1;
   traceLog("texture cache: store at %s (%d MB free on ux0)\n",
            TEXTURE_CACHE_DIR, (int)(card_free / (1024 * 1024)));
@@ -564,6 +563,12 @@ static int restore_texture(GLuint id) {
   if (!saved) {
     char path[160];
     texture_path(path, sizeof(path), id, info->serial);
+    if (!restore_scratch) {
+      restore_scratch = malloc((size_t)TEXTURE_BACKUP_MAX_KB * 1024);
+      if (!restore_scratch)
+        return 0; // no room to read it back; the placeholder stays
+    }
+
     SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
     if (fd < 0)
       return 0;

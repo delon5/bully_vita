@@ -55,6 +55,17 @@ void __real_free(void *ptr);
 // so many small ones that the bulk counter shows it anyway.
 #define SMALL_BYTES (64 * 1024)
 
+// One small allocation in this many is credited to its call site, so the bulk
+// of the game's memory can be named without the table's lock in front of every
+// allocation it makes.
+#define SMALL_SAMPLE 64
+// The eboot's text starts here or above; the game's .so is mapped much higher,
+// at LOAD_ADDRESS, which is how a call site tells you which of the two asked.
+#define EBOOT_TEXT_BASE 0x81000000u
+// Marks a sampled block, so the report can scale it back up and so its bytes
+// are not counted twice against the large total.
+#define SAMPLED_FLAG 0x40000000u
+
 // Distinct call sites worth remembering. Raised well past the eboot's, because
 // a site that cannot claim a slot goes uncredited and its memory then appears
 // only in the total -- which is exactly the kind of gap this exists to close.
@@ -90,6 +101,7 @@ static inline void unlock_table(void) {
 static LiveBlock live[LIVE_SLOTS];
 static CallerTotals callers[CALLERS];
 static size_t large_live_bytes, small_live_bytes;
+static uint32_t small_seen;
 static uint32_t small_live_count, untracked_frees, table_full;
 
 // Pointers from a single heap are 8 byte aligned at worst, so the low bits
@@ -138,7 +150,8 @@ static void remember_block(void *ptr, size_t size, uint32_t caller) {
       b->ptr = ptr;
       b->size = (uint32_t)size;
       b->caller = caller;
-      large_live_bytes += size;
+      if (!(caller & SAMPLED_FLAG))
+        large_live_bytes += size;
       CallerTotals *c = caller_slot(caller);
       if (c) {
         c->live_bytes += (uint32_t)size;
@@ -164,7 +177,8 @@ static size_t forget_block(void *ptr, uint32_t *caller_out) {
       size_t size = b->size;
       if (caller_out)
         *caller_out = b->caller;
-      large_live_bytes -= size;
+      if (!(b->caller & SAMPLED_FLAG))
+        large_live_bytes -= size;
       CallerTotals *c = caller_slot(b->caller);
       if (c && c->caller == b->caller) {
         c->live_bytes -= b->size;
@@ -197,6 +211,14 @@ static void remember(void *ptr, size_t size, void *return_address) {
   if (size < SMALL_BYTES) {
     __atomic_add_fetch(&small_live_bytes, size, __ATOMIC_RELAXED);
     __atomic_add_fetch(&small_live_count, 1, __ATOMIC_RELAXED);
+    // One in SMALL_SAMPLE of them is credited to its call site anyway. 44 MB
+    // across 175000 small allocations is the largest thing the game holds and
+    // the only one still anonymous, and tabling them all would put the lock
+    // back in front of every allocation -- which is what made the game a
+    // slideshow before. Sampling costs a counter and names the holder just as
+    // well: a site responsible for a tenth of them is a tenth of the sample.
+    if ((__atomic_add_fetch(&small_seen, 1, __ATOMIC_RELAXED) & (SMALL_SAMPLE - 1)) == 0)
+      remember_block(ptr, size, so_offset(return_address) | SAMPLED_FLAG);
     return;
   }
 
@@ -297,19 +319,25 @@ void alloc_trace_report(void) {
            small_live_count, untracked_frees, table_full ? " [TABLE FULL]" : "");
 
   uint32_t ceiling = 0xffffffffu;
-  for (int rank = 0; rank < 8; rank++) {
+  for (int rank = 0; rank < 16; rank++) {
     CallerTotals *best = NULL;
     for (int i = 0; i < CALLERS; i++) {
       CallerTotals *c = &callers[i];
-      if (c->total_count == 0 || c->live_bytes >= ceiling)
+      // Eboot sites have their own report; this one is the game's.
+      if (c->total_count == 0 || c->live_bytes >= ceiling || c->caller >= EBOOT_TEXT_BASE)
         continue;
       if (!best || c->live_bytes > best->live_bytes)
         best = c;
     }
-    if (!best || best->live_bytes < 512 * 1024)
+    if (!best || best->live_bytes < 16 * 1024)
       break;
-    traceLog("heap:   libBully.so+0x%x holds %d MB in %u blocks (%u ever)\n", best->caller,
-             (int)(best->live_bytes / (1024 * 1024)), best->live_count, best->total_count);
+    if (best->caller & SAMPLED_FLAG)
+      traceLog("heap:   libBully.so+0x%x holds about %d MB in small blocks (1 in %d sampled)\n",
+               best->caller & ~SAMPLED_FLAG,
+               (int)(best->live_bytes * SMALL_SAMPLE / (1024 * 1024)), SMALL_SAMPLE);
+    else
+      traceLog("heap:   libBully.so+0x%x holds %d MB in %u blocks (%u ever)\n", best->caller,
+               (int)(best->live_bytes / (1024 * 1024)), best->live_count, best->total_count);
     ceiling = best->live_bytes;
   }
 }
@@ -340,10 +368,6 @@ void alloc_trace_report(void) {
  */
 
 #ifdef LOADER_ALLOC_TRACE
-
-// Text on this console starts here or above; the .so is mapped much higher, at
-// LOAD_ADDRESS, which is how the two are told apart.
-#define EBOOT_TEXT_BASE 0x81000000u
 
 static size_t loader_live_bytes;
 static uint32_t loader_live_count;

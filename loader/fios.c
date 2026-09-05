@@ -16,8 +16,18 @@
 #include "so_util.h"
 
 #define MAX_PATH_LENGTH 128
+// The read cache over main.obb. This is 32 MB in one block, taken at startup
+// and never released -- a fifth of the newlib heap, and the largest single
+// allocation in the process. The game is dying of heap exhaustion with
+// "system: 4 MB user free" and an OUT OF MEMORY on a 683 KB texture upload, so
+// this is memory it needs more than we need the cache depth.
+//
+// Halved rather than cut to nothing: the cache is what keeps area streaming off
+// the memory card, and the port already stutters when it has to read. The GTA
+// SA port uses 64 MB for the same thing, so there is no reason to think 32 was
+// a carefully chosen figure to begin with.
 #define RAMCACHEBLOCKSIZE (32 * 1024)
-#define RAMCACHEBLOCKNUM 1024
+#define RAMCACHEBLOCKNUM 512
 
 static int64_t g_OpStorage[SCE_FIOS_OP_STORAGE_SIZE(64, MAX_PATH_LENGTH) / sizeof(int64_t) + 1];
 static int64_t g_ChunkStorage[SCE_FIOS_CHUNK_STORAGE_SIZE(1024) / sizeof(int64_t) + 1];
