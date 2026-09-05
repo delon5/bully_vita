@@ -1023,6 +1023,7 @@ int main(int argc, char *argv[]) {
   // so the pair mode layton3-vita uses does not hold here and the global pool
   // vitaGL defaults to is the least accurate option. Postponing compilation to
   // glLinkProgram always gives it the right couple.
+  vglSetTextureCacheFrequency(TEXTURE_CACHE_IDLE_FRAMES);
   vglSetSemanticBindingMode(VGL_MODE_POSTPONED);
   vglSetupRuntimeShaderCompiler(SHARK_OPT_UNSAFE, SHARK_ENABLE, SHARK_ENABLE, SHARK_ENABLE);
   vglSetupGarbageCollector(127, 0x20000);

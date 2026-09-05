@@ -18,6 +18,18 @@
 #endif
 #define MEMORY_VITAGL_THRESHOLD_MB 8
 
+// How long a texture must go undrawn before vitaGL's own cache is allowed to
+// write it out and free it, in frames. vitaGL defaults to 3600 -- two minutes
+// at the frame rate this runs at -- and it only reclaims when an allocation has
+// already failed. Walking into a new area asks for several thousand textures in
+// a few seconds, and nothing the previous area used is anywhere near that stale,
+// so the sweep finds nothing eligible, frees nothing, and the allocation fails
+// anyway: on hardware the cache folder stayed empty right up to the crash.
+// A few seconds is long enough that anything still on screen is safe, and short
+// enough that the area you just left can be reclaimed to make room for the one
+// you are walking into.
+#define TEXTURE_CACHE_IDLE_FRAMES 240
+
 // vitaGL reports "Circular pool overrun on frame 376 (Total of 6532574 bytes)"
 // during the attract mode, which it warns costs performance. The default is
 // 32MB and the game asks for a little over 6MB in a single frame there, so the
