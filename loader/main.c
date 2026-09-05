@@ -21,6 +21,12 @@
 #include <psp2/display.h>
 #include <psp2/gxm.h>
 #include <kubridge.h>
+
+// vitaGL internals, declared here rather than pulled in from its private
+// shared.h: these are the programs glClear draws with, and a null one is the
+// difference between a clear that renders and one that quietly does nothing.
+extern void *clear_vertex_program_patched;
+extern void *clear_fragment_program_patched;
 #include <vitashark.h>
 #include <vitaGL.h>
 
@@ -1044,6 +1050,16 @@ int main(int argc, char *argv[]) {
   // anything. This is the one test that separates a display path that never
   // reaches the panel from content that is genuinely being drawn black: it uses
   // nothing but glClear and vglSwapBuffers, no shaders, no textures, no game.
+  // vitaGL's clear is a full-screen quad drawn with these two programs, built
+  // by the shader patcher during init. A null one means every glClear silently
+  // draws nothing, which is exactly what a black surface with no GL error and
+  // a working scanout looks like.
+  traceLog("display: clear programs vertex %p fragment %p\n",
+           clear_vertex_program_patched, clear_fragment_program_patched);
+  traceLog("display: vitaGL free ram %d KB, cdram %d KB, phycont %d KB, external %d KB\n",
+           (int)(vglMemFree(VGL_MEM_RAM) / 1024), (int)(vglMemFree(VGL_MEM_VRAM) / 1024),
+           (int)(vglMemFree(VGL_MEM_SLOW) / 1024), (int)(vglMemFree(VGL_MEM_EXTERNAL) / 1024));
+
   traceLog("display: clearing to red for one second\n");
   glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
   for (int i = 0; i < 60; i++) {
