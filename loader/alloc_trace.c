@@ -71,6 +71,16 @@ void __real_free(void *ptr);
 // only in the total -- which is exactly the kind of gap this exists to close.
 #define CALLERS 2048
 
+// A slot that has been freed, as distinct from one that was never used. Open
+// addressing puts a block wherever it lands after its hash, so a lookup has to
+// keep probing past collisions; clearing a slot to empty on deletion cuts that
+// chain, and every block that landed after the deleted one becomes invisible.
+// Its bytes are then never taken off the counters, and its slot is never
+// reclaimed -- which is the whole of the accounting corruption: totals that
+// only rise, an underflow when a fallback fires for a block that was still
+// tabled, and a table that fills with entries nothing can find.
+#define TOMBSTONE ((void *)1)
+
 typedef struct {
   void *ptr;
   uint32_t size;
@@ -152,7 +162,7 @@ static void remember_block(void *ptr, size_t size, uint32_t caller) {
   lock_table();
   for (uint32_t probe = 0; probe < 64; probe++) {
     LiveBlock *b = &live[(i + probe) & LIVE_MASK];
-    if (!b->ptr) {
+    if (!b->ptr || b->ptr == TOMBSTONE) {
       b->ptr = ptr;
       b->size = (uint32_t)size;
       b->caller = caller;
@@ -193,14 +203,14 @@ static size_t forget_block(void *ptr, uint32_t *caller_out) {
         c->live_bytes -= b->size;
         c->live_count--;
       }
-      b->ptr = NULL;
+      b->ptr = TOMBSTONE; // not NULL: that would cut the chain behind it
       b->size = 0;
       b->caller = 0;
       unlock_table();
       return size ? size : 1;
     }
     if (!b->ptr)
-      break; // the run ended, so it was never tabled
+      break; // a slot never used ends the chain; a tombstone does not
   }
   unlock_table();
   return 0;
