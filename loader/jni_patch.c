@@ -231,9 +231,35 @@ float GetGamepadAxis(int port, int axis) {
 
 static int frames_swapped;
 
+#ifdef LOADER_TRACE
+// vitaGL skips the display queue entirely while a framebuffer object is bound,
+// so a game that leaves one bound at swap time renders perfectly and shows
+// nothing. Read the frame back too: content in the surface with a black panel
+// is a presentation fault, a black surface is the game drawing nothing.
+extern void *in_use_framebuffer;
+
+static void trace_frame_contents(int n) {
+  uint32_t px[64];
+  int lit = 0;
+  for (int y = 0; y < 8; y++) {
+    glReadPixels(0, y * (SCREEN_H / 8), 8, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    for (int i = 0; i < 8; i++)
+      if ((px[i] & 0x00ffffff) != 0)
+        lit++;
+  }
+  glReadPixels(SCREEN_W / 2, SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+  traceLog("frame: %d readback centre 0x%08x, %d/64 lit, fbo bound %p\n",
+           n, px[0], lit, in_use_framebuffer);
+}
+#endif
+
 int swapBuffers(void) {
   if (frames_swapped < 3 || frames_swapped == 60 || frames_swapped == 600)
     traceLog("frame: %d presented\n", frames_swapped);
+#ifdef LOADER_TRACE
+  if (frames_swapped == 2 || frames_swapped == 60 || frames_swapped == 600)
+    trace_frame_contents(frames_swapped);
+#endif
   frames_swapped++;
 
   texture_cache_tick();

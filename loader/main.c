@@ -1193,6 +1193,7 @@ int main(int argc, char *argv[]) {
   texture_cache_init();
 
   traceLog("boot: texture cache done, initialising vitaGL\n");
+  vglSetCircularPoolSize(MEMORY_VITAGL_CIRCULAR_POOL_MB * 1024 * 1024);
   vglSetupGarbageCollector(127, 0x20000);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
 

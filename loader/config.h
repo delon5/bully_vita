@@ -18,6 +18,14 @@
 #endif
 #define MEMORY_VITAGL_THRESHOLD_MB 8
 
+// vitaGL reports "Circular pool overrun on frame 376 (Total of 6532574 bytes)"
+// during the attract mode, which it warns costs performance. The default is
+// 32MB and the game asks for a little over 6MB in a single frame there, so the
+// overrun is transient spikes rather than a steady shortfall; 48MB absorbs them
+// with room to spare and still leaves the heaps well clear of the budget the
+// texture cache works to.
+#define MEMORY_VITAGL_CIRCULAR_POOL_MB 48
+
 // Create this file to turn the texture cache off: nothing is tracked, nothing
 // is evicted and no backing store is opened, leaving the game's texture
 // handling exactly as it was. It is a runtime switch rather than a build option
