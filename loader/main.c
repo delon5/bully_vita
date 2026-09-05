@@ -165,7 +165,7 @@ int ProcessEvents(void) {
   // The game's main loop calls this every iteration, so it tells apart a loop
   // that is running but never drawing from one that is not running at all.
   static int events;
-  if (events == 0 || events == 60 || events == 600 || events == 3000)
+  if (events == 0 || events == 600 || events == 3000 || events == 10000 || events == 30000)
     traceLog("loop: ProcessEvents %d, movie player state %d\n", events, movie_player_state());
   events++;
 #endif

@@ -190,6 +190,10 @@ void movie_draw_frame(void) {
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, &movie_pos[0]);
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, &movie_texcoord[0]);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+#ifdef LOADER_TRACE
+        if (drawn <= 1)
+          traceLog("movie: drew frame, gl error 0x%x\n", glGetError());
+#endif
         vglSwapBuffers(GL_FALSE);
       }
     } else {
@@ -198,6 +202,7 @@ void movie_draw_frame(void) {
   }
 
   if (player_state == PLAYER_STOP) {
+    traceLog("movie: stopping\n");
     sceAvPlayerStop(movie_player);
     sceKernelWaitThreadEnd(audio_thid, NULL, NULL);
     sceAvPlayerClose(movie_player);
@@ -205,6 +210,7 @@ void movie_draw_frame(void) {
     player_state = PLAYER_INACTIVE;
     glClear(GL_COLOR_BUFFER_BIT);
     vglSwapBuffers(GL_FALSE);
+    traceLog("movie: finished, handed the screen back to the game\n");
   }
 }
 
