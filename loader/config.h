@@ -39,6 +39,14 @@
 // hand out on a Vita (128MB of CDRAM plus whatever is left of main RAM once the
 // game heap above has been carved out).
 #define TEXTURE_BUDGET_MB 128
+// Nothing is evicted while we are comfortably under budget, so a copy taken
+// then is written to the card for no reason -- and taking one for every
+// texture the game loads means writing a couple of hundred megabytes to slow
+// storage during startup, competing with the game's own asset reads. Start
+// copying once resident textures pass this mark. What was loaded before it is
+// the core set the game keeps hot anyway, and the growth that used to run the
+// console out of memory is all above the line and backed as normal.
+#define TEXTURE_BACKUP_START_MB 64
 // Evict regardless of the budget once vitaGL has less than this much free, so
 // that memory pressure coming from anywhere else does not kill us either.
 #define TEXTURE_RESERVE_MB 32

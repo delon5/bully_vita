@@ -822,7 +822,13 @@ static void upload_finished(GLenum target, GLint level, GLsizei width, GLsizei h
   if (level == 0)
     info->serial = ++upload_serial;
 
-  if (level == 0 || !info->unbacked)
+  // Below the start mark a copy would never be used: eviction does not run
+  // until we are at the budget, and reaching it only requires the textures
+  // above the line to be reloadable.
+  int worth_backing = tracked_bytes >= (size_t)TEXTURE_BACKUP_START_MB * 1024 * 1024;
+  if (!worth_backing)
+    info->unbacked = 1;
+  else if (level == 0 || !info->unbacked)
     info->unbacked = !backup_stage(info, id, level, width, height, source_bytes, internalformat,
                                    format, type, compressed, data);
   if (info->unbacked)
