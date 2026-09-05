@@ -30,16 +30,22 @@
 
 #ifdef LOADER_ALLOC_TRACE
 
-// Live allocations, open addressed by pointer. Sized well past what the game
-// keeps live so lookups stay short; a full table would silently stop
-// accounting, so overflow is counted and reported rather than ignored.
-#define LIVE_SLOTS 262144
+// Live allocations of SMALL_BYTES or more, open addressed by pointer. Only
+// large blocks reach it, so it can be a fraction of the size the first version
+// needed -- 384 KB rather than three megabytes, which matters on a port that is
+// short of memory. A full table would silently stop accounting, so overflow is
+// counted and reported rather than ignored.
+#define LIVE_SLOTS 32768
 #define LIVE_MASK (LIVE_SLOTS - 1)
 
-// Allocations smaller than this are counted in bulk rather than individually.
-// A hundred thousand small allocations are a fact of life in a game this size,
-// and the question here is where megabytes go.
-#define SMALL_BYTES 1024
+// Allocations smaller than this are counted in bulk, without the table and
+// without the lock. The first version of this drew the line at 1 KB, which put
+// a contended lock in front of nearly every allocation the game made and turned
+// the game into a slideshow. At 64 KB the table sees a few thousand blocks
+// rather than hundreds of thousands, so the lock is taken rarely enough to
+// disappear -- and a leak measured in megabytes is made of large blocks or of
+// so many small ones that the bulk counter shows it anyway.
+#define SMALL_BYTES (64 * 1024)
 
 // Distinct call sites worth remembering. The game has far fewer places that
 // allocate large blocks than it has allocations.
@@ -120,15 +126,16 @@ static void remember(void *ptr, size_t size, void *return_address) {
   (void)size;
   size = malloc_usable_size(ptr);
 
-  lock_table();
+  // Small blocks never touch the table or the lock: atomics on two counters,
+  // which is the difference between an observation and a stall.
   if (size < SMALL_BYTES) {
-    small_live_bytes += size;
-    small_live_count++;
-    unlock_table();
+    __atomic_add_fetch(&small_live_bytes, size, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&small_live_count, 1, __ATOMIC_RELAXED);
     return;
   }
 
   uint32_t caller = so_offset(return_address);
+  lock_table();
   uint32_t i = hash_ptr(ptr) & LIVE_MASK;
   for (uint32_t probe = 0; probe < 64; probe++) {
     LiveBlock *b = &live[(i + probe) & LIVE_MASK];
@@ -158,18 +165,13 @@ static void forget(void *ptr) {
   // Small blocks are most of the traffic and are not in the table, so settle
   // that first rather than probing for something that was never put there.
   size_t size = malloc_usable_size(ptr);
-  lock_table();
   if (size < SMALL_BYTES) {
-    if (small_live_count) {
-      small_live_bytes -= small_live_bytes < size ? small_live_bytes : size;
-      small_live_count--;
-    } else {
-      untracked_frees++;
-    }
-    unlock_table();
+    __atomic_sub_fetch(&small_live_bytes, size, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&small_live_count, 1, __ATOMIC_RELAXED);
     return;
   }
 
+  lock_table();
   uint32_t i = hash_ptr(ptr) & LIVE_MASK;
   for (uint32_t probe = 0; probe < 64; probe++) {
     LiveBlock *b = &live[(i + probe) & LIVE_MASK];

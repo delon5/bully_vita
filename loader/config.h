@@ -33,16 +33,22 @@
 #define LOAD_ADDRESS 0x98000000
 
 #define MEMORY_SCELIBC_MB 4
-// The game's own heap. A session that crashed had it at 153 MB of 160 while
-// vitaGL still had 101 MB free across its pools -- so the memory that ran out
-// was the game's, not the renderer's, and no amount of evicting textures was
-// ever going to help. vitaGL takes whatever is left after this, so raising it
-// moves memory from the texture pools to the game, which is where the shortage
-// actually was: the pools never fell below 101 MB of 229 all session.
+// The game's own heap. vitaGL takes whatever is left, and the two do not trade
+// off gently: at 208 MB the pools came to 133 MB against a 104 MB texture
+// working set, and the texture cache spent the whole session a few megabytes
+// from its limit -- escalating every sixty frames and writing textures to the
+// memory card, 524 times, each one a stall. A quarter of the frame rate samples
+// were under 20 fps.
+//
+// At 160 MB the pools are 229 MB and never fell below 101 MB free all session,
+// which is the difference between a cache that reclaims occasionally and one
+// that thrashes. The extra heap did buy longer sessions before the game ran out
+// of memory, but it bought them with a permanent stutter, and the leak it was
+// meant to address is not the renderer's to fix.
 #ifdef HAVE_RAZOR
 #define MEMORY_NEWLIB_MB 256
 #else
-#define MEMORY_NEWLIB_MB 208
+#define MEMORY_NEWLIB_MB 160
 #endif
 #define MEMORY_VITAGL_THRESHOLD_MB 8
 
