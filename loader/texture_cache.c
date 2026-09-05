@@ -296,6 +296,8 @@ static int backup_stage(TextureInfo *info, GLuint id, GLint level, GLsizei width
     return 0;
   if (sizeof(BackupRecord) + size > (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
     return 0;
+  if (level == 0 && size < TEXTURE_BACKUP_MIN_BYTES)
+    return 0; // see TEXTURE_BACKUP_MIN_BYTES: not worth a file, so kept resident
 
   char path[160];
 

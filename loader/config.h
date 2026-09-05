@@ -94,6 +94,18 @@
 // without one and falls back to evicting textures it cannot reload, which
 // still keeps memory bounded.
 #define TEXTURE_BACKUP_MIN_MB 64
+// Smallest texture worth a file on the card. The game uploads thousands of
+// small textures for every large one, so the small ones are nearly all of the
+// file operations and almost none of the memory -- and a file costs a directory
+// lookup on every later run even when it is already there, which is why a
+// second run was no faster than the first.
+//
+// Below this a texture is kept resident and never evicted. That was dangerous
+// while eviction had a last resort that dropped textures with no copy: it is
+// what put a black character and then black ground on screen. With that gone,
+// the worst an uncopied texture can do is stay.
+#define TEXTURE_BACKUP_MIN_BYTES (32 * 1024)
+
 // Largest texture, all mipmap levels together, we are willing to copy.
 #define TEXTURE_BACKUP_MAX_KB 4096
 // Staging arena for copies waiting to be written. It has to be a good few times
