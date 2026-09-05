@@ -1036,6 +1036,21 @@ int main(int argc, char *argv[]) {
 
   traceLog("boot: vitaGL up (%s / %s), setting up movie player\n",
            (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER));
+
+#ifdef LOADER_TRACE
+  // Paint the screen red for a moment before the game gets a chance to draw
+  // anything. This is the one test that separates a display path that never
+  // reaches the panel from content that is genuinely being drawn black: it uses
+  // nothing but glClear and vglSwapBuffers, no shaders, no textures, no game.
+  traceLog("display: clearing to red for one second\n");
+  glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+  for (int i = 0; i < 60; i++) {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    vglSwapBuffers(GL_FALSE);
+  }
+  traceLog("display: red test done, gl error 0x%x\n", glGetError());
+  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+#endif
   movie_setup_player();
 
   traceLog("boot: handing over to the game\n");
