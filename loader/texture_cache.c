@@ -114,6 +114,8 @@ static uint32_t frame_counter = 1;
 static size_t tracked_bytes = 0;
 static uint32_t upload_serial = 1;
 static uint32_t starved_frames; // frames the lossless pass has failed to keep up
+// Counted for the trace: this is the first time any of this has run on hardware.
+static uint32_t evicted_count, restored_count, restore_failed_count;
 
 static PendingWrite queue[QUEUE_SLOTS];
 static volatile uint32_t queue_head; // producer: the render thread
@@ -618,6 +620,7 @@ static uint32_t bytes_per_pixel(GLint internalformat, GLenum type) {
  */
 
 static void evict_texture(GLuint id) {
+  evicted_count++;
   TextureInfo *info = &textures[id];
 
   install_placeholder(id);
@@ -754,8 +757,12 @@ void glBindTextureHook(GLenum target, GLuint texture) {
   TextureInfo *info = cache_enabled ? texture_info(texture) : NULL;
   if (info && info->evicted && target == GL_TEXTURE_2D) {
     // The game is about to draw with a texture we dropped. Put it back.
-    if (!is_restorable(info) || !restore_texture(texture))
+    if (!is_restorable(info) || !restore_texture(texture)) {
       info->unbacked = 1; // nothing we can do; stop pretending it is reloadable
+      restore_failed_count++;
+    } else {
+      restored_count++;
+    }
   }
 
   texture_touch(texture);
@@ -882,4 +889,14 @@ void glTexParameterfHook(GLenum target, GLenum pname, GLfloat param) {
       info->min_filter = (GLint)param;
   }
   glTexParameterf(target, pname, param);
+}
+
+// Reported on the trace heartbeat while this is being exercised for the first
+// time on hardware: how much is resident, how much has been dropped, and how
+// much of it came back.
+void texture_cache_stats(int *mb, int *evicted, int *restored, int *failed) {
+  *mb = (int)(tracked_bytes / (1024 * 1024));
+  *evicted = (int)evicted_count;
+  *restored = (int)restored_count;
+  *failed = (int)restore_failed_count;
 }

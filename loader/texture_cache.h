@@ -33,5 +33,6 @@ void texture_cache_shutdown(void);
 // Drops the least recently used textures if we are over budget. Must be called
 // once per frame from the thread that renders, right before swapping buffers.
 void texture_cache_tick(void);
+void texture_cache_stats(int *mb, int *evicted, int *restored, int *failed);
 
 #endif

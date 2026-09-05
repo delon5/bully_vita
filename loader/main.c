@@ -212,9 +212,12 @@ int ProcessEvents(void) {
   // The game's main loop calls this every iteration, so it tells apart a loop
   // that is running but never drawing from one that is not running at all.
   static int events;
-  if (events % 600 == 0)
-    traceLog("loop: %d | tex %d buf %d draw %d\n",
-             events, trace_textures, trace_buffers, trace_draws);
+  if (events % 600 == 0) {
+    int cache_mb, evicted, restored, failed;
+    texture_cache_stats(&cache_mb, &evicted, &restored, &failed);
+    traceLog("loop: %d | tex %d draw %d | cache %d MB, evicted %d, restored %d, lost %d\n",
+             events, trace_textures, trace_draws, cache_mb, evicted, restored, failed);
+  }
   events++;
 #endif
   movie_draw_frame();
