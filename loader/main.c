@@ -215,8 +215,12 @@ int ProcessEvents(void) {
   if (events % 600 == 0) {
     int cache_mb, evicted, restored, failed;
     texture_cache_stats(&cache_mb, &evicted, &restored, &failed);
-    traceLog("loop: %d | tex %d draw %d | cache %d MB, evicted %d, restored %d, lost %d\n",
-             events, trace_textures, trace_draws, cache_mb, evicted, restored, failed);
+    traceLog("loop: %d | tex %d draw %d | vgl ram %d cdram %d phycont %d MB | cache %d MB ev %d re %d lost %d\n",
+             events, trace_textures, trace_draws,
+             (int)(vglMemFree(VGL_MEM_RAM) / (1024 * 1024)),
+             (int)(vglMemFree(VGL_MEM_VRAM) / (1024 * 1024)),
+             (int)(vglMemFree(VGL_MEM_PHYCONT) / (1024 * 1024)),
+             cache_mb, evicted, restored, failed);
   }
   events++;
 #endif
