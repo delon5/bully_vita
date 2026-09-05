@@ -220,6 +220,13 @@ int ProcessEvents(void) {
     // Heap used as well as the GPU pools. The cache parks evicted textures in
     // the newlib heap, so a crash could now be the heap running out rather than
     // the pools, and the two look nothing alike from a coredump.
+    //
+    // Broken out rather than taken as one number, because the allocation trace
+    // accounts for 76 MB of what this reports as 155 MB, and the shape of that
+    // gap decides what the fix even is. arena is what has been taken from the
+    // system and never given back; uordblks is what is actually live; fordblks
+    // is what has been freed and is sitting in the free lists. A large fordblks
+    // is fragmentation, not a leak, and no amount of freeing things fixes it.
     struct mallinfo heap = mallinfo();
     traceLog("loop: %d | tex %d draw %d | vgl ram %d cdram %d phycont %d MB | heap %d MB | "
              "cache %d MB parked %d ev %d re %d lost %d spill %d starve %d defer %d block %d\n",
@@ -244,6 +251,9 @@ int ProcessEvents(void) {
     last_frames = frames_swapped;
     last_us = us;
     traceLog("fps: %d over the last %d frames\n", fps, drawn);
+    traceLog("heapinfo: arena %d MB, live %d MB, free-listed %d MB, top %d KB\n",
+             (int)(heap.arena / (1024 * 1024)), (int)(heap.uordblks / (1024 * 1024)),
+             (int)(heap.fordblks / (1024 * 1024)), (int)(heap.keepcost / 1024));
 
     StreamingStats stream;
     streaming_patch_stats(&stream);
@@ -508,26 +518,6 @@ extern void *__cxa_guard_acquire;
 extern void *__cxa_guard_release;
 
 void patch_game(void) {
-    // Frames actually presented since the last heartbeat, over the wall clock
-    // between them. vsync is disabled, so this is what the hardware managed.
-    static int last_frames;
-    static uint32_t last_us;
-    SceKernelSysClock now;
-    sceKernelGetProcessTime(&now);
-    uint32_t us = (uint32_t)now;
-    int drawn = frames_swapped - last_frames;
-    int fps = 0;
-    if (last_us && us > last_us)
-      fps = (int)(((uint64_t)drawn * 1000000u) / (us - last_us));
-    last_frames = frames_swapped;
-    last_us = us;
-    traceLog("fps: %d over the last %d frames\n", fps, drawn);
-
-    StreamingStats stream;
-    streaming_patch_stats(&stream);
-    traceLog("stream: gate %s, streamer holds %d MB of %d, %d refusals, %d backoffs\n",
-             stream.installed ? "on" : "OFF", stream.memory_used_mb, stream.budget_mb,
-             stream.refusals, stream.backoffs);
 #ifdef LOADER_ALLOC_TRACE
   hook_addr(so_symbol(&bully_mod, "_Znwj"), (uintptr_t)&bully_operator_new);
   hook_addr(so_symbol(&bully_mod, "_Znaj"), (uintptr_t)&bully_operator_new_array);
