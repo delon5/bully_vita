@@ -824,7 +824,14 @@ static void upload_finished(GLenum target, GLint level, GLsizei width, GLsizei h
   texture_uploaded(id, resident_bytes, level == 0);
 }
 
+#ifdef LOADER_TRACE
+extern int trace_textures;
+#endif
+
 void glTexImage2DHook(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *data) {
+#ifdef LOADER_TRACE
+  trace_textures++;
+#endif
   // Levels above the base are dropped: the game supplies mipmaps the Vita does
   // not need and vitaGL would rebase them against whichever level arrived first.
   if (level != 0)
@@ -840,6 +847,9 @@ void glTexImage2DHook(GLenum target, GLint level, GLint internalformat, GLsizei 
 }
 
 void glCompressedTexImage2DHook(GLenum target, GLint level, GLenum format, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void *data) {
+#ifdef LOADER_TRACE
+  trace_textures++;
+#endif
   // mips for PVRTC textures break when they're under 1 block in size
   if (!(level == 0 || ((width >= 4 && height >= 4) || (format != 0x8C01 && format != 0x8C02))))
     return;

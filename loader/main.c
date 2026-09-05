@@ -176,16 +176,22 @@ int OS_ScreenGetWidth(void) {
   return SCREEN_W;
 }
 
+#ifdef LOADER_TRACE
+// Counted rather than logged individually: the question after startup is
+// whether the game is still doing work at all, and five numbers on each
+// heartbeat answer that without thousands of lines.
+int trace_files, trace_textures, trace_buffers, trace_clears, trace_draws;
+#endif
+
 int ProcessEvents(void) {
 #ifdef LOADER_TRACE
   // The game's main loop calls this every iteration, so it tells apart a loop
   // that is running but never drawing from one that is not running at all.
   static int events;
   if (events % 600 == 0)
-    traceLog("loop: ProcessEvents %d, movie player state %d, vitaGL ram %d KB cdram %d KB phycont %d KB\n",
-             events, movie_player_state(),
-             (int)(vglMemFree(VGL_MEM_RAM) / 1024), (int)(vglMemFree(VGL_MEM_VRAM) / 1024),
-             (int)(vglMemFree(VGL_MEM_PHYCONT) / 1024));
+    traceLog("loop: %d | files %d tex %d buf %d clear %d draw %d | cdram %d KB\n",
+             events, trace_files, trace_textures, trace_buffers, trace_clears, trace_draws,
+             (int)(vglMemFree(VGL_MEM_VRAM) / 1024));
   events++;
 #endif
   movie_draw_frame();
@@ -625,10 +631,11 @@ void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, con
 // drawing anything, so log what it opens: the last name before it stops is
 // what it is waiting on.
 static FILE *fopen_hook(const char *name, const char *mode) {
-  static int opens;
-  if (opens < 60)
+  // Only the first few by name -- after that the counter in the heartbeat is
+  // what matters, since the question is whether the game is still working.
+  if (trace_files < 40)
     traceLog("file: open %s\n", name ? name : "(null)");
-  opens++;
+  trace_files++;
   return sceLibcBridge_fopen(name, mode);
 }
 #endif
@@ -643,15 +650,14 @@ static FILE *fopen_hook(const char *name, const char *mode) {
 static GLuint glCreateProgramTrace(void) { TRACE_FIRST("glCreateProgram"); return glCreateProgram(); }
 static void glAttachShaderTrace(GLuint p, GLuint s) { TRACE_FIRST("glAttachShader"); glAttachShader(p, s); }
 static void glUseProgramTrace(GLuint p) { TRACE_FIRST("glUseProgram"); glUseProgram(p); }
-static void glClearTrace(GLbitfield m) { TRACE_FIRST("glClear"); glClear(m); }
+static void glClearTrace(GLbitfield m) { TRACE_FIRST("glClear"); trace_clears++; glClear(m); }
 static void glViewportTrace(GLint x, GLint y, GLsizei w, GLsizei h) { TRACE_FIRST("glViewport"); glViewport(x, y, w, h); }
 static void glBufferDataTrace(GLenum t, GLsizeiptr sz, const void *d, GLenum u) {
   // Logged on both sides: vitaGL's allocation failure path waits on the
   // garbage collector's semaphore and sleeps a second per retry, so a call
   // that is entered and never left is a thread parked inside vitaGL rather
   // than a game that decided to stop.
-  static int calls;
-  int n = calls++;
+  int n = trace_buffers++;
   if (n < 3)
     traceLog("gl: glBufferData %d entering, %d bytes\n", n, (int)sz);
   glBufferData(t, sz, d, u);
@@ -678,10 +684,9 @@ void glLinkProgramHook(GLuint prog) {
 void glDrawElementsHook(GLenum mode, GLsizei count, GLenum type, const void *indices) {
   glDrawElements(mode, count, type, indices);
 #ifdef LOADER_TRACE
-  static int draws;
-  if (draws == 0 || draws == 100 || draws == 1000)
-    traceLog("draw: glDrawElements %d, %d indices, gl error 0x%x\n", draws, count, glGetError());
-  draws++;
+  if (trace_draws == 0 || trace_draws == 100 || trace_draws == 1000)
+    traceLog("draw: glDrawElements %d, %d indices, gl error 0x%x\n", trace_draws, count, glGetError());
+  trace_draws++;
 #endif
 }
 
