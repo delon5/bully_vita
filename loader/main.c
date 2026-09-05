@@ -230,6 +230,21 @@ int ProcessEvents(void) {
              (int)(heap.uordblks / (1024 * 1024)),
              cache.tracked_mb, cache.parked_mb, cache.evicted, cache.restored, cache.failed,
              cache.spilled, cache.starved, cache.deferred, cache.blocked);
+    // Frames actually presented since the last heartbeat, over the wall clock
+    // between them. vsync is disabled, so this is what the hardware managed.
+    static int last_frames;
+    static uint32_t last_us;
+    SceKernelSysClock now;
+    sceKernelGetProcessTime(&now);
+    uint32_t us = (uint32_t)now;
+    int drawn = frames_swapped - last_frames;
+    int fps = 0;
+    if (last_us && us > last_us)
+      fps = (int)(((uint64_t)drawn * 1000000u) / (us - last_us));
+    last_frames = frames_swapped;
+    last_us = us;
+    traceLog("fps: %d over the last %d frames\n", fps, drawn);
+
     StreamingStats stream;
     streaming_patch_stats(&stream);
     traceLog("stream: gate %s, game holds %d MB, %d refusals\n",
@@ -492,6 +507,21 @@ extern void *__cxa_guard_acquire;
 extern void *__cxa_guard_release;
 
 void patch_game(void) {
+    // Frames actually presented since the last heartbeat, over the wall clock
+    // between them. vsync is disabled, so this is what the hardware managed.
+    static int last_frames;
+    static uint32_t last_us;
+    SceKernelSysClock now;
+    sceKernelGetProcessTime(&now);
+    uint32_t us = (uint32_t)now;
+    int drawn = frames_swapped - last_frames;
+    int fps = 0;
+    if (last_us && us > last_us)
+      fps = (int)(((uint64_t)drawn * 1000000u) / (us - last_us));
+    last_frames = frames_swapped;
+    last_us = us;
+    traceLog("fps: %d over the last %d frames\n", fps, drawn);
+
     StreamingStats stream;
     streaming_patch_stats(&stream);
     traceLog("stream: gate %s, game holds %d MB, %d refusals\n",

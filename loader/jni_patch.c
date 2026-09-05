@@ -229,7 +229,10 @@ float GetGamepadAxis(int port, int axis) {
   return 0.0f;
 }
 
-static int frames_swapped;
+// Presented frames. Read by the trace heartbeat to work out the real frame
+// rate, which is worth measuring rather than assuming: vsync is off, so
+// whatever the game reaches is what the hardware can do, not a cap.
+int frames_swapped;
 
 #ifdef LOADER_TRACE
 // vitaGL skips the display queue entirely while a framebuffer object is bound,
