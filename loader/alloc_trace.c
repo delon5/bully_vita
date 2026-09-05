@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dialog.h"
 #include "main.h"
 #include "config.h"
 #include "alloc_trace.h"
@@ -221,6 +222,43 @@ void *bully_memalign(size_t alignment, size_t size) {
 void bully_free(void *ptr) {
   forget(ptr);
   free(ptr);
+}
+
+// operator new and operator new[], replaced rather than merely observed.
+//
+// The game defines its own -- the standard libstdc++ shape: round zero up to
+// one, malloc, and on failure run the new_handler or throw. They call malloc,
+// so without this every C++ allocation in the game would be credited to
+// operator new itself and the report would say nothing at all. Hooked, the
+// return address is the code that actually wrote "new".
+//
+// operator delete needs no such treatment: it is a plain branch to free, which
+// the loader already resolves to bully_free.
+//
+// The one behavioural difference is the failure path. The original walks the
+// new_handler chain and throws std::bad_alloc; reproducing that from out here
+// means reaching into the game's exception machinery. This is a diagnostic
+// build of a port whose whole problem is running out of memory, so a failed
+// allocation says so and stops, which is more use than an obscure crash a few
+// frames later.
+static void *op_new(size_t size, void *return_address) {
+  if (size == 0)
+    size = 1;
+  void *ptr = malloc(size);
+  if (!ptr)
+    fatal_error("out of memory: the game asked for %d bytes and the heap had none left.\n"
+                "This is the leak, caught at the moment it ran out.",
+                (int)size);
+  remember(ptr, size, return_address);
+  return ptr;
+}
+
+void *bully_operator_new(size_t size) {
+  return op_new(size, __builtin_return_address(0));
+}
+
+void *bully_operator_new_array(size_t size) {
+  return op_new(size, __builtin_return_address(0));
 }
 
 void alloc_trace_report(void) {

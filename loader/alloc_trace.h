@@ -17,6 +17,12 @@ void *bully_realloc(void *ptr, size_t size);
 void *bully_memalign(size_t alignment, size_t size);
 void bully_free(void *ptr);
 
+// operator new / operator new[]. The game defines its own on top of malloc, so
+// these are hooked over it -- otherwise every C++ allocation is credited to
+// operator new rather than to whoever wrote "new".
+void *bully_operator_new(size_t size);
+void *bully_operator_new_array(size_t size);
+
 // Writes what the heap is holding and who asked for it to the trace.
 void alloc_trace_report(void);
 
