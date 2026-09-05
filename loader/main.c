@@ -1012,9 +1012,8 @@ int main(int argc, char *argv[]) {
   // glLinkProgram always gives it the right couple.
   vglSetSemanticBindingMode(VGL_MODE_POSTPONED);
   vglSetupRuntimeShaderCompiler(SHARK_OPT_UNSAFE, SHARK_ENABLE, SHARK_ENABLE, SHARK_ENABLE);
-  vglSetCircularPoolSize(MEMORY_VITAGL_CIRCULAR_POOL_MB * 1024 * 1024);
   vglSetupGarbageCollector(127, 0x20000);
-  vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
+  vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_2X);
 
 #ifdef LOADER_TRACE
   // Does the main GXM context rasterise anything at all? Nothing but glClear
