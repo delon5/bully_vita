@@ -165,7 +165,7 @@ int ProcessEvents(void) {
   // The game's main loop calls this every iteration, so it tells apart a loop
   // that is running but never drawing from one that is not running at all.
   static int events;
-  if (events == 0 || events == 600 || events == 3000 || events == 10000 || events == 30000)
+  if (events % 600 == 0)
     traceLog("loop: ProcessEvents %d, movie player state %d\n", events, movie_player_state());
   events++;
 #endif
@@ -553,7 +553,7 @@ void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, con
     // Only the first handful, but enough to say whether the game's shaders are
     // being found on the card and accepted by vitaGL at all.
     static int loads;
-    if (loads < 4)
+    if (loads < 40)
       traceLog("shader: %s %s\n", sha_name, file ? "found" : "MISSING");
     loads++;
   }
@@ -590,7 +590,7 @@ void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, con
 #ifdef LOADER_TRACE
     {
       static int bins;
-      if (bins < 4)
+      if (bins < 40)
         traceLog("shader: glShaderBinary %d bytes, gl error 0x%x\n",
                  (int)shaderSize, glGetError());
       bins++;
@@ -600,6 +600,19 @@ void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, con
     free(shaderBuf);
   }
 }
+
+#ifdef LOADER_TRACE
+// The game goes quiet after the intro movie without linking a program or
+// drawing anything, so log what it opens: the last name before it stops is
+// what it is waiting on.
+static FILE *fopen_hook(const char *name, const char *mode) {
+  static int opens;
+  if (opens < 60)
+    traceLog("file: open %s\n", name ? name : "(null)");
+  opens++;
+  return sceLibcBridge_fopen(name, mode);
+}
+#endif
 
 void glLinkProgramHook(GLuint prog) {
   glLinkProgram(prog);
@@ -762,7 +775,11 @@ static so_default_dynlib default_dynlib[] = {
   // { "fgetc", (uintptr_t)&fgetc },
   // { "fgets", (uintptr_t)&fgets },
 
+#ifdef LOADER_TRACE
+  { "fopen", (uintptr_t)&fopen_hook },
+#else
   { "fopen", (uintptr_t)&sceLibcBridge_fopen },
+#endif
   { "fprintf", (uintptr_t)&sceLibcBridge_fprintf },
   // { "fputc", (uintptr_t)&sceLibcBridge_fputc },
   // { "fputs", (uintptr_t)&sceLibcBridge_fputs },
