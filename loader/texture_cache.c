@@ -28,6 +28,7 @@
  */
 
 #include <psp2/appmgr.h>
+#include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
@@ -75,7 +76,8 @@ typedef struct {
   uint32_t last_frame; // frame counter at the time of the last bind
 
   uint32_t serial;
-  uint32_t backup_bytes; // bytes of texture data written when it was evicted
+  uint32_t backup_bytes; // bytes of texture data saved when it was evicted
+  uint8_t *ram_copy; // the saved bytes, when they fit in the heap rather than on the card
   int32_t internalformat, format, type;
   LevelInfo level[MAX_BACKUP_LEVELS];
   int32_t min_filter; // the game's last glTexParameteri, clobbered while evicted
@@ -108,6 +110,11 @@ static uint32_t evicted_count, restored_count, restore_failed_count;
 static uint8_t *restore_scratch;
 static int backup_ready;
 static int cache_enabled = 1;
+static size_t ram_cache_bytes; // evicted textures currently parked in the heap
+static int card_writes_this_frame;
+// Counted for the trace, to tell an eviction that cost a memcpy from one that
+// cost a write.
+static uint32_t ram_evicted_count, card_evicted_count, ram_restored_count;
 
 
 // vglMemFree refuses VGL_MEM_ALL: it is the enum terminator and the wrapper
@@ -177,8 +184,15 @@ static void texture_dir(char *out, size_t out_size, GLuint id) {
 }
 
 static void backup_release(TextureInfo *info) {
-  // The file stays. It is keyed by content, so it is still valid for whatever
-  // uploads those exact bytes next -- this run or a later one.
+  // Any file stays. Its name carries the texture's generation, so the next
+  // eviction of this name writes a different file rather than colliding. A heap
+  // copy has no such protection and is the only one of the two that costs
+  // memory while it is held, so it goes now.
+  if (info->ram_copy) {
+    ram_cache_bytes -= info->backup_bytes;
+    free(info->ram_copy);
+    info->ram_copy = NULL;
+  }
   info->levels = 0;
   info->backup_bytes = 0;
 }
@@ -211,6 +225,70 @@ static void texture_pin(GLuint id) {
  */
 
 
+// Empties the store. Files are keyed by texture name and generation, neither of
+// which means anything to a different run, so nothing in here is worth keeping
+// across one -- and left alone it would grow every session.
+//
+// Names are copied out of the listing rather than acted on during it, since
+// removing entries from a directory while reading it is not something to rely
+// on. They are copied as bare names, not paths: a directory name here is two
+// hex digits and a file name is under thirty characters, so the buffers stay
+// small enough to sit on a thread stack.
+static void purge_store(void) {
+  SceUID top = sceIoDopen(TEXTURE_CACHE_DIR);
+  if (top < 0)
+    return;
+
+  char subdirs[256][8];
+  int num_subdirs = 0;
+  SceIoDirent entry;
+  while (num_subdirs < 256 && sceIoDread(top, &entry) > 0) {
+    if (entry.d_name[0] == '.' || strlen(entry.d_name) >= sizeof(subdirs[0]))
+      continue;
+    strcpy(subdirs[num_subdirs], entry.d_name);
+    num_subdirs++;
+  }
+  sceIoDclose(top);
+
+  for (int i = 0; i < num_subdirs; i++) {
+    // Through a local of a known size, so the compiler can see that neither
+    // path below can overflow rather than assuming the whole table might.
+    char name[sizeof(subdirs[0])];
+    memcpy(name, subdirs[i], sizeof(name)); // bounded and terminated on the way in
+    char dir_path[sizeof(TEXTURE_CACHE_DIR) + sizeof(name) + 1];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", TEXTURE_CACHE_DIR, name);
+
+    // One directory can hold more entries than a batch, so keep listing it
+    // until a pass comes back short.
+    for (;;) {
+      SceUID dir = sceIoDopen(dir_path);
+      if (dir < 0)
+        break;
+      char victims[32][40];
+      int num_victims = 0;
+      while (num_victims < 32 && sceIoDread(dir, &entry) > 0) {
+        if (entry.d_name[0] == '.' || strlen(entry.d_name) >= sizeof(victims[0]))
+          continue;
+        strcpy(victims[num_victims], entry.d_name);
+        num_victims++;
+      }
+      sceIoDclose(dir);
+
+      for (int j = 0; j < num_victims; j++) {
+        char victim[sizeof(victims[0])];
+        memcpy(victim, victims[j], sizeof(victim));
+        char victim_path[sizeof(dir_path) + sizeof(victim) + 1];
+        snprintf(victim_path, sizeof(victim_path), "%s/%s", dir_path, victim);
+        sceIoRemove(victim_path);
+      }
+      if (num_victims < 32)
+        break;
+    }
+    sceIoRmdir(dir_path);
+  }
+  sceIoRmdir(TEXTURE_CACHE_DIR);
+}
+
 void texture_cache_init(void) {
   SceIoStat stat;
   cache_enabled = sceIoGetstat(TEXTURE_CACHE_DISABLE_PATH, &stat) < 0;
@@ -219,8 +297,22 @@ void texture_cache_init(void) {
     return;
   }
 
-  for (GLuint id = 0; id < MAX_TEXTURES; id++)
+  // Start from nothing. On the console this runs once and there is nothing to
+  // clear, but leaving state behind would mean a heap copy from a previous run
+  // of the cache counted against this one's ceiling while belonging to a
+  // texture name that now means something else.
+  for (GLuint id = 0; id < MAX_TEXTURES; id++) {
+    free(textures[id].ram_copy);
+    memset(&textures[id], 0, sizeof(TextureInfo));
     textures[id].min_filter = GL_LINEAR;
+  }
+  memset(bound_textures, 0, sizeof(bound_textures));
+  active_unit = 0;
+  tracked_bytes = 0;
+  ram_cache_bytes = 0;
+  card_writes_this_frame = 0;
+  starved_frames = 0;
+  pool_total = 0;
 
   // The store lives next to the game's own files, in the data directory the
   // user installed them into, and is kept across runs. Check there is room for
@@ -240,6 +332,7 @@ void texture_cache_init(void) {
     return;
   }
   sceIoMkdir(DATA_PATH, 0777);
+  purge_store();
   sceIoMkdir(TEXTURE_CACHE_DIR, 0777);
 
   restore_scratch = malloc((size_t)TEXTURE_BACKUP_MAX_KB * 1024);
@@ -256,10 +349,12 @@ void texture_cache_init(void) {
 void texture_cache_shutdown(void) {
   if (!backup_ready)
     return;
-  // The store is deliberately left behind: it is keyed by texture contents, so
-  // the next run finds its textures already written and starts faster. Deleting
-  // ux0:data/Bully/textures is always safe.
+  // Nothing here outlives the run: a file is named for a texture name and a
+  // generation of it, both of which the next run hands out to different
+  // textures. Clearing it now keeps the card tidy, and init clears it again in
+  // case the game did not get this far.
   backup_ready = 0;
+  purge_store();
   free(restore_scratch);
   restore_scratch = NULL;
 }
@@ -302,23 +397,55 @@ static int backup_stage(TextureInfo *info, GLuint id, GLint level, GLsizei width
   return 1;
 }
 
-// Takes the texture's pixels out of GPU memory and writes them to the card,
-// just before the memory holding them is handed back. vitaGL keeps a texture
-// in its own swizzled layout, so what is written is the GPU's copy rather than
-// the bytes the game originally uploaded, and restoring puts it back the same
-// way round.
+// Takes the texture's pixels out of GPU memory and puts them somewhere the GPU
+// pools are not, just before the memory holding them is handed back. vitaGL
+// keeps a texture in its own swizzled layout, so what is saved is the GPU's
+// copy rather than the bytes the game originally uploaded, and restoring puts
+// it back the same way round.
+//
+// The heap comes first and the card second. Both free the same GPU memory --
+// the newlib heap is not mappable by the GXM, so a texture parked there has
+// genuinely left the pools -- but one costs a memcpy and the other costs a
+// write of a few hundred KB in the middle of a frame. Doing every eviction
+// through the card is what made the framerate collapse on hardware.
+//
+// Returns 1 once the bytes are safe, 0 if this texture can never be saved, and
+// -1 if it could be but not in this frame. The caller has to keep those apart:
+// only the middle one is a reason to stop considering the texture.
 static int backup_capture(TextureInfo *info, GLuint id) {
   if (!backup_ready || info->levels == 0 || info->resident_size == 0)
     return 0;
   if (info->resident_size > (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
     return 0;
   if (info->resident_size < TEXTURE_BACKUP_MIN_BYTES)
-    return 0; // too small to be worth a file; it simply stays resident
+    return 0; // too small to be worth saving; it simply stays resident
+
+  // Decided before reading the texture back, so that a frame which has used up
+  // its card writes does not pay for a bind and a pointer fetch to find out.
+  int to_card = ram_cache_bytes + info->resident_size > (size_t)TEXTURE_RAM_CACHE_MB * 1024 * 1024;
+  if (to_card && card_writes_this_frame >= TEXTURE_CARD_WRITES_PER_FRAME)
+    return -1; // out of writes for this frame, not out of options
 
   glBindTexture(GL_TEXTURE_2D, id);
   const void *pixels = vglGetTexDataPointer(GL_TEXTURE_2D);
   if (!pixels)
     return 0;
+
+  if (!to_card) {
+    // malloc failing is the heap telling us it has no more to give, whatever
+    // our own ceiling says. Fall through to the card rather than insisting.
+    uint8_t *copy = malloc(info->resident_size);
+    if (copy) {
+      memcpy(copy, pixels, info->resident_size);
+      info->ram_copy = copy;
+      info->backup_bytes = info->resident_size;
+      ram_cache_bytes += info->resident_size;
+      ram_evicted_count++;
+      return 1;
+    }
+    if (card_writes_this_frame >= TEXTURE_CARD_WRITES_PER_FRAME)
+      return -1;
+  }
 
   char dir[160], path[160];
   texture_dir(dir, sizeof(dir), id);
@@ -332,17 +459,19 @@ static int backup_capture(TextureInfo *info, GLuint id) {
   record.bytes = info->resident_size;
   record.checksum = checksum(pixels, info->resident_size);
 
+  card_writes_this_frame++;
   SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
   if (fd < 0)
-    return 0;
+    return -1;
   int ok = sceIoWrite(fd, &record, sizeof(record)) == (int)sizeof(record) &&
            sceIoWrite(fd, pixels, info->resident_size) == (int)info->resident_size;
   sceIoClose(fd);
   if (!ok) {
     sceIoRemove(path); // a short write must not be mistaken for a usable copy
-    return 0;
+    return -1;
   }
   info->backup_bytes = info->resident_size;
+  card_evicted_count++;
   return 1;
 }
 
@@ -367,23 +496,32 @@ static void install_placeholder(GLuint id) {
 static int restore_texture(GLuint id) {
   TextureInfo *info = &textures[id];
 
-  char path[160];
-  texture_path(path, sizeof(path), id, info->serial);
-  SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
-  if (fd < 0)
-    return 0;
-  BackupRecord record;
-  int header = sceIoRead(fd, &record, sizeof(record));
-  int got = 0;
-  if (header == (int)sizeof(record) && record.magic == BACKUP_MAGIC && record.id == id &&
-      record.serial == info->serial && record.bytes == info->backup_bytes &&
-      record.bytes <= (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
-    got = sceIoRead(fd, restore_scratch, record.bytes);
-  sceIoClose(fd);
-  if (got != (int)record.bytes)
-    return 0;
-  if (checksum(restore_scratch, record.bytes) != record.checksum)
-    return 0;
+  // Where the bytes come back from. A heap copy is already in memory we own, so
+  // it is used in place; only a texture that had to spill to the card is read
+  // back into the scratch buffer.
+  const uint8_t *saved = info->ram_copy;
+  uint32_t saved_bytes = info->backup_bytes;
+  if (!saved) {
+    char path[160];
+    texture_path(path, sizeof(path), id, info->serial);
+    SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0)
+      return 0;
+    BackupRecord record;
+    int header = sceIoRead(fd, &record, sizeof(record));
+    int got = 0;
+    if (header == (int)sizeof(record) && record.magic == BACKUP_MAGIC && record.id == id &&
+        record.serial == info->serial && record.bytes == info->backup_bytes &&
+        record.bytes <= (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
+      got = sceIoRead(fd, restore_scratch, record.bytes);
+    sceIoClose(fd);
+    if (got != (int)record.bytes)
+      return 0;
+    if (checksum(restore_scratch, record.bytes) != record.checksum)
+      return 0;
+    saved = restore_scratch;
+    saved_bytes = record.bytes;
+  }
 
   // Allocate the texture again through the same call the game made, with no
   // pixels, then put the GPU's own copy back into the buffer vitaGL hands out.
@@ -407,7 +545,15 @@ static int restore_texture(GLuint id) {
     install_placeholder(id);
     return 0;
   }
-  memcpy(pixels, restore_scratch, record.bytes);
+  memcpy(pixels, saved, saved_bytes);
+
+  // The heap copy has done its job and is the expensive one to keep around.
+  if (info->ram_copy) {
+    ram_cache_bytes -= info->backup_bytes;
+    free(info->ram_copy);
+    info->ram_copy = NULL;
+    ram_restored_count++;
+  }
 
   // Eviction forced the sampler off mipmaps because the placeholder had none.
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, info->min_filter);
@@ -486,8 +632,16 @@ static void evict_texture(GLuint id) {
   // worth a file, no room on the card, a write that failed -- the texture stays
   // exactly where it is. Dropping one we cannot put back is how the ground and
   // the buildings went black, and there is no pressure that makes it worth it.
-  if (!backup_capture(info, id)) {
-    info->unbacked = 1;
+  int captured = backup_capture(info, id);
+  if (captured <= 0) {
+    // Tell "never" from "not this frame". A texture too small to be worth
+    // saving, or one vitaGL will not hand a pointer to, is unbacked for good
+    // and there is no point considering it again. One that only lost this
+    // frame's ration of card writes has nothing wrong with it and must stay a
+    // candidate, or the first busy frame would permanently retire everything it
+    // could not get to and the cache would stop reclaiming.
+    if (captured == 0)
+      info->unbacked = 1;
     evicted_count--;
     return;
   }
@@ -558,8 +712,10 @@ static int evict_textures(size_t target_bytes, uint32_t min_idle_frames) {
 
   glBindTexture(GL_TEXTURE_2D, previous);
 
-  debugPrintf("texture cache: evicted %d textures, %d KB still in use\n",
-              evicted, (int)(tracked_bytes / 1024));
+  debugPrintf("texture cache: evicted %d textures (%u to heap, %u to card), "
+              "%d KB in use, %d KB parked\n",
+              evicted, ram_evicted_count, card_evicted_count,
+              (int)(tracked_bytes / 1024), (int)(ram_cache_bytes / 1024));
   return num_candidates;
 }
 
@@ -568,6 +724,7 @@ void texture_cache_tick(void) {
     return;
 
   frame_counter++;
+  card_writes_this_frame = 0;
 
   // A texture stays bound to its unit until something displaces it, so one the
   // game bound once and keeps drawing with is still in use even though we never

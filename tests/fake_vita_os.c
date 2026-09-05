@@ -15,9 +15,11 @@
 // and glibc defines that as a macro, so whichever is parsed second loses.
 #include <psp2/appmgr.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/dirent.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -101,6 +103,40 @@ int sceIoRead(SceUID fd, void *data, SceSize size) {
 SceOff sceIoLseek(SceUID fd, SceOff offset, int whence) { return lseek(fd, offset, SEEK_SET); }
 int sceIoMkdir(const char *dir, SceMode mode) { (void)mode; return mkdir(host_path(dir), 0777); }
 int sceIoRemove(const char *file) { return unlink(host_path(file)); }
+int sceIoRmdir(const char *dir) { return rmdir(host_path(dir)); }
+
+// Directory listing, used by the store's purge. SceUID is an int and DIR* is a
+// pointer, so the handles live in a small table rather than being cast.
+static DIR *open_dirs[16];
+SceUID sceIoDopen(const char *dirname) {
+  DIR *d = opendir(host_path(dirname));
+  if (!d)
+    return -1;
+  for (int i = 0; i < 16; i++) {
+    if (!open_dirs[i]) {
+      open_dirs[i] = d;
+      return i;
+    }
+  }
+  closedir(d);
+  return -1;
+}
+int sceIoDread(SceUID fd, SceIoDirent *dir) {
+  if (fd < 0 || fd >= 16 || !open_dirs[fd])
+    return -1;
+  struct dirent *e = readdir(open_dirs[fd]);
+  if (!e)
+    return 0;
+  snprintf(dir->d_name, sizeof(dir->d_name), "%s", e->d_name);
+  return 1;
+}
+int sceIoDclose(SceUID fd) {
+  if (fd < 0 || fd >= 16 || !open_dirs[fd])
+    return -1;
+  closedir(open_dirs[fd]);
+  open_dirs[fd] = NULL;
+  return 0;
+}
 
 // Free space on the card. Tests set fake_card_free to exercise both the
 // plenty-of-room path and the too-tight-to-bother path.

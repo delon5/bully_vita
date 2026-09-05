@@ -12,7 +12,11 @@
 #include "harness.h"
 
 #define AREA 200
-#define TEX_BYTES (256 * 1024)
+// Sized off the budget rather than fixed, so that one area fits inside it and
+// three areas do not. A fixed size silently stops testing anything the day the
+// budget moves: at 256 KB a texture, three areas came to about the budget and
+// the cache had almost nothing to evict.
+#define TEX_BYTES (((size_t)TEXTURE_BUDGET_MB * MB * 4 / 5) / AREA)
 
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);

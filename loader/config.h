@@ -60,9 +60,14 @@
 // read comfortably under budget. Free memory counts all of it.
 #define TEXTURE_FREE_HEADROOM_PERCENT 25
 
-// Still capped in bytes as well, so a scene that never pressures the pools
-// does not sit on an unbounded pile of textures it stopped drawing with.
-#define TEXTURE_BUDGET_MB 64
+// Still capped in bytes as well, so a scene that never pressures the pools does
+// not sit on an unbounded pile of textures it stopped drawing with. This is a
+// backstop, not the working limit -- the headroom rule above is what should
+// normally be doing the reclaiming. Set too low it evicts constantly while
+// there is memory to spare, and every eviction is work in the middle of a
+// frame: at 64 MB that showed up on hardware as the framerate falling off 30
+// down to nothing.
+#define TEXTURE_BUDGET_MB 144
 // Evict regardless of the budget once vitaGL has less than this much free, so
 // that memory pressure coming from anywhere else does not kill us either.
 #define TEXTURE_RESERVE_MB 32
@@ -73,6 +78,18 @@
 // Upper bound on how many textures a single frame may evict, so that reclaiming
 // memory does not turn into a visible hitch.
 #define TEXTURE_EVICTIONS_PER_FRAME 64
+// Of those, how many may fall through to the memory card in one frame. A card
+// write of a few hundred KB costs more than a frame is worth, so evictions that
+// have to make one are rationed hard even though evictions into RAM are not.
+#define TEXTURE_CARD_WRITES_PER_FRAME 1
+
+// Evicted textures are held in the newlib heap up to this much, and only spill
+// to the memory card past it. The heap is not GPU-mappable, so a texture parked
+// there has genuinely left the pools vitaGL allocates from, which is the memory
+// this cache exists to reclaim -- and putting it back is a memcpy rather than a
+// read off the card. Kept well short of the heap so the game still has its own
+// room; when it is full, or the heap will not give, eviction uses the card.
+#define TEXTURE_RAM_CACHE_MB 48
 
 // Where the source bytes of uploaded textures are kept so that an evicted one
 // can be uploaded again when the game draws with it. Truncated on every boot,
