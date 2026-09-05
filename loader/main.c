@@ -1058,7 +1058,19 @@ int main(int argc, char *argv[]) {
   // app means they are drawn, queued and never shown, with no error anywhere.
   // Ask sceDisplay what it is actually scanning out, and run the same budget
   // check vitaGL uses to pick between the two paths.
-  sceGxmDisplayQueueFinish();
+  // Cheapest question first, and each answer is written out before the next
+  // call is made: an earlier version of this drained the display queue up
+  // front, which never returned when nothing was consuming it and took the
+  // whole boot down with it.
+  SceAppMgrBudgetInfo budget;
+  sceClibMemset(&budget, 0, sizeof(budget));
+  budget.size = sizeof(budget);
+  int budget_res = sceAppMgrGetBudgetInfo(&budget);
+  traceLog("display: sceAppMgrGetBudgetInfo 0x%x -> vitaGL system app mode %s\n",
+           budget_res, budget_res == 0 ? "ON (frames go to sceSharedFb)" : "off");
+
+  // Reports what is being scanned out right now; unlike draining the queue it
+  // does not wait on anything.
   SceDisplayFrameBuf shown;
   sceClibMemset(&shown, 0, sizeof(shown));
   shown.size = sizeof(shown);
@@ -1066,13 +1078,6 @@ int main(int argc, char *argv[]) {
   traceLog("display: sceDisplayGetFrameBuf 0x%x, base %p, %dx%d, pitch %d, fmt 0x%x\n",
            fb_res, shown.base, (int)shown.width, (int)shown.height,
            (int)shown.pitch, (unsigned int)shown.pixelformat);
-
-  SceAppMgrBudgetInfo budget;
-  sceClibMemset(&budget, 0, sizeof(budget));
-  budget.size = sizeof(budget);
-  int budget_res = sceAppMgrGetBudgetInfo(&budget);
-  traceLog("display: sceAppMgrGetBudgetInfo 0x%x -> vitaGL system app mode %s\n",
-           budget_res, budget_res == 0 ? "ON (frames go to sceSharedFb)" : "off");
 
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 #endif
