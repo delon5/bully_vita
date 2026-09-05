@@ -139,9 +139,19 @@ Do not take a newer vitaGL without checking both. The overridden `CC` demotes
 diagnostics GCC 14 turned into errors; this is 2021 code written under the older
 default, so demoting them preserves its behaviour rather than changing it.
 
-Do not turn on vitaGL's `HAVE_TEXTURE_CACHE` or `TEXTURE_UPLOADS_SPEEDHACK`.
-The loader does its own texture eviction and both of those change the ownership
-of texture memory underneath it.
+`HAVE_TEXTURE_CACHE=1` turns on vitaGL's own texture cache, which does what the
+loader's `texture_cache.c` was written to do and does it better. When a GPU
+allocation fails it walks its list of textures the game has not drawn with
+recently, writes each one's data to `ux0:data/vgl_cache/BULLY0000` under a name
+taken from an XXH3 hash of the contents, and frees the memory; binding the
+texture again reads the file straight back into a new allocation. Because it
+holds the texture in its swizzled GPU form it restores with a memcpy rather
+than by replaying the original upload, it needs no interception of the game's
+GL calls, and it writes nothing until an allocation actually fails -- so it
+costs nothing during startup.
+
+Do not turn on `TEXTURE_UPLOADS_SPEEDHACK`: it changes the ownership of texture
+memory underneath the loader.
 
 Finally, install the SceLibc stubs and build:
 
