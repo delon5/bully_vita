@@ -61,13 +61,20 @@ static int installed;
 
 // How much the streamer is holding, by the game's own reckoning.
 //
-// The obvious thing to measure was the newlib heap, and it is the wrong thing.
-// The game does not take a model's memory from malloc: CMemoryHeap grabs large
-// blocks and sub-allocates, so evicting a model returns its memory to a free
-// list inside the game and mallinfo never moves. On hardware that showed up as
-// 24389 refusals with the heap sitting at 179 MB the entire time -- the gate
-// asking for something eviction could not deliver, and the game stripping the
-// world trying to deliver it.
+// A correction, because the reasoning that used to be written here was wrong
+// and it closed off the most promising route in the port.
+//
+// It said the game sub-allocates from an arena, so that freeing a model returns
+// its memory to a free list inside the game and never reaches newlib. That is
+// false for this binary. MemoryMgrMalloc branches straight to memalign@plt and
+// MemoryMgrFree branches straight to free@plt; CMemoryHeap::Init has no callers
+// anywhere in the .text. There is no arena, and making the engine free a model
+// does return that memory to the heap.
+//
+// What actually went wrong on hardware -- 24389 refusals with the heap at a
+// flat 179 MB -- was the policy, not the gauge: an absolute threshold below the
+// figure the game runs at, so the answer was "no" for ever and it evicted the
+// world trying to satisfy it.
 //
 // CStreaming::UpdateMemoryUsed sums CMemoryHeap::GetMemoryUsed over the
 // streaming memory IDs, which is exactly the figure that moves when a model is

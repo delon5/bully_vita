@@ -101,7 +101,6 @@ static inline void unlock_table(void) {
 static LiveBlock live[LIVE_SLOTS];
 static CallerTotals callers[CALLERS];
 static size_t large_live_bytes, small_live_bytes;
-static uint32_t small_seen;
 static uint32_t small_live_count, untracked_frees, table_full;
 
 // Pointers from a single heap are 8 byte aligned at worst, so the low bits
@@ -141,6 +140,13 @@ static CallerTotals *caller_slot(uint32_t caller) {
 // Put one block in the table, credited to a call site. The caller value is
 // whatever identifies the code that asked: an offset into the .so for the
 // game, an eboot address for the loader.
+// Whether a small block is one of the sampled ones. Derived from the pointer
+// rather than from a counter, so that the free path reaches the same answer as
+// the allocation path without having to look anything up.
+static inline int sampled(const void *ptr) {
+  return (hash_ptr(ptr) & (SMALL_SAMPLE - 1)) == 0;
+}
+
 static void remember_block(void *ptr, size_t size, uint32_t caller) {
   uint32_t i = hash_ptr(ptr) & LIVE_MASK;
   lock_table();
@@ -217,7 +223,7 @@ static void remember(void *ptr, size_t size, void *return_address) {
     // back in front of every allocation -- which is what made the game a
     // slideshow before. Sampling costs a counter and names the holder just as
     // well: a site responsible for a tenth of them is a tenth of the sample.
-    if ((__atomic_add_fetch(&small_seen, 1, __ATOMIC_RELAXED) & (SMALL_SAMPLE - 1)) == 0)
+    if (sampled(ptr))
       remember_block(ptr, size, so_offset(return_address) | SAMPLED_FLAG);
     return;
   }
@@ -233,6 +239,13 @@ static void forget(void *ptr) {
   if (size < SMALL_BYTES) {
     __atomic_sub_fetch(&small_live_bytes, size, __ATOMIC_RELAXED);
     __atomic_sub_fetch(&small_live_count, 1, __ATOMIC_RELAXED);
+    // A sampled block has to leave the table too. Counting one in every
+    // sixty-four in but never out would have made every high-churn call site --
+    // the per-frame temporaries -- look like the biggest leak in the game,
+    // while a real one stayed buried. It would also have filled the table with
+    // dead entries and corrupted the large-block totals along with it.
+    if (sampled(ptr))
+      forget_block(ptr, NULL);
     return;
   }
 
@@ -318,15 +331,24 @@ void alloc_trace_report(void) {
            (int)(large_live_bytes / (1024 * 1024)), (int)(small_live_bytes / (1024 * 1024)),
            small_live_count, untracked_frees, table_full ? " [TABLE FULL]" : "");
 
-  uint32_t ceiling = 0xffffffffu;
+  size_t ceiling_bytes = (size_t)-1;
+  uint32_t ceiling_caller = 0;
   for (int rank = 0; rank < 16; rank++) {
     CallerTotals *best = NULL;
     for (int i = 0; i < CALLERS; i++) {
       CallerTotals *c = &callers[i];
       // Eboot sites have their own report; this one is the game's.
-      if (c->total_count == 0 || c->live_bytes >= ceiling || c->caller >= EBOOT_TEXT_BASE)
+      // Ranked on size and then call site, because comparing size alone drops
+      // exact ties -- which is why a report listing 36 MB of holders could
+      // announce a 68 MB total: the two .obb caches are the same size and the
+      // second was never printed.
+      if (c->total_count == 0 || c->caller >= EBOOT_TEXT_BASE)
         continue;
-      if (!best || c->live_bytes > best->live_bytes)
+      if (c->live_bytes > ceiling_bytes ||
+          (c->live_bytes == ceiling_bytes && c->caller >= ceiling_caller))
+        continue;
+      if (!best || c->live_bytes > best->live_bytes ||
+          (c->live_bytes == best->live_bytes && c->caller < best->caller))
         best = c;
     }
     if (!best || best->live_bytes < 16 * 1024)
@@ -338,7 +360,8 @@ void alloc_trace_report(void) {
     else
       traceLog("heap:   libBully.so+0x%x holds %d MB in %u blocks (%u ever)\n", best->caller,
                (int)(best->live_bytes / (1024 * 1024)), best->live_count, best->total_count);
-    ceiling = best->live_bytes;
+    ceiling_bytes = best->live_bytes;
+    ceiling_caller = best->caller;
   }
 }
 
@@ -432,14 +455,19 @@ void alloc_trace_loader_report(void) {
   traceLog("loader heap: %d MB in %u blocks not allocated by the game\n",
            (int)(loader_live_bytes / (1024 * 1024)), loader_live_count);
 
-  uint32_t ceiling = 0xffffffffu;
+  size_t ceiling_bytes = (size_t)-1;
+  uint32_t ceiling_caller = 0;
   for (int rank = 0; rank < 16; rank++) {
     CallerTotals *best = NULL;
     for (int i = 0; i < CALLERS; i++) {
       CallerTotals *c = &callers[i];
-      if (c->total_count == 0 || c->live_bytes >= ceiling || c->caller < EBOOT_TEXT_BASE)
+      if (c->total_count == 0 || c->caller < EBOOT_TEXT_BASE)
         continue;
-      if (!best || c->live_bytes > best->live_bytes)
+      if (c->live_bytes > ceiling_bytes ||
+          (c->live_bytes == ceiling_bytes && c->caller >= ceiling_caller))
+        continue;
+      if (!best || c->live_bytes > best->live_bytes ||
+          (c->live_bytes == best->live_bytes && c->caller < best->caller))
         best = c;
     }
     // Down to 64 KB: the three sites over a quarter of a megabyte came to 37 MB
@@ -449,7 +477,8 @@ void alloc_trace_loader_report(void) {
       break;
     traceLog("loader heap:   eboot 0x%x holds %d KB in %u blocks (%u ever)\n", best->caller,
              (int)(best->live_bytes / 1024), best->live_count, best->total_count);
-    ceiling = best->live_bytes;
+    ceiling_bytes = best->live_bytes;
+    ceiling_caller = best->caller;
   }
 }
 
