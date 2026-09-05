@@ -614,6 +614,23 @@ static FILE *fopen_hook(const char *name, const char *mode) {
 }
 #endif
 
+#ifdef LOADER_TRACE
+// The game loads its shaders and then stops without ever linking a program or
+// drawing. Log the first call to each step of GLES2 program setup so the trace
+// says which step it never reaches.
+#define TRACE_FIRST(tag) \
+  do { static int seen; if (!seen) { seen = 1; traceLog("gl: first " tag "\n"); } } while (0)
+
+static GLuint glCreateProgramTrace(void) { TRACE_FIRST("glCreateProgram"); return glCreateProgram(); }
+static void glAttachShaderTrace(GLuint p, GLuint s) { TRACE_FIRST("glAttachShader"); glAttachShader(p, s); }
+static void glUseProgramTrace(GLuint p) { TRACE_FIRST("glUseProgram"); glUseProgram(p); }
+static void glClearTrace(GLbitfield m) { TRACE_FIRST("glClear"); glClear(m); }
+static void glViewportTrace(GLint x, GLint y, GLsizei w, GLsizei h) { TRACE_FIRST("glViewport"); glViewport(x, y, w, h); }
+static void glBufferDataTrace(GLenum t, GLsizeiptr sz, const void *d, GLenum u) { TRACE_FIRST("glBufferData"); glBufferData(t, sz, d, u); }
+static void glVertexAttribPointerTrace(GLuint i, GLint sz, GLenum t, GLboolean n, GLsizei st, const void *p) { TRACE_FIRST("glVertexAttribPointer"); glVertexAttribPointer(i, sz, t, n, st, p); }
+static void glGetProgramivTrace(GLuint p, GLenum pn, GLint *v) { TRACE_FIRST("glGetProgramiv"); glGetProgramiv(p, pn, v); }
+#endif
+
 void glLinkProgramHook(GLuint prog) {
   glLinkProgram(prog);
 #ifdef LOADER_TRACE
@@ -642,6 +659,9 @@ void glGetShaderivHook(GLuint shader, GLenum pname, GLint *params) {
 }
 
 void glCompileShaderHook(GLuint shader) {
+#ifdef LOADER_TRACE
+  TRACE_FIRST("glCompileShader");
+#endif
   return;
 }
 
@@ -795,7 +815,11 @@ static so_default_dynlib default_dynlib[] = {
   // { "gettid", (uintptr_t)&gettid },
 
   { "glActiveTexture", (uintptr_t)&glActiveTextureHook },
+#ifdef LOADER_TRACE
+  { "glAttachShader", (uintptr_t)&glAttachShaderTrace },
+#else
   { "glAttachShader", (uintptr_t)&glAttachShader },
+#endif
   { "glBindAttribLocation", (uintptr_t)&glBindAttribLocationHook },
   { "glBindBuffer", (uintptr_t)&glBindBuffer },
   { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer },
@@ -803,8 +827,16 @@ static so_default_dynlib default_dynlib[] = {
   { "glBindTexture", (uintptr_t)&glBindTextureHook },
   { "glBlendFunc", (uintptr_t)&glBlendFunc },
   { "glBlendFuncSeparate", (uintptr_t)&glBlendFuncSeparate },
+#ifdef LOADER_TRACE
+  { "glBufferData", (uintptr_t)&glBufferDataTrace },
+#else
   { "glBufferData", (uintptr_t)&glBufferData },
+#endif
+#ifdef LOADER_TRACE
+  { "glClear", (uintptr_t)&glClearTrace },
+#else
   { "glClear", (uintptr_t)&glClear },
+#endif
   { "glClearColor", (uintptr_t)&glClearColor },
   { "glClearDepthf", (uintptr_t)&glClearDepthf },
   { "glClearStencil", (uintptr_t)&glClearStencil },
@@ -812,7 +844,11 @@ static so_default_dynlib default_dynlib[] = {
   { "glCompileShader", (uintptr_t)&glCompileShaderHook },
   { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2DHook },
   { "glCompressedTexSubImage2D", (uintptr_t)&ret0 }, // TODO
+#ifdef LOADER_TRACE
+  { "glCreateProgram", (uintptr_t)&glCreateProgramTrace },
+#else
   { "glCreateProgram", (uintptr_t)&glCreateProgram },
+#endif
   { "glCreateShader", (uintptr_t)&glCreateShader },
   { "glCullFace", (uintptr_t)&glCullFace },
   { "glDeleteBuffers", (uintptr_t)&glDeleteBuffers },
@@ -841,7 +877,11 @@ static so_default_dynlib default_dynlib[] = {
   { "glGetError", (uintptr_t)&glGetError },
   { "glGetIntegerv", (uintptr_t)&glGetIntegerv },
   { "glGetProgramInfoLog", (uintptr_t)&glGetProgramInfoLog },
+#ifdef LOADER_TRACE
+  { "glGetProgramiv", (uintptr_t)&glGetProgramivTrace },
+#else
   { "glGetProgramiv", (uintptr_t)&glGetProgramiv },
+#endif
   { "glGetShaderInfoLog", (uintptr_t)&glGetShaderInfoLog },
   { "glGetShaderiv", (uintptr_t)&glGetShaderivHook },
   { "glGetString", (uintptr_t)&glGetString },
@@ -863,9 +903,21 @@ static so_default_dynlib default_dynlib[] = {
   { "glUniform1i", (uintptr_t)&glUniform1i },
   { "glUniform4fv", (uintptr_t)&glUniform4fv },
   { "glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv },
+#ifdef LOADER_TRACE
+  { "glUseProgram", (uintptr_t)&glUseProgramTrace },
+#else
   { "glUseProgram", (uintptr_t)&glUseProgram },
+#endif
+#ifdef LOADER_TRACE
+  { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointerTrace },
+#else
   { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
+#endif
+#ifdef LOADER_TRACE
+  { "glViewport", (uintptr_t)&glViewportTrace },
+#else
   { "glViewport", (uintptr_t)&glViewport },
+#endif
 
   { "longjmp", (uintptr_t)&longjmp },
   { "setjmp", (uintptr_t)&setjmp },
