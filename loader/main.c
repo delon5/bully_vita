@@ -1079,6 +1079,29 @@ int main(int argc, char *argv[]) {
            fb_res, shown.base, (int)shown.width, (int)shown.height,
            (int)shown.pitch, (unsigned int)shown.pixelformat);
 
+  // The panel is being fed a real surface at the right geometry, so either the
+  // GPU never put red into it or what it put there is not what reaches the
+  // panel. Read a pixel back out of the surface the GPU rendered into: red
+  // means the drawing half works and the fault is downstream of it.
+  {
+    uint32_t px = 0;
+    glReadPixels(SCREEN_W / 2, SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &px);
+    traceLog("display: glReadPixels centre 0x%08x (red is 0xff0000ff), gl error 0x%x\n",
+             px, glGetError());
+  }
+
+  // And write straight into the buffer sceDisplay says it is scanning out,
+  // with no GPU involved at all. If the screen goes green here, everything
+  // from the surface to the panel is fine and only the rendering is not.
+  if (fb_res == 0 && shown.base) {
+    uint32_t *pixels = (uint32_t *)shown.base;
+    for (unsigned int i = 0; i < shown.pitch * shown.height; i++)
+      pixels[i] = 0xff00ff00; // opaque green in A8B8G8R8
+    traceLog("display: filled the scanout buffer green from the CPU\n");
+    sceKernelDelayThread(3 * 1000 * 1000);
+    traceLog("display: green hold over\n");
+  }
+
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 #endif
   movie_setup_player();
