@@ -27,6 +27,8 @@
 // difference between a clear that renders and one that quietly does nothing.
 extern void *clear_vertex_program_patched;
 extern void *clear_fragment_program_patched;
+// The three display colour surfaces vitaGL renders into and cycles between.
+extern void *gxm_color_surfaces_addr[3];
 #include <vitashark.h>
 #include <vitaGL.h>
 
@@ -1104,6 +1106,28 @@ int main(int argc, char *argv[]) {
     glReadPixels(SCREEN_W / 2, SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &px);
     traceLog("display: glReadPixels centre 0x%08x (red is 0xff0000ff), gl error 0x%x\n",
              px, glGetError());
+  }
+
+  // glReadPixels goes through vitaGL's own idea of which surface is current.
+  // Read all three colour surfaces directly instead: if red is sitting in one
+  // of them the GPU did draw and the wrong buffer is being shown, and if the
+  // address sceDisplay reports is not among them then vitaGL's frames are not
+  // the ones on screen at all.
+  for (int i = 0; i < 3; i++) {
+    uint32_t *surface = (uint32_t *)gxm_color_surfaces_addr[i];
+    if (!surface) {
+      traceLog("display: colour surface %d not allocated\n", i);
+      continue;
+    }
+    uint32_t centre = surface[(SCREEN_H / 2) * 960 + (SCREEN_W / 2)];
+    int red_pixels = 0;
+    for (int y = 0; y < SCREEN_H; y += 16)
+      for (int x = 0; x < SCREEN_W; x += 16)
+        if ((surface[y * 960 + x] & 0x00ffffff) == 0x000000ff)
+          red_pixels++;
+    traceLog("display: colour surface %d at %p, centre 0x%08x, %d red samples%s\n",
+             i, surface, centre, red_pixels,
+             surface == shown.base ? " (this is the one being scanned out)" : "");
   }
 
   // And write straight into the buffer sceDisplay says it is scanning out,
