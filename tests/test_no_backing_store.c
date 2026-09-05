@@ -58,10 +58,13 @@ int main(void) {
   printf("  %zu MB in use, %d evicted\n", tracked_bytes / MB, count_evicted());
   assert(count_evicted() == 0 && "must not lose textures it cannot get back while merely over budget");
 
-  // Keep pushing well past the budget. Memory has to be bounded whatever the
-  // card is doing, so now it has to start letting go even though that loses
-  // them. Upload a fixed number rather than aiming at a figure: once the ceiling
-  // engages it evicts as fast as we upload, so a target would never be reached.
+  // Keep pushing well past the budget. This used to be the point where a last
+  // resort engaged and started evicting textures with no copy on the card, on
+  // the reasoning that bounded memory beats running out of it. It does not: on
+  // hardware it took the ground and the buildings out of the world, and nothing
+  // was ever going to upload them again, because the game has no idea the cache
+  // exists. Whatever the pressure, a texture that cannot be restored is one this
+  // cache must not drop.
   for (int i = 0; i < 300; i++) {
     tex_upload(0x3000u + uploaded, 512, 512, TEX_BYTES);
     texture_cache_tick();
@@ -70,8 +73,7 @@ int main(void) {
   frames(TEXTURE_LOSSY_AFTER_FRAMES + TEXTURE_IDLE_FRAMES + 400);
   printf("  after pushing well past budget: %zu MB in use, %d evicted\n",
          tracked_bytes / MB, count_evicted());
-  assert(count_evicted() > 0 && "memory must stay bounded even with nothing to fall back on");
-  assert(tracked_bytes <= budget + budget / 2 && "must come back under the ceiling");
+  assert(count_evicted() == 0 && "must never drop a texture it cannot restore");
 
   printf("PASS\n");
   return 0;

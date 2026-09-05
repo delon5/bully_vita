@@ -295,10 +295,6 @@ static int backup_stage(TextureInfo *info, GLuint id, GLint level, GLsizei width
     return 0;
   if (sizeof(BackupRecord) + size > (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
     return 0;
-  // Not worth a file. See TEXTURE_BACKUP_MIN_BYTES: these are the bulk of the
-  // uploads and a rounding error in the budget.
-  if (level == 0 && size < TEXTURE_BACKUP_MIN_BYTES)
-    return 0;
 
   char path[160];
 
@@ -615,21 +611,20 @@ void texture_cache_tick(void) {
     return;
   }
 
-  // Still over. That is fine for a while: vitaGL only really frees a dropped
-  // texture on its garbage collector a few frames later, and the working set may
-  // genuinely be a little larger than the budget. Staying over budget is better
-  // than evicting textures we are about to need again.
+  // Still over budget. Stay over it.
+  //
+  // There used to be a last resort here: once the lossless pass had failed for
+  // long enough, evict textures with no copy on the card and accept losing
+  // them. The reasoning was that bounded memory beats running out of it. On
+  // hardware that is not the trade it looks like -- it took the ground and the
+  // buildings out of the world and they never came back, because nothing was
+  // ever going to upload them again. A texture this cache cannot restore is a
+  // texture it has no business dropping, which is the whole premise of the
+  // thing.
+  //
+  // So the only textures that ever leave are the ones that can come back. If
+  // that is not enough to reach the budget, the budget is not reached.
   starved_frames++;
-
-  // But if we have not been able to keep up for a long time, we are holding
-  // textures we have no copy of and memory has to be bounded whatever the card
-  // is doing. These come back white, which beats running out of memory.
-  if (starved_frames > TEXTURE_LOSSY_AFTER_FRAMES &&
-      (tracked_bytes > budget + budget / 2 ||
-       vitagl_free_memory() < (size_t)TEXTURE_RESERVE_MB * 1024 * 1024)) {
-    evict_textures(budget, TEXTURE_IDLE_FRAMES_URGENT, 1);
-    starved_frames = 0;
-  }
 }
 
 /*
