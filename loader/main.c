@@ -1089,6 +1089,26 @@ int main(int argc, char *argv[]) {
   vglSetupGarbageCollector(127, 0x20000);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_2X);
 
+  // Do not let textures overflow into the newlib heap.
+  //
+  // vitaGL's texture allocator tries CDRAM, then RAM, then phycont, then the
+  // CDLG budget, and then -- because use_extra_mem defaults to GL_TRUE -- it
+  // calls memalign and takes the memory out of the game's own heap. And
+  // vgl_mem_get_free_space(VGL_MEM_EXTERNAL) returns 0 unconditionally, so none
+  // of it is visible to anything that asks vitaGL how much memory is left.
+  //
+  // That is the leak this port has been dying of. It explains a heap that
+  // climbed to 155 MB while every pool reading said there was room to spare, a
+  // texture cache that never evicted because it could not see any pressure, and
+  // 79 MB of live allocations that the allocation trace could not account for
+  // -- vitaGL's own mallocs do not come through the wrappers the game's do.
+  //
+  // With this off the allocation fails instead, which the loader is set up for:
+  // an upload vitaGL rejects allocates nothing, texture_is_allocated notices,
+  // and the pressure shows up in the pool figures where the texture cache can
+  // act on it.
+  vglUseExtraMem(GL_FALSE);
+
 
   traceLog("boot: vitaGL up (%s / %s), setting up movie player\n",
            (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER));
