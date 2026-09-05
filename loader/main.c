@@ -18,6 +18,8 @@
 #include <psp2/power.h>
 #include <psp2/rtc.h>
 #include <psp2/touch.h>
+#include <psp2/display.h>
+#include <psp2/gxm.h>
 #include <kubridge.h>
 #include <vitashark.h>
 #include <vitaGL.h>
@@ -1049,6 +1051,29 @@ int main(int argc, char *argv[]) {
     vglSwapBuffers(GL_FALSE);
   }
   traceLog("display: red test done, gl error 0x%x\n", glGetError());
+
+  // vitaGL only reaches sceDisplaySetFrameBuf through its display queue
+  // callback, and only when it did not decide the app is a system one -- in
+  // system app mode it hands frames to sceSharedFb instead, which for a normal
+  // app means they are drawn, queued and never shown, with no error anywhere.
+  // Ask sceDisplay what it is actually scanning out, and run the same budget
+  // check vitaGL uses to pick between the two paths.
+  sceGxmDisplayQueueFinish();
+  SceDisplayFrameBuf shown;
+  sceClibMemset(&shown, 0, sizeof(shown));
+  shown.size = sizeof(shown);
+  int fb_res = sceDisplayGetFrameBuf(&shown, SCE_DISPLAY_SETBUF_NEXTFRAME);
+  traceLog("display: sceDisplayGetFrameBuf 0x%x, base %p, %dx%d, pitch %d, fmt 0x%x\n",
+           fb_res, shown.base, (int)shown.width, (int)shown.height,
+           (int)shown.pitch, (unsigned int)shown.pixelformat);
+
+  SceAppMgrBudgetInfo budget;
+  sceClibMemset(&budget, 0, sizeof(budget));
+  budget.size = sizeof(budget);
+  int budget_res = sceAppMgrGetBudgetInfo(&budget);
+  traceLog("display: sceAppMgrGetBudgetInfo 0x%x -> vitaGL system app mode %s\n",
+           budget_res, budget_res == 0 ? "ON (frames go to sceSharedFb)" : "off");
+
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 #endif
   movie_setup_player();
