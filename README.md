@@ -170,18 +170,30 @@ memory, or less than `TEXTURE_FREE_HEADROOM_PERCENT` of vitaGL's pools still
 free -- it drops the textures the game has gone longest without drawing.
 
 Dropping a texture reads its bytes back out of the GPU with
-`vglGetTexDataPointer` and writes them to `ux0:data/Bully/textures`, then
-replaces it with a 1x1 placeholder so vitaGL frees the real allocation. When the
-game next binds it the loader replays the upload -- every mip level, with no
-pixels -- and copies the saved bytes straight back into the new allocation. The
-saved form is vitaGL's own swizzled layout, so restoring is a `memcpy` and not a
-re-encode.
+`vglGetTexDataPointer`, saves them, and replaces the texture with a 1x1
+placeholder so vitaGL frees the real allocation. When the game next binds it the
+loader replays the upload -- every mip level, with no pixels -- and copies the
+saved bytes straight back into the new allocation. The saved form is vitaGL's
+own swizzled layout, so restoring is a `memcpy` and not a re-encode.
+
+The bytes go to the newlib heap first, up to `TEXTURE_RAM_CACHE_MB`, and only
+spill to `ux0:data/Bully/textures` past that. The heap is not GPU-mappable, so a
+texture parked there has genuinely left the pools vitaGL allocates from, which
+is the memory that runs out -- and it costs a `memcpy` in each direction instead
+of a memory card write inside a frame. The store is cleared at startup and at
+quit; its filenames are a texture name and a generation of it, neither of which
+means anything to a different run.
 
 Two rules keep it honest, both learned on hardware:
 
 - Nothing is written at upload time. An earlier version copied every texture as
   it arrived, which turned loading a new area into thousands of memory card
   writes and made loads far slower than the leak ever did.
+- Almost nothing is written at eviction time either. Writing there instead
+  looked like the fix, and on hardware it was worse: the framerate stopped
+  dipping and started stopping, because reclaiming does several evictions a
+  frame and a card write costs more than a frame is worth. Hence the heap tier,
+  and a hard ration of one card write per frame for what still spills.
 - A texture that cannot be copied is never dropped. An earlier version had a
   last resort that evicted uncopied textures under pressure, on the reasoning
   that bounded memory beats running out of it. It is not: the ground and the
