@@ -15,10 +15,19 @@
 // "cdram 0 ... ev 0". Turn it off once a session survives.
 #define LOADER_TRACE
 // Accounts for every allocation the game makes and reports the largest holders
-// with the trace. On to find what is growing on the newlib heap after a long
-// session, which is what the port crashes on now that textures are bounded.
-// Costs a hash insert per malloc and a lookup per free.
-#define LOADER_ALLOC_TRACE
+// with the trace.
+//
+// OFF, and not to be left on. It takes a lock on every malloc and every free,
+// contended between GameMain, Sound, RenderThread and CDStreamThread, and adds
+// a malloc_usable_size call and a hash probe to each -- in a game that
+// allocates as hard as this one that is a serialisation point, not an
+// observation. On hardware it stalls the render thread while the audio thread
+// plays on, then catches up: the game freezes and resyncs, over and over.
+//
+// It also costs 3 MB of .bss for the table, on a port whose whole problem is
+// memory. Turn it on to answer a specific question about who is holding the
+// heap, read the answer, and turn it off again.
+// #define LOADER_ALLOC_TRACE
 // #define HAVE_RAZOR
 
 #define LOAD_ADDRESS 0x98000000
