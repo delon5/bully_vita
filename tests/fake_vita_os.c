@@ -13,6 +13,7 @@
 
 // The Vita headers come first on purpose: SceIoStat has a field called st_ctime
 // and glibc defines that as a macro, so whichever is parsed second loses.
+#include <psp2/appmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
@@ -69,6 +70,15 @@ int sceIoRead(SceUID fd, void *data, SceSize size) {
 SceOff sceIoLseek(SceUID fd, SceOff offset, int whence) { return lseek(fd, offset, SEEK_SET); }
 int sceIoMkdir(const char *dir, SceMode mode) { return mkdir(host_path(dir), 0777); }
 int sceIoRemove(const char *file) { return unlink(host_path(file)); }
+
+// Free space on the card. Tests set fake_card_free to exercise both the
+// plenty-of-room path and the too-tight-to-bother path.
+uint64_t fake_card_free = 4ull * 1024 * 1024 * 1024;
+int sceAppMgrGetDevInfo(const char *dev, uint64_t *max_size, uint64_t *free_size) {
+  if (max_size) *max_size = 8ull * 1024 * 1024 * 1024;
+  if (free_size) *free_size = fake_card_free;
+  return 0;
+}
 
 // The cache checks for a file that turns it off. Tests want it on, so report
 // that it is not there -- unless a test deliberately creates it.

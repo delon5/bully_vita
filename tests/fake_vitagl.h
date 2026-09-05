@@ -40,4 +40,7 @@ void fake_reset(size_t free_memory);
 // Holds the writer thread inside sceIoWrite while set.
 extern volatile int fake_stall_writes;
 
+// Free space the loader will see on ux0.
+extern uint64_t fake_card_free;
+
 #endif

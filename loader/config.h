@@ -46,9 +46,17 @@
 // can be uploaded again when the game draws with it. Truncated on every boot,
 // since texture names are handed out afresh each run.
 #define TEXTURE_BACKUP_PATH DATA_PATH "/" "texcache.bin"
-// Ceiling on the cache file. Past this we stop taking copies; the textures that
-// miss out simply stay resident instead of being evicted.
-#define TEXTURE_BACKUP_MAX_MB 768
+// Ceiling on the cache file, and how much of the card to leave alone. The
+// actual limit is whichever is smaller: this, or the free space minus the
+// reserve. Filling a memory card is not a fair thing to do to somebody -- the
+// game writes its saves and its .obb indexes to the same card, and those do not
+// survive being truncated by a full disk.
+#define TEXTURE_BACKUP_MAX_MB 512
+#define TEXTURE_BACKUP_KEEP_FREE_MB 512
+// Below this there is no point having a backing store at all; the cache runs
+// without one and falls back to evicting textures it cannot reload, which
+// still keeps memory bounded.
+#define TEXTURE_BACKUP_MIN_MB 64
 // Largest texture, all mipmap levels together, we are willing to copy.
 #define TEXTURE_BACKUP_MAX_KB 4096
 // Staging arena for copies waiting to be written. It has to be a good few times

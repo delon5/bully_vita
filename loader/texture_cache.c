@@ -22,6 +22,7 @@
  * of the MIT license.  See the LICENSE file for details.
  */
 
+#include <psp2/appmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
@@ -128,6 +129,7 @@ static int cache_enabled = 1;
 
 // Cache file allocator.
 static uint32_t file_cursor;
+static uint32_t file_limit; // how far the cache file may grow, set from free space
 static uint32_t free_list[NUM_BUCKETS][FREE_LIST_CAP];
 static uint16_t free_count[NUM_BUCKETS];
 // Every record a texture can own must be readable back in one go, so a texture's
@@ -207,7 +209,7 @@ static int extent_alloc(uint32_t size, uint32_t *offset) {
     *offset = free_list[bucket][--free_count[bucket]];
     return bucket;
   }
-  if ((uint64_t)file_cursor + bucket_bytes(bucket) > (uint64_t)TEXTURE_BACKUP_MAX_MB * 1024 * 1024)
+  if ((uint64_t)file_cursor + bucket_bytes(bucket) > (uint64_t)file_limit)
     return -1;
   *offset = file_cursor;
   file_cursor += bucket_bytes(bucket);
@@ -321,6 +323,24 @@ void texture_cache_init(void) {
   // installed them into. It is only meaningful for the run that wrote it --
   // texture names are handed out afresh every time -- so it starts empty, and
   // truncating is also what stops it growing across sessions.
+  // Work out how much of the card we may actually use. The cap is a ceiling,
+  // not an entitlement: whatever is free minus a reserve wins if it is smaller.
+  uint64_t card_size = 0, card_free = 0;
+  if (sceAppMgrGetDevInfo("ux0:", &card_size, &card_free) < 0) {
+    traceLog("texture cache: could not read free space on ux0, running without a backing store\n");
+    return;
+  }
+  uint64_t reserve = (uint64_t)TEXTURE_BACKUP_KEEP_FREE_MB * 1024 * 1024;
+  uint64_t usable = card_free > reserve ? card_free - reserve : 0;
+  if (usable > (uint64_t)TEXTURE_BACKUP_MAX_MB * 1024 * 1024)
+    usable = (uint64_t)TEXTURE_BACKUP_MAX_MB * 1024 * 1024;
+  if (usable < (uint64_t)TEXTURE_BACKUP_MIN_MB * 1024 * 1024) {
+    traceLog("texture cache: only %d MB free on ux0, running without a backing store\n",
+             (int)(card_free / (1024 * 1024)));
+    return;
+  }
+  file_limit = (uint32_t)usable;
+
   sceIoMkdir(DATA_PATH, 0777);
   // One descriptor, read/write: the writer seeks and writes, the render thread
   // seeks and reads, and both are on the render thread's side of a handshake
@@ -350,7 +370,8 @@ void texture_cache_init(void) {
   }
 
   backup_ready = 1;
-  traceLog("texture cache: backing store open at %s\n", TEXTURE_BACKUP_PATH);
+  traceLog("texture cache: backing store at %s, limit %d MB (%d MB free on ux0)\n",
+           TEXTURE_BACKUP_PATH, (int)(file_limit / (1024 * 1024)), (int)(card_free / (1024 * 1024)));
 }
 
 void texture_cache_shutdown(void) {

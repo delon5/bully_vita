@@ -39,8 +39,17 @@ int main(void) {
   assert(is_restorable(&textures[pending]) && "must become reloadable once written");
   printf("write queue  : not reloadable until written to the card  OK\n");
 
-  // Now the card is out of the picture entirely.
-  backup_ready = 0;
+  // A card with no room to spare must not get a backing store at all -- filling
+  // it would take the game's own saves and .obb indexes down with it.
+  {
+    uint32_t limit_when_roomy = file_limit;
+    backup_ready = 0; file_limit = 0; file_cursor = 0;
+    fake_card_free = 200ull * 1024 * 1024;   // less than the reserve
+    texture_cache_init();
+    assert(!backup_ready && "a nearly full card must not get a backing store");
+    printf("full card    : no backing store taken (had %u MB when roomy)  OK\n",
+           limit_when_roomy / (1024 * 1024));
+  }
   printf("backing store disabled\n");
 
   // Go over budget, but not far over. Nothing here can be reloaded, so the
