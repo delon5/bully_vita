@@ -6,6 +6,7 @@
  * of the MIT license.  See the LICENSE file for details.
  */
 
+#include <psp2/kernel/clib.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/audioout.h>
@@ -103,7 +104,7 @@ void *gpu_alloc(void *p, uint32_t align, uint32_t size) {
     align = FB_ALIGNMENT;
   }
   size = ALIGN_MEM(size, align);
-  return vglAlloc(size, VGL_MEM_SLOW);
+  return vglAlloc(size, VGL_MEM_PHYCONT);
 }
 
 void gpu_free(void *p, void *ptr) {
@@ -207,6 +208,16 @@ void movie_draw_frame(void) {
   }
 }
 
+static void movie_shader_binary(GLuint shader, const void *gxp, size_t size) {
+  uint8_t *wrapped = malloc(size + sizeof(uint32_t));
+  if (!wrapped)
+    return;
+  *(uint32_t *)wrapped = 0;
+  sceClibMemcpy(wrapped + sizeof(uint32_t), gxp, size);
+  glShaderBinary(1, &shader, 0, wrapped, size + sizeof(uint32_t));
+  free(wrapped);
+}
+
 void movie_setup_player(void) {
   sceSysmoduleLoadModule(SCE_SYSMODULE_AVPLAYER);
 
@@ -218,11 +229,13 @@ void movie_setup_player(void) {
     vglFree(vglGetTexDataPointer(GL_TEXTURE_2D));
   }
 
+  // Same raw-GXP-to-vitaGL-container wrapping the game's shaders need; see
+  // shader_binary_from_gxp in main.c.
   movie_vs = glCreateShader(GL_VERTEX_SHADER);
-  glShaderBinary(1, &movie_vs, 0, movie_v, size_movie_v);
+  movie_shader_binary(movie_vs, movie_v, size_movie_v);
 
   movie_fs = glCreateShader(GL_FRAGMENT_SHADER);
-  glShaderBinary(1, &movie_fs, 0, movie_f, size_movie_f);
+  movie_shader_binary(movie_fs, movie_f, size_movie_f);
 
   movie_prog = glCreateProgram();
   glAttachShader(movie_prog, movie_vs);

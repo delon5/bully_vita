@@ -22,13 +22,6 @@
 #include <psp2/gxm.h>
 #include <kubridge.h>
 
-// vitaGL internals, declared here rather than pulled in from its private
-// shared.h: these are the programs glClear draws with, and a null one is the
-// difference between a clear that renders and one that quietly does nothing.
-extern void *clear_vertex_program_patched;
-extern void *clear_fragment_program_patched;
-// The three display colour surfaces vitaGL renders into and cycles between.
-extern void *gxm_color_surfaces_addr[3];
 #include <vitashark.h>
 #include <vitaGL.h>
 
@@ -520,6 +513,26 @@ int stat_hook(const char *pathname, void *statbuf) {
   return res;
 }
 
+// The game (and the movie player) supply shaders as raw GXP blobs. Current
+// vitaGL reads a glShaderBinary payload with unserialize_shader, which expects
+// its own container: a uint32 count of matrix uniforms, that many uint32
+// indices, and then the GXP. Handing it a bare GXP makes it read the 'GXP\0'
+// magic as a count and skip 20MB past the end of the buffer.
+//
+// A GXP that declares no matrix uniforms serialises to exactly a zero count
+// followed by the GXP itself, so wrapping is a four byte prefix. (The optional
+// binds_map and sized-sampler fields are not read here: glShaderBinary passes
+// load_bindings false, and HAVE_GLSL_TEXTURE_SIZE is off in our build.)
+static void shader_binary_from_gxp(GLuint shader, const void *gxp, size_t size) {
+  uint8_t *wrapped = malloc(size + sizeof(uint32_t));
+  if (!wrapped)
+    return;
+  *(uint32_t *)wrapped = 0; // no matrix uniforms
+  sceClibMemcpy(wrapped + sizeof(uint32_t), gxp, size);
+  glShaderBinary(1, &shader, 0, wrapped, size + sizeof(uint32_t));
+  free(wrapped);
+}
+
 void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, const GLint *length) {
   uint32_t sha1[5];
   SHA1_CTX ctx;
@@ -573,7 +586,7 @@ void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, con
     sceLibcBridge_fread(shaderBuf, 1, shaderSize, file);
     sceLibcBridge_fclose(file);
 
-    glShaderBinary(1, &shader, 0, shaderBuf, shaderSize);
+    shader_binary_from_gxp(shader, shaderBuf, shaderSize);
 #ifdef LOADER_TRACE
     {
       static int bins;
@@ -586,6 +599,29 @@ void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, con
 
     free(shaderBuf);
   }
+}
+
+void glLinkProgramHook(GLuint prog) {
+  glLinkProgram(prog);
+#ifdef LOADER_TRACE
+  static int links;
+  if (links < 6) {
+    GLint linked = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+    traceLog("program: %u link status %d, gl error 0x%x\n", prog, (int)linked, glGetError());
+  }
+  links++;
+#endif
+}
+
+void glDrawElementsHook(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+  glDrawElements(mode, count, type, indices);
+#ifdef LOADER_TRACE
+  static int draws;
+  if (draws == 0 || draws == 100 || draws == 1000)
+    traceLog("draw: glDrawElements %d, %d indices, gl error 0x%x\n", draws, count, glGetError());
+  draws++;
+#endif
 }
 
 void glGetShaderivHook(GLuint shader, GLenum pname, GLint *params) {
@@ -772,7 +808,7 @@ static so_default_dynlib default_dynlib[] = {
   { "glDepthMask", (uintptr_t)&glDepthMask },
   { "glDisable", (uintptr_t)&glDisable },
   { "glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray },
-  { "glDrawElements", (uintptr_t)&glDrawElements },
+  { "glDrawElements", (uintptr_t)&glDrawElementsHook },
   { "glEnable", (uintptr_t)&glEnable },
   { "glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray },
   { "glFinish", (uintptr_t)&glFinish },
@@ -794,7 +830,7 @@ static so_default_dynlib default_dynlib[] = {
   { "glGetString", (uintptr_t)&glGetString },
   { "glGetUniformLocation", (uintptr_t)&glGetUniformLocationHook },
   { "glLineWidth", (uintptr_t)&glLineWidth },
-  { "glLinkProgram", (uintptr_t)&glLinkProgram },
+  { "glLinkProgram", (uintptr_t)&glLinkProgramHook },
   { "glPolygonOffset", (uintptr_t)&glPolygonOffset },
   { "glReadPixels", (uintptr_t)&glReadPixels },
   { "glRenderbufferStorage", (uintptr_t)&ret0 },
@@ -1036,114 +1072,13 @@ int main(int argc, char *argv[]) {
   traceLog("boot: fios ok, starting texture cache\n");
   texture_cache_init();
 
-  // This must stay. The game's shaders are supplied as precompiled .gxp through
-  // glShaderBinary, and without this vitaGL loads SceShaccCg and taiHEN-patches
-  // it during vglInit, which most people have no reason to have installed.
   traceLog("boot: texture cache done, initialising vitaGL\n");
-  vglEnableRuntimeShaderCompiler(GL_FALSE);
   vglSetupGarbageCollector(127, 0x20000);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
 
   traceLog("boot: vitaGL up (%s / %s), setting up movie player\n",
            (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER));
 
-#ifdef LOADER_TRACE
-  // Paint the screen red for a moment before the game gets a chance to draw
-  // anything. This is the one test that separates a display path that never
-  // reaches the panel from content that is genuinely being drawn black: it uses
-  // nothing but glClear and vglSwapBuffers, no shaders, no textures, no game.
-  // vitaGL's clear is a full-screen quad drawn with these two programs, built
-  // by the shader patcher during init. A null one means every glClear silently
-  // draws nothing, which is exactly what a black surface with no GL error and
-  // a working scanout looks like.
-  traceLog("display: clear programs vertex %p fragment %p\n",
-           clear_vertex_program_patched, clear_fragment_program_patched);
-  traceLog("display: vitaGL free ram %d KB, cdram %d KB, phycont %d KB, external %d KB\n",
-           (int)(vglMemFree(VGL_MEM_RAM) / 1024), (int)(vglMemFree(VGL_MEM_VRAM) / 1024),
-           (int)(vglMemFree(VGL_MEM_SLOW) / 1024), (int)(vglMemFree(VGL_MEM_EXTERNAL) / 1024));
-
-  traceLog("display: clearing to red for one second\n");
-  glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-  for (int i = 0; i < 60; i++) {
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    vglSwapBuffers(GL_FALSE);
-  }
-  traceLog("display: red test done, gl error 0x%x\n", glGetError());
-
-  // vitaGL only reaches sceDisplaySetFrameBuf through its display queue
-  // callback, and only when it did not decide the app is a system one -- in
-  // system app mode it hands frames to sceSharedFb instead, which for a normal
-  // app means they are drawn, queued and never shown, with no error anywhere.
-  // Ask sceDisplay what it is actually scanning out, and run the same budget
-  // check vitaGL uses to pick between the two paths.
-  // Cheapest question first, and each answer is written out before the next
-  // call is made: an earlier version of this drained the display queue up
-  // front, which never returned when nothing was consuming it and took the
-  // whole boot down with it.
-  SceAppMgrBudgetInfo budget;
-  sceClibMemset(&budget, 0, sizeof(budget));
-  budget.size = sizeof(budget);
-  int budget_res = sceAppMgrGetBudgetInfo(&budget);
-  traceLog("display: sceAppMgrGetBudgetInfo 0x%x -> vitaGL system app mode %s\n",
-           budget_res, budget_res == 0 ? "ON (frames go to sceSharedFb)" : "off");
-
-  // Reports what is being scanned out right now; unlike draining the queue it
-  // does not wait on anything.
-  SceDisplayFrameBuf shown;
-  sceClibMemset(&shown, 0, sizeof(shown));
-  shown.size = sizeof(shown);
-  int fb_res = sceDisplayGetFrameBuf(&shown, SCE_DISPLAY_SETBUF_NEXTFRAME);
-  traceLog("display: sceDisplayGetFrameBuf 0x%x, base %p, %dx%d, pitch %d, fmt 0x%x\n",
-           fb_res, shown.base, (int)shown.width, (int)shown.height,
-           (int)shown.pitch, (unsigned int)shown.pixelformat);
-
-  // The panel is being fed a real surface at the right geometry, so either the
-  // GPU never put red into it or what it put there is not what reaches the
-  // panel. Read a pixel back out of the surface the GPU rendered into: red
-  // means the drawing half works and the fault is downstream of it.
-  {
-    uint32_t px = 0;
-    glReadPixels(SCREEN_W / 2, SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &px);
-    traceLog("display: glReadPixels centre 0x%08x (red is 0xff0000ff), gl error 0x%x\n",
-             px, glGetError());
-  }
-
-  // glReadPixels goes through vitaGL's own idea of which surface is current.
-  // Read all three colour surfaces directly instead: if red is sitting in one
-  // of them the GPU did draw and the wrong buffer is being shown, and if the
-  // address sceDisplay reports is not among them then vitaGL's frames are not
-  // the ones on screen at all.
-  for (int i = 0; i < 3; i++) {
-    uint32_t *surface = (uint32_t *)gxm_color_surfaces_addr[i];
-    if (!surface) {
-      traceLog("display: colour surface %d not allocated\n", i);
-      continue;
-    }
-    uint32_t centre = surface[(SCREEN_H / 2) * 960 + (SCREEN_W / 2)];
-    int red_pixels = 0;
-    for (int y = 0; y < SCREEN_H; y += 16)
-      for (int x = 0; x < SCREEN_W; x += 16)
-        if ((surface[y * 960 + x] & 0x00ffffff) == 0x000000ff)
-          red_pixels++;
-    traceLog("display: colour surface %d at %p, centre 0x%08x, %d red samples%s\n",
-             i, surface, centre, red_pixels,
-             surface == shown.base ? " (this is the one being scanned out)" : "");
-  }
-
-  // And write straight into the buffer sceDisplay says it is scanning out,
-  // with no GPU involved at all. If the screen goes green here, everything
-  // from the surface to the panel is fine and only the rendering is not.
-  if (fb_res == 0 && shown.base) {
-    uint32_t *pixels = (uint32_t *)shown.base;
-    for (unsigned int i = 0; i < shown.pitch * shown.height; i++)
-      pixels[i] = 0xff00ff00; // opaque green in A8B8G8R8
-    traceLog("display: filled the scanout buffer green from the CPU\n");
-    sceKernelDelayThread(3 * 1000 * 1000);
-    traceLog("display: green hold over\n");
-  }
-
-  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-#endif
   movie_setup_player();
 
   traceLog("boot: handing over to the game\n");

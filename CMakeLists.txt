@@ -17,28 +17,6 @@ set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Wl,-q,--wrap,memcpy,--wrap,memmove,--wrap,memset -D_GNU_SOURCE -Wall -O3 -mfloat-abi=softfp")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++11")
 
-# The game hands raw .gxp blobs to glShaderBinary. vitaGL changed that entry
-# point after the revision this port targets: newer builds route it through
-# unserialize_shader, which expects vitaGL's own serialized cache format and
-# quietly registers nothing when handed a bare .gxp. Nothing fails loudly --
-# the game boots, plays audio and renders a black screen. Check for the newer
-# symbol at configure time so a mismatched vitaGL is a build error instead of
-# an evening of coredumps. See README.md for the revision to build.
-find_library(VITAGL_LIBRARY NAMES vitaGL PATHS "${VITASDK}/arm-vita-eabi/lib" NO_DEFAULT_PATH)
-if(VITAGL_LIBRARY)
-  execute_process(
-    COMMAND "${VITASDK}/bin/arm-vita-eabi-nm" "${VITAGL_LIBRARY}"
-    OUTPUT_VARIABLE VITAGL_SYMBOLS
-    ERROR_QUIET
-  )
-  if(VITAGL_SYMBOLS MATCHES "unserialize_shader")
-    message(FATAL_ERROR
-      "The installed vitaGL routes glShaderBinary through unserialize_shader, "
-      "which this port's precompiled .gxp shaders are not in the format for. "
-      "Rebuild vitaGL at the revision pinned in .github/workflows/build.yml "
-      "(VITAGL_REV) -- see README.md.")
-  endif()
-endif()
 
 add_executable(Bully
   loader/main.c
