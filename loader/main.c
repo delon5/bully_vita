@@ -1055,6 +1055,15 @@ int main(int argc, char *argv[]) {
 
   // Stamped so a trace file can never be ambiguous about which build wrote it.
   traceLog("---- loader built %s %s ----\n", __DATE__, __TIME__);
+  // Where this boot put us. Addresses in the trace are only meaningful against
+  // it: the module slide changes from run to run, and reconstructing it from a
+  // coredump afterwards means rebuilding the exact binary to symbolise anything.
+  // A known function's runtime address. Every eboot address in this trace is
+  // only meaningful against it: the module slide changes from run to run, so
+  // without this, turning a logged address back into a function means rebuilding
+  // the exact binary and reading the slide out of a coredump. Subtract the
+  // linked address of ProcessEvents from this and you have the slide.
+  traceLog("eboot: ProcessEvents is at 0x%x this boot\n", (unsigned)(uintptr_t)&ProcessEvents);
   traceLog("boot: reached kubridge check\n");
   if (check_kubridge() < 0)
     fatal_error("Error kubridge.skprx is not installed.");

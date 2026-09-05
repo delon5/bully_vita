@@ -55,9 +55,10 @@ void __real_free(void *ptr);
 // so many small ones that the bulk counter shows it anyway.
 #define SMALL_BYTES (64 * 1024)
 
-// Distinct call sites worth remembering. The game has far fewer places that
-// allocate large blocks than it has allocations.
-#define CALLERS 512
+// Distinct call sites worth remembering. Raised well past the eboot's, because
+// a site that cannot claim a slot goes uncredited and its memory then appears
+// only in the total -- which is exactly the kind of gap this exists to close.
+#define CALLERS 2048
 
 typedef struct {
   void *ptr;
@@ -112,7 +113,7 @@ static uint32_t so_offset(void *return_address) {
 // A slot is free while it has never been used; slots are never given back, so a
 // site that allocated and freed everything still shows how much it ever did.
 static CallerTotals *caller_slot(uint32_t caller) {
-  uint32_t i = (caller * 0x9e3779b1u) >> 23;
+  uint32_t i = (caller * 0x9e3779b1u) >> 21;
   for (uint32_t probe = 0; probe < CALLERS; probe++) {
     CallerTotals *c = &callers[(i + probe) & (CALLERS - 1)];
     if (c->caller == caller)
@@ -154,13 +155,15 @@ static void remember_block(void *ptr, size_t size, uint32_t caller) {
 
 // Take a block back out, returning how big it was, or 0 if it was never in
 // there -- which is how the caller tells a tabled block from a bulk-counted one.
-static size_t forget_block(void *ptr) {
+static size_t forget_block(void *ptr, uint32_t *caller_out) {
   uint32_t i = hash_ptr(ptr) & LIVE_MASK;
   lock_table();
   for (uint32_t probe = 0; probe < 64; probe++) {
     LiveBlock *b = &live[(i + probe) & LIVE_MASK];
     if (b->ptr == ptr) {
       size_t size = b->size;
+      if (caller_out)
+        *caller_out = b->caller;
       large_live_bytes -= size;
       CallerTotals *c = caller_slot(b->caller);
       if (c && c->caller == b->caller) {
@@ -211,7 +214,7 @@ static void forget(void *ptr) {
     return;
   }
 
-  if (!forget_block(ptr))
+  if (!forget_block(ptr, NULL))
     untracked_frees++; // allocated before tracking began, or lost to a full table
 }
 
@@ -338,6 +341,10 @@ void alloc_trace_report(void) {
 
 #ifdef LOADER_ALLOC_TRACE
 
+// Text on this console starts here or above; the .so is mapped much higher, at
+// LOAD_ADDRESS, which is how the two are told apart.
+#define EBOOT_TEXT_BASE 0x81000000u
+
 static size_t loader_live_bytes;
 static uint32_t loader_live_count;
 
@@ -381,10 +388,17 @@ static void account_alloc(void *ptr, void *return_address) {
 }
 
 static void account_free(void *ptr) {
-  size_t reclaimed = forget_block(ptr);
+  // The table holds the eboot's blocks and the game's large ones together, so
+  // the caller decides whose counters to adjust. Decrementing the eboot's for
+  // every tabled block -- which is what this did at first -- ran the count below
+  // zero and reported 3725 MB in 4294967204 blocks.
+  uint32_t caller = 0;
+  size_t reclaimed = forget_block(ptr, &caller);
   if (reclaimed) {
-    __atomic_sub_fetch(&loader_live_bytes, reclaimed, __ATOMIC_RELAXED);
-    __atomic_sub_fetch(&loader_live_count, 1, __ATOMIC_RELAXED);
+    if (caller >= EBOOT_TEXT_BASE) {
+      __atomic_sub_fetch(&loader_live_bytes, reclaimed, __ATOMIC_RELAXED);
+      __atomic_sub_fetch(&loader_live_count, 1, __ATOMIC_RELAXED);
+    }
     return;
   }
   forget(ptr);
@@ -395,16 +409,19 @@ void alloc_trace_loader_report(void) {
            (int)(loader_live_bytes / (1024 * 1024)), loader_live_count);
 
   uint32_t ceiling = 0xffffffffu;
-  for (int rank = 0; rank < 8; rank++) {
+  for (int rank = 0; rank < 16; rank++) {
     CallerTotals *best = NULL;
     for (int i = 0; i < CALLERS; i++) {
       CallerTotals *c = &callers[i];
-      if (c->total_count == 0 || c->live_bytes >= ceiling || c->caller < 0x81000000u)
+      if (c->total_count == 0 || c->live_bytes >= ceiling || c->caller < EBOOT_TEXT_BASE)
         continue;
       if (!best || c->live_bytes > best->live_bytes)
         best = c;
     }
-    if (!best || best->live_bytes < 256 * 1024)
+    // Down to 64 KB: the three sites over a quarter of a megabyte came to 37 MB
+    // of the 155 MB live, so whatever holds the rest is spread thinner than the
+    // old threshold could see.
+    if (!best || best->live_bytes < 64 * 1024)
       break;
     traceLog("loader heap:   eboot 0x%x holds %d KB in %u blocks (%u ever)\n", best->caller,
              (int)(best->live_bytes / 1024), best->live_count, best->total_count);
