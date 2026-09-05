@@ -14,6 +14,11 @@
 // eviction rule that never once fired was invisible until a heartbeat printed
 // "cdram 0 ... ev 0". Turn it off once a session survives.
 #define LOADER_TRACE
+// Accounts for every allocation the game makes and reports the largest holders
+// with the trace. On to find what is growing on the newlib heap after a long
+// session, which is what the port crashes on now that textures are bounded.
+// Costs a hash insert per malloc and a lookup per free.
+#define LOADER_ALLOC_TRACE
 // #define HAVE_RAZOR
 
 #define LOAD_ADDRESS 0x98000000

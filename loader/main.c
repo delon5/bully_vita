@@ -53,6 +53,7 @@
 #include "jni_patch.h"
 #include "movie_patch.h"
 #include "openal_patch.h"
+#include "alloc_trace.h"
 #include "texture_cache.h"
 
 #include "sha1.h"
@@ -228,6 +229,12 @@ int ProcessEvents(void) {
              (int)(heap.uordblks / (1024 * 1024)),
              cache.tracked_mb, cache.parked_mb, cache.evicted, cache.restored, cache.failed,
              cache.spilled, cache.starved, cache.deferred, cache.blocked);
+#ifdef LOADER_ALLOC_TRACE
+    // Less often than the heartbeat: this one walks a table and prints several
+    // lines, and the question it answers changes over minutes, not frames.
+    if (events % 6000 == 0)
+      alloc_trace_report();
+#endif
   }
   events++;
 #endif
@@ -656,11 +663,20 @@ static so_default_dynlib default_dynlib[] = {
   { "tan", (uintptr_t)&tan },
   { "tanf", (uintptr_t)&tanf },
 
+#ifdef LOADER_ALLOC_TRACE
+  // Same allocators, wrapped so the trace can say who is holding the heap.
+  { "calloc", (uintptr_t)&bully_calloc },
+  { "free", (uintptr_t)&bully_free },
+  { "malloc", (uintptr_t)&bully_malloc },
+  { "memalign", (uintptr_t)&bully_memalign },
+  { "realloc", (uintptr_t)&bully_realloc },
+#else
   { "calloc", (uintptr_t)&calloc },
   { "free", (uintptr_t)&free },
   { "malloc", (uintptr_t)&malloc },
   { "memalign", (uintptr_t)&memalign },
   { "realloc", (uintptr_t)&realloc },
+#endif
 
   { "atoi", (uintptr_t)&atoi },
 
