@@ -51,6 +51,12 @@ int frames_swapped;
 void *__real_malloc(size_t size) { return malloc(size); }
 void *__real_calloc(size_t count, size_t size) { return calloc(count, size); }
 void *__real_realloc(void *ptr, size_t size) { return realloc(ptr, size); }
+void *__real_aligned_alloc(size_t alignment, size_t size) {
+  void *p = NULL;
+  if (posix_memalign(&p, alignment < sizeof(void *) ? sizeof(void *) : alignment, size))
+    return NULL;
+  return p;
+}
 void *__real_memalign(size_t alignment, size_t size) {
   void *p = NULL;
   if (posix_memalign(&p, alignment < sizeof(void *) ? sizeof(void *) : alignment, size))

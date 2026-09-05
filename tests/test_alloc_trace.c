@@ -112,6 +112,25 @@ int main(void) {
       trace_free(slots[i]);
   }
 
+  // Freeing a block the tracer never saw. OpenAL allocates through
+  // aligned_alloc, which reaches the allocator without naming the memalign
+  // symbol, so --wrap could not see it -- while its frees came straight
+  // through. Every one subtracted bytes that had never been added, and after a
+  // session of voices and buffers the small total wrapped past zero and printed
+  // as 4007 MB. The suite passed anyway, because it only ever freed what it had
+  // allocated.
+  {
+    size_t bytes_before = small_live_bytes;
+    for (int i = 0; i < 5000; i++) {
+      void *stranger = malloc(SMALL); // never through trace_alloc
+      trace_free(stranger);
+    }
+    assert(small_live_bytes <= bytes_before && "an unknown free must not add bytes");
+    assert(small_live_bytes != (size_t)-1 && small_live_bytes < (size_t)1 << 40 &&
+           "and must never wrap past zero");
+    printf("unknown free : 5000 blocks the tracer never saw, no underflow     OK\n");
+  }
+
   printf("PASS\n");
   return 0;
 }

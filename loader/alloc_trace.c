@@ -36,6 +36,7 @@ void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
 void *__real_realloc(void *ptr, size_t size);
 void *__real_memalign(size_t alignment, size_t size);
+void *__real_aligned_alloc(size_t alignment, size_t size);
 void __real_free(void *ptr);
 
 // Live allocations of SMALL_BYTES or more, open addressed by pointer. Only
@@ -111,6 +112,13 @@ static inline void unlock_table(void) {
 static LiveBlock live[LIVE_SLOTS];
 static CallerTotals callers[CALLERS];
 static size_t large_live_bytes, small_live_bytes;
+// Frees of blocks that were never counted. OpenAL allocates through
+// aligned_alloc, which reaches _memalign_r without ever naming the memalign
+// symbol, so --wrap cannot see it -- while al_free goes straight through
+// __wrap_free. Every one of those frees was subtracting bytes that had never
+// been added, and after a session of voices and buffers the small total wrapped
+// past zero and printed as 4007 MB.
+static uint32_t unknown_frees;
 static uint32_t small_live_count, untracked_frees, table_full;
 
 // Pointers from a single heap are 8 byte aligned at worst, so the low bits
@@ -250,6 +258,14 @@ static void forget(void *ptr) {
 
   size_t size = malloc_usable_size(ptr);
   if (size < SMALL_BYTES) {
+    // Never below zero. A total that wraps is worse than one that is short: it
+    // reads as gigabytes and buries the answer, where a floor plus a count of
+    // what could not be explained says plainly how much to trust the figure.
+    if (__atomic_load_n(&small_live_count, __ATOMIC_RELAXED) == 0 ||
+        __atomic_load_n(&small_live_bytes, __ATOMIC_RELAXED) < size) {
+      __atomic_add_fetch(&unknown_frees, 1, __ATOMIC_RELAXED);
+      return;
+    }
     __atomic_sub_fetch(&small_live_bytes, size, __ATOMIC_RELAXED);
     __atomic_sub_fetch(&small_live_count, 1, __ATOMIC_RELAXED);
     // A sampled block has to leave the table too. Counting one in every
@@ -342,7 +358,8 @@ void alloc_trace_report(void) {
   // table, since this runs inside the game's loop.
   traceLog("heap: %d MB in large blocks, %d MB in small (%u of them), %u untracked frees%s\n",
            (int)(large_live_bytes / (1024 * 1024)), (int)(small_live_bytes / (1024 * 1024)),
-           small_live_count, untracked_frees, table_full ? " [TABLE FULL]" : "");
+           small_live_count, untracked_frees + unknown_frees,
+           table_full ? " [TABLE FULL]" : "");
 
   size_t ceiling_bytes = (size_t)-1;
   uint32_t ceiling_caller = 0;
@@ -533,6 +550,7 @@ void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
 void *__real_realloc(void *ptr, size_t size);
 void *__real_memalign(size_t alignment, size_t size);
+void *__real_aligned_alloc(size_t alignment, size_t size);
 void __real_free(void *ptr);
 #define account_alloc(ptr, ra) ((void)0)
 #define account_free(ptr) ((void)0)
@@ -556,6 +574,18 @@ void *__wrap_calloc(size_t count, size_t size) {
 
 void *__wrap_memalign(size_t alignment, size_t size) {
   void *ptr = __real_memalign(alignment, size);
+  if (!ptr)
+    note_failure(size, __builtin_return_address(0));
+  account_alloc(ptr, __builtin_return_address(0));
+  return ptr;
+}
+
+// OpenAL's al_malloc goes through aligned_alloc, which reaches _memalign_r
+// without ever referencing the memalign symbol -- so wrapping memalign alone
+// left its allocations invisible while its frees were counted, which is what
+// drove the small total below zero.
+void *__wrap_aligned_alloc(size_t alignment, size_t size) {
+  void *ptr = __real_aligned_alloc(alignment, size);
   if (!ptr)
     note_failure(size, __builtin_return_address(0));
   account_alloc(ptr, __builtin_return_address(0));
