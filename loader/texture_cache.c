@@ -105,6 +105,11 @@ static int active_unit = 0;
 static uint32_t frame_counter = 1;
 static size_t tracked_bytes = 0;
 static uint32_t upload_serial = 1;
+// The highest texture name the game has actually used. The eviction pass walks
+// this array every frame it wants to reclaim, and walking all 16384 slots means
+// touching two megabytes of struct to look at a few thousand live entries --
+// cache pressure every frame, for nothing.
+static GLuint highest_id;
 static uint32_t starved_frames; // frames the lossless pass has failed to keep up
 // What each pool had free once the game was drawing, sampled on the first tick.
 // Kept per pool rather than as a total: on hardware CDRAM ran to zero while the
@@ -169,13 +174,23 @@ static uint32_t checksum(const void *data, uint32_t size) {
   return hash;
 }
 
-// Whether the newlib heap is too far gone to be parking textures in. mallinfo
-// walks the free list, so it is not free -- it is called once per eviction,
-// never per upload.
-static int heap_is_tight(void) {
+// Whether the newlib heap is too far gone to be parking textures in.
+//
+// Sampled once a frame, in the tick, and only read here. mallinfo walks the
+// whole free list and takes the malloc lock to do it, so asking per eviction
+// meant taking that lock up to sixty-four times a frame -- blocking every
+// thread that wanted to allocate, exactly while the game was streaming an area
+// in and allocating hardest. That is a stutter, not a measurement.
+static int heap_tight;
+
+static void sample_heap(void) {
   struct mallinfo info = mallinfo();
   size_t limit = (size_t)(MEMORY_NEWLIB_MB - TEXTURE_HEAP_KEEP_FREE_MB) * 1024 * 1024;
-  return (size_t)info.uordblks > limit;
+  heap_tight = (size_t)info.uordblks > limit;
+}
+
+static int heap_is_tight(void) {
+  return heap_tight;
 }
 
 static TextureInfo *texture_info(GLuint id) {
@@ -335,6 +350,7 @@ void texture_cache_init(void) {
     textures[id].min_filter = GL_LINEAR;
   }
   memset(bound_textures, 0, sizeof(bound_textures));
+  highest_id = 0;
   active_unit = 0;
   tracked_bytes = 0;
   ram_cache_bytes = 0;
@@ -629,6 +645,8 @@ static void texture_uploaded(GLuint id, uint32_t size, int base_level) {
   }
 
   info->tracked = 1;
+  if (id > highest_id)
+    highest_id = id;
   info->evicted = 0;
   info->last_frame = frame_counter;
   tracked_bytes += size;
@@ -717,7 +735,7 @@ static int evict_textures(size_t target_bytes, uint32_t min_idle_frames) {
   // Collect the least recently used textures in a single pass, keeping the list
   // sorted oldest first so that the newest entry is the one that falls out when
   // it is full.
-  for (GLuint id = 1; id < MAX_TEXTURES; id++) {
+  for (GLuint id = 1; id <= highest_id; id++) {
     TextureInfo *info = &textures[id];
     if (!info->tracked || info->pinned || info->evicted || info->size == 0)
       continue;
@@ -770,6 +788,9 @@ void texture_cache_tick(void) {
     return;
 
   frame_counter++;
+
+  // Once a frame, for everything that asks about it below.
+  sample_heap();
 
   // A texture stays bound to its unit until something displaces it, so one the
   // game bound once and keeps drawing with is still in use even though we never
