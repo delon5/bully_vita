@@ -5,7 +5,7 @@
 // Writes a line to ux0:data/bully_trace.txt at each step of startup. Separate
 // from DEBUG on purpose: DEBUG also forwards every one of the game's own log
 // lines, which is thousands of file opens and slow enough to look like a hang.
-// #define LOADER_TRACE
+#define LOADER_TRACE
 // #define HAVE_RAZOR
 
 #define LOAD_ADDRESS 0x98000000

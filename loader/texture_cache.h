@@ -33,6 +33,18 @@ void texture_cache_shutdown(void);
 // Drops the least recently used textures if we are over budget. Must be called
 // once per frame from the thread that renders, right before swapping buffers.
 void texture_cache_tick(void);
-void texture_cache_stats(int *mb, int *evicted, int *restored, int *failed);
+// What the cache is holding and what it has had to do to hold it. parked_mb and
+// spilled apart tell a cheap eviction from an expensive one, and starved says
+// the cache wanted to reclaim and could not -- which is what precedes running
+// out of memory.
+typedef struct {
+  int tracked_mb;
+  int parked_mb; // evicted textures sitting in the newlib heap
+  int evicted, restored, failed;
+  int spilled; // evictions that had to reach the memory card
+  int starved; // frames it failed to get back under its limits
+} TextureCacheStats;
+
+void texture_cache_stats(TextureCacheStats *out);
 
 #endif

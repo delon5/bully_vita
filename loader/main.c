@@ -213,14 +213,21 @@ int ProcessEvents(void) {
   // that is running but never drawing from one that is not running at all.
   static int events;
   if (events % 600 == 0) {
-    int cache_mb, evicted, restored, failed;
-    texture_cache_stats(&cache_mb, &evicted, &restored, &failed);
-    traceLog("loop: %d | tex %d draw %d | vgl ram %d cdram %d phycont %d MB | cache %d MB ev %d re %d lost %d\n",
+    TextureCacheStats cache;
+    texture_cache_stats(&cache);
+    // Heap used as well as the GPU pools. The cache parks evicted textures in
+    // the newlib heap, so a crash could now be the heap running out rather than
+    // the pools, and the two look nothing alike from a coredump.
+    struct mallinfo heap = mallinfo();
+    traceLog("loop: %d | tex %d draw %d | vgl ram %d cdram %d phycont %d MB | heap %d MB | "
+             "cache %d MB parked %d ev %d re %d lost %d spill %d starve %d\n",
              events, trace_textures, trace_draws,
              (int)(vglMemFree(VGL_MEM_RAM) / (1024 * 1024)),
              (int)(vglMemFree(VGL_MEM_VRAM) / (1024 * 1024)),
              (int)(vglMemFree(VGL_MEM_PHYCONT) / (1024 * 1024)),
-             cache_mb, evicted, restored, failed);
+             (int)(heap.uordblks / (1024 * 1024)),
+             cache.tracked_mb, cache.parked_mb, cache.evicted, cache.restored, cache.failed,
+             cache.spilled, cache.starved);
   }
   events++;
 #endif

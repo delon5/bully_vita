@@ -934,9 +934,12 @@ void glTexParameterfHook(GLenum target, GLenum pname, GLfloat param) {
 // Reported on the trace heartbeat while this is being exercised for the first
 // time on hardware: how much is resident, how much has been dropped, and how
 // much of it came back.
-void texture_cache_stats(int *mb, int *evicted, int *restored, int *failed) {
-  *mb = (int)(tracked_bytes / (1024 * 1024));
-  *evicted = (int)evicted_count;
-  *restored = (int)restored_count;
-  *failed = (int)restore_failed_count;
+void texture_cache_stats(TextureCacheStats *out) {
+  out->tracked_mb = (int)(tracked_bytes / (1024 * 1024));
+  out->parked_mb = (int)(ram_cache_bytes / (1024 * 1024));
+  out->evicted = (int)evicted_count;
+  out->restored = (int)restored_count;
+  out->failed = (int)restore_failed_count;
+  out->spilled = (int)card_evicted_count;
+  out->starved = (int)starved_frames;
 }
