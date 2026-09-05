@@ -1004,6 +1004,13 @@ int main(int argc, char *argv[]) {
   // glShaderBinary payload as their own serialized container, and a bare GXP
   // wrapped to satisfy that parser registers a program that links, draws
   // without error and rasterises nothing. Requires libshacccg.suprx.
+  // Semantics can only be resolved accurately when vitaGL can see a vertex and
+  // fragment shader together. This engine compiles some forty shaders during
+  // startup and does not create a program from any of them until much later,
+  // so the pair mode layton3-vita uses does not hold here and the global pool
+  // vitaGL defaults to is the least accurate option. Postponing compilation to
+  // glLinkProgram always gives it the right couple.
+  vglSetSemanticBindingMode(VGL_MODE_POSTPONED);
   vglSetupRuntimeShaderCompiler(SHARK_OPT_UNSAFE, SHARK_ENABLE, SHARK_ENABLE, SHARK_ENABLE);
   vglSetCircularPoolSize(MEMORY_VITAGL_CIRCULAR_POOL_MB * 1024 * 1024);
   vglSetupGarbageCollector(127, 0x20000);
