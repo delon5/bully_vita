@@ -56,8 +56,29 @@ export PATH="$VITASDK/bin:$PATH"
 Most dependencies are then a one-liner:
 
 ```bash
-vdpm install libmathneon mpg123 openal-soft kubridge taihen SceShaccCgExt vitaShaRK
+vdpm install libmathneon mpg123 kubridge taihen SceShaccCgExt vitaShaRK
 ```
+
+`openal-soft` has to be built from source, with one patch:
+
+```bash
+git clone -b vita-1.19.1 https://github.com/isage/openal-soft
+git -C openal-soft checkout --detach c851a68f0939040a56bf0dd453367c1021264bb9
+grep -rl 'alignas(16)' --include=*.h --include=*.c openal-soft | xargs sed -i 's/alignas(16)/alignas(8)/g'
+cmake -S openal-soft -B openal-soft/build \
+  -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_FLAGS="-mfloat-abi=softfp -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types"
+cmake --build openal-soft/build --target install
+```
+
+openal-soft declares `aluVector` and `aluMatrixf` `alignas(16)`, but reaches them
+through struct-return slots derived from the stack pointer, and AAPCS only
+guarantees SP is 8-byte aligned. The compiler is then entitled to emit a
+16-byte-aligned NEON store to an 8-byte-aligned address, which faults. Whether it
+does comes down to frame layout, so it is luck rather than a setting: the 2021
+build survives it, a build with a current compiler does not, and it crashes in
+`aluMixData` before the first frame. Asking for 8-byte alignment costs nothing on
+this hardware and makes the store legal either way.
 
 `vitaGL` has to be built from source, because the port depends on compile-time
 options the published package does not set, and it has to be **this revision**:

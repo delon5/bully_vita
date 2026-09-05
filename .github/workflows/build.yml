@@ -23,6 +23,7 @@ jobs:
       # so vglInit always loads SceShaccCg and patches it through taiHEN. Do not
       # bump this without checking both.
       VITAGL_REV: 4e4f5b6ad0bf43754935250a1707fad67eb4e450
+      OPENAL_REV: c851a68f0939040a56bf0dd453367c1021264bb9
 
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +37,7 @@ jobs:
           echo "$HOME/vitasdk/bin" >> "$GITHUB_PATH"
 
       - name: Install prebuilt dependencies
-        run: VDPM_NONINTERACTIVE=1 vdpm install libmathneon mpg123 openal-soft kubridge taihen SceShaccCgExt vitaShaRK
+        run: VDPM_NONINTERACTIVE=1 vdpm install libmathneon mpg123 kubridge taihen SceShaccCgExt vitaShaRK
 
       # Built from source rather than taken from the package set, because the
       # port depends on compile-time options (unpure textures, phycont on
@@ -56,6 +57,23 @@ jobs:
       # so the tests see the same headers the vpk is built against.
       - name: Run texture cache tests
         run: make -C tests check
+
+      # openal-soft declares aluVector and aluMatrixf alignas(16), but reaches
+      # them through sret slots derived from SP -- and AAPCS only guarantees SP
+      # is 8-byte aligned. The compiler is then entitled to emit a 16-byte
+      # aligned NEON store to an 8-byte aligned address, which is a data abort.
+      # Whether it does depends on frame layout, so this is luck, not a setting:
+      # the 2021 build happened to survive it and a current one does not.
+      # Asking for 8 costs nothing here and makes the store legal either way.
+      - name: Build openal-soft
+        run: |
+          git clone -b vita-1.19.1 https://github.com/isage/openal-soft
+          git -C openal-soft checkout --detach "$OPENAL_REV"
+          grep -rl 'alignas(16)' --include=*.h --include=*.c openal-soft | xargs sed -i 's/alignas(16)/alignas(8)/g'
+          cmake -S openal-soft -B openal-soft/build \
+            -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-mfloat-abi=softfp -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types"
+          cmake --build openal-soft/build -j"$(nproc)" --target install
 
       - name: Build SceLibcBridge stubs
         run: make -C libc_bridge install
