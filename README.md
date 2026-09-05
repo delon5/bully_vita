@@ -166,10 +166,21 @@ The result is `build/Bully.vpk`.
 [`.github/workflows/build.yml`](.github/workflows/build.yml) runs exactly these
 steps on every push and pins the same vitaGL revision.
 
-If the game misbehaves and you want to rule the texture cache out, create an
-empty file at `ux0:data/Bully/no_texcache`. The loader then leaves the game's
-texture handling exactly as it was, with no tracking, no eviction and no cache
-file. Delete it to turn the cache back on; no rebuild either way.
+Unused textures are freed by vitaGL's own texture cache, built in with
+`HAVE_TEXTURE_CACHE=1` (see above). It writes textures the game has stopped
+drawing with to `ux0:data/vgl_cache/BULLY0000` and reads them back when the game
+binds them again, so a long session stays inside what the console has rather
+than growing until it dies. Deleting that folder is safe; it is rebuilt as
+needed.
+
+The loader also carries its own texture cache in `loader/texture_cache.c`,
+which predates that discovery and does the same job by intercepting the game's
+GL calls. It is **off** unless an empty file exists at
+`ux0:data/Bully/use_texcache`, because working from outside vitaGL is both more
+fragile and, on hardware, crashed once the game reached actual gameplay. It is
+kept for now because it is covered by the tests in `tests/` and because its
+eviction policy is budget-driven rather than allocation-failure-driven, which is
+worth keeping as a fallback until vitaGL's has more time on real hardware.
 
 ## Credits
 

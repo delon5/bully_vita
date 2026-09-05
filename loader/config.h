@@ -26,13 +26,13 @@
 // texture cache works to.
 #define MEMORY_VITAGL_CIRCULAR_POOL_MB 48
 
-// Create this file to turn the texture cache off: nothing is tracked, nothing
-// is evicted and no backing store is opened, leaving the game's texture
-// handling exactly as it was. It is a runtime switch rather than a build option
-// so the binary is identical either way, which matters both for telling a
-// problem in here apart from a problem elsewhere and because changing the size
-// of the loader can upset how vita-elf-create lays out its segments.
-#define TEXTURE_CACHE_DISABLE_PATH DATA_PATH "/" "no_texcache"
+// vitaGL's own texture cache (HAVE_TEXTURE_CACHE, see README) does this job
+// from inside the library, where it owns the texture data outright. It is what
+// the build uses. The loader's own cache below predates that discovery and is
+// off unless this file exists, because it works by intercepting the game's GL
+// calls -- which is both more fragile and, on hardware, what crashed once the
+// game reached actual gameplay.
+#define TEXTURE_CACHE_ENABLE_PATH DATA_PATH "/" "use_texcache"
 
 // How much texture data the game is allowed to keep resident. The Android
 // build never evicts anything, so this is what keeps it inside what vitaGL can
