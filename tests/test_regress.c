@@ -229,6 +229,38 @@ int main(void) {
            "the drained pool must be held well clear of empty");
   }
 
+  // Reclaiming that is refused must not be refused forever. On hardware the
+  // RAM pool settled at 13% of its start -- above the 12% that opens the memory
+  // card, below the 25% the cache aims for -- with the heap tier full because
+  // the game had the heap. The cache wanted to evict and was told no 3.6
+  // million times while the pools drained under it, and the session ended in
+  // malloc. Cheap first is right; cheap forever is not.
+  {
+    // A driver small enough that the byte budget cannot cap the pressure before
+    // the RAM pool gets low, since it is the pool that has to end up wedged.
+    harness_start(160 * MB);
+    fake_heap_used = (size_t)MEMORY_NEWLIB_MB * MB; // the game has the heap: no parking
+    GLuint hot[32];
+    for (int i = 0; i < 32; i++)
+      hot[i] = tex_upload(0xB0000000u + i, 512, 512, TEX_BYTES);
+    // Sit the RAM pool between the two thresholds -- under the 25% the cache
+    // aims for, over the 12% that opens the card -- which is where nothing
+    // would ever happen if the fixed threshold were the only way out.
+    for (int i = 0; i < 4000 && fake_pool_free[1] > fake_pool_start[1] / 100 * 15; i++) {
+      tex_upload(0xB1000000u + i, 512, 512, TEX_BYTES);
+      texture_cache_tick();
+    }
+    assert(fake_pool_free[1] <= fake_pool_start[1] / 100 * 15 && "failed to wedge the pool");
+    uint32_t spilled_before = card_evicted_count;
+    wander(hot, 32, TEXTURE_BLOCKED_FRAMES * 4);
+    printf("wedge        : ram %zu%% of start, %u written once cheap ran out  OK\n",
+           fake_pool_free[1] * 100 / fake_pool_start[1], card_evicted_count - spilled_before);
+    assert(fake_pool_free[1] > fake_pool_start[1] / 100 * TEXTURE_POOL_EMERGENCY_PERCENT &&
+           "the fixed threshold must not be what saves this");
+    assert(card_evicted_count > spilled_before &&
+           "reclaiming blocked for long enough has to escalate, not wait forever");
+  }
+
   printf("PASS\n");
   return 0;
 }

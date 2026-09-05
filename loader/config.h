@@ -88,6 +88,12 @@
 // than the memory is worth. Under sustained pressure free memory settles here
 // rather than at the target above, which is the intended hysteresis.
 #define TEXTURE_POOL_EMERGENCY_PERCENT 12
+// How long the cache may want to free memory and free none before it stops
+// waiting for a cheap way to do it and uses the card. Two seconds or so: long
+// enough that a passing spike is not paid for with a stutter, short enough that
+// it cannot sit blocked while the pools drain, which on hardware it did for
+// three and a half million frames.
+#define TEXTURE_BLOCKED_FRAMES 60
 
 // Still capped in bytes as well, so a scene that never pressures the pools does
 // not sit on an unbounded pile of textures it stopped drawing with. This is a

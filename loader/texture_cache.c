@@ -123,6 +123,8 @@ static size_t ram_cache_bytes; // evicted textures currently parked in the heap
 // Whether reclaiming may fall back to the memory card at all. Set only when a
 // pool is genuinely at its floor, where a hitch beats running out of memory.
 static int card_writes_allowed;
+// Consecutive frames the cache has wanted to free memory and freed none.
+static uint32_t blocked_frames;
 // Counted for the trace, to tell an eviction that cost a memcpy from one that
 // cost a write.
 static uint32_t ram_evicted_count, card_evicted_count, ram_restored_count;
@@ -337,6 +339,7 @@ void texture_cache_init(void) {
   tracked_bytes = 0;
   ram_cache_bytes = 0;
   starved_frames = 0;
+  blocked_frames = 0;
   evicted_count = restored_count = restore_failed_count = 0;
   ram_evicted_count = card_evicted_count = ram_restored_count = deferred_count = 0;
   memset(pool_start, 0, sizeof(pool_start));
@@ -810,6 +813,7 @@ void texture_cache_tick(void) {
 
   if (tracked_bytes <= budget && deficit == 0) {
     starved_frames = 0;
+    blocked_frames = 0;
     return;
   }
 
@@ -827,9 +831,24 @@ void texture_cache_tick(void) {
   // the byte budget does not: that is a backstop against hoarding, not a
   // shortage, and paying a card write per frame for it is what made area loads
   // unplayable.
+  //
+  // But a fixed threshold is not enough on its own. On hardware the RAM pool
+  // settled at 13% -- above the 12% that opens the card, below the 25% the
+  // cache is trying to reach -- and there it stayed, wanting to evict and being
+  // refused, 3.6 million times, while the pools ran dry underneath it. So the
+  // card also opens when reclaiming has simply not been working: if the cache
+  // has wanted to free memory for this many consecutive frames and freed
+  // nothing, cheap has been tried and cheap has failed.
   size_t emergency = pool_start[1] / 100 * TEXTURE_POOL_EMERGENCY_PERCENT;
-  card_writes_allowed = free_now[1] < emergency;
+  card_writes_allowed = free_now[1] < emergency || blocked_frames >= TEXTURE_BLOCKED_FRAMES;
+  size_t before = tracked_bytes;
   evict_textures(target, TEXTURE_IDLE_FRAMES);
+  // Wanted to reclaim and got nothing: the heap tier is full or the game has
+  // the heap, and the card is shut. Counted so that it cannot go on forever.
+  if (tracked_bytes < before)
+    blocked_frames = 0;
+  else if (blocked_frames < TEXTURE_BLOCKED_FRAMES)
+    blocked_frames++;
 
   if (tracked_bytes <= budget) {
     starved_frames = 0;
@@ -1028,4 +1047,5 @@ void texture_cache_stats(TextureCacheStats *out) {
   out->spilled = (int)card_evicted_count;
   out->starved = (int)starved_frames;
   out->deferred = (int)deferred_count;
+  out->blocked = (int)blocked_frames;
 }

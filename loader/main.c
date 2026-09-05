@@ -220,14 +220,14 @@ int ProcessEvents(void) {
     // the pools, and the two look nothing alike from a coredump.
     struct mallinfo heap = mallinfo();
     traceLog("loop: %d | tex %d draw %d | vgl ram %d cdram %d phycont %d MB | heap %d MB | "
-             "cache %d MB parked %d ev %d re %d lost %d spill %d starve %d defer %d\n",
+             "cache %d MB parked %d ev %d re %d lost %d spill %d starve %d defer %d block %d\n",
              events, trace_textures, trace_draws,
              (int)(vglMemFree(VGL_MEM_RAM) / (1024 * 1024)),
              (int)(vglMemFree(VGL_MEM_VRAM) / (1024 * 1024)),
              (int)(vglMemFree(VGL_MEM_PHYCONT) / (1024 * 1024)),
              (int)(heap.uordblks / (1024 * 1024)),
              cache.tracked_mb, cache.parked_mb, cache.evicted, cache.restored, cache.failed,
-             cache.spilled, cache.starved, cache.deferred);
+             cache.spilled, cache.starved, cache.deferred, cache.blocked);
   }
   events++;
 #endif
