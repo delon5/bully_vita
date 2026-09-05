@@ -961,6 +961,8 @@ int main(int argc, char *argv[]) {
     _oal_thread_affinity = 0x10000;
   }
 
+  // Stamped so a trace file can never be ambiguous about which build wrote it.
+  traceLog("---- loader built %s %s ----\n", __DATE__, __TIME__);
   traceLog("boot: reached kubridge check\n");
   if (check_kubridge() < 0)
     fatal_error("Error kubridge.skprx is not installed.");
