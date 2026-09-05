@@ -23,6 +23,7 @@
 #include <kubridge.h>
 
 #include <vitashark.h>
+#include <vitashark.h>
 #include <vitaGL.h>
 
 #include <malloc.h>
@@ -164,6 +165,29 @@ int ret0(void) {
   return 0;
 }
 
+void glLinkProgramHook(GLuint prog) {
+  glLinkProgram(prog);
+#ifdef LOADER_TRACE
+  static int links;
+  if (links < 6) {
+    GLint linked = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+    traceLog("program: %u link status %d, gl error 0x%x\n", prog, (int)linked, glGetError());
+  }
+  links++;
+#endif
+}
+
+void glDrawElementsHook(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+  glDrawElements(mode, count, type, indices);
+#ifdef LOADER_TRACE
+  extern int trace_draws;
+  if (trace_draws == 0 || trace_draws == 100 || trace_draws == 1000)
+    traceLog("draw: glDrawElements %d, %d indices, gl error 0x%x\n", trace_draws, count, glGetError());
+  trace_draws++;
+#endif
+}
+
 int ret1(void) {
   return 1;
 }
@@ -181,8 +205,6 @@ int OS_ScreenGetWidth(void) {
 // whether the game is still doing work at all, and five numbers on each
 // heartbeat answer that without thousands of lines.
 int trace_files, trace_textures, trace_buffers, trace_clears, trace_draws;
-extern char trace_last_open[128];
-extern int trace_failed_opens;
 #endif
 
 int ProcessEvents(void) {
@@ -191,9 +213,8 @@ int ProcessEvents(void) {
   // that is running but never drawing from one that is not running at all.
   static int events;
   if (events % 600 == 0)
-    traceLog("loop: %d | files %d (%d failed) tex %d buf %d draw %d | last: %s\n",
-             events, trace_files, trace_failed_opens, trace_textures, trace_buffers,
-             trace_draws, trace_last_open);
+    traceLog("loop: %d | tex %d buf %d draw %d\n",
+             events, trace_textures, trace_buffers, trace_draws);
   events++;
 #endif
   movie_draw_frame();
@@ -540,199 +561,10 @@ int stat_hook(const char *pathname, void *statbuf) {
   return res;
 }
 
-// The game (and the movie player) supply shaders as raw GXP blobs. Current
-// vitaGL reads a glShaderBinary payload with unserialize_shader, which expects
-// its own container: a uint32 count of matrix uniforms, that many uint32
-// indices, and then the GXP. Handing it a bare GXP makes it read the 'GXP\0'
-// magic as a count and skip 20MB past the end of the buffer.
-//
-// A GXP that declares no matrix uniforms serialises to exactly a zero count
-// followed by the GXP itself, so wrapping is a four byte prefix. (The optional
-// binds_map and sized-sampler fields are not read here: glShaderBinary passes
-// load_bindings false, and HAVE_GLSL_TEXTURE_SIZE is off in our build.)
-static void shader_binary_from_gxp(GLuint shader, const void *gxp, size_t size) {
-  uint8_t *wrapped = malloc(size + sizeof(uint32_t));
-  if (!wrapped)
-    return;
-  *(uint32_t *)wrapped = 0; // no matrix uniforms
-  sceClibMemcpy(wrapped + sizeof(uint32_t), gxp, size);
-  glShaderBinary(1, &shader, 0, wrapped, size + sizeof(uint32_t));
-  free(wrapped);
-}
 
-void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, const GLint *length) {
-  uint32_t sha1[5];
-  SHA1_CTX ctx;
 
-  sha1_init(&ctx);
-  sha1_update(&ctx, (uint8_t *)*string, *length);
-  sha1_final(&ctx, (uint8_t *)sha1);
 
-  char sha_name[64];
-  snprintf(sha_name, sizeof(sha_name), "%08x%08x%08x%08x%08x", sha1[0], sha1[1], sha1[2], sha1[3], sha1[4]);
 
-  char gxp_path[128];
-  snprintf(gxp_path, sizeof(gxp_path), "%s/%s.gxp", GXP_PATH, sha_name);
-
-  FILE *file = sceLibcBridge_fopen(gxp_path, "rb");
-#ifdef LOADER_TRACE
-  {
-    // Only the first handful, but enough to say whether the game's shaders are
-    // being found on the card and accepted by vitaGL at all.
-    static int loads;
-    if (loads < 40)
-      traceLog("shader: %s %s\n", sha_name, file ? "found" : "MISSING");
-    loads++;
-  }
-#endif
-  if (!file) {
-    debugPrintf("Could not find %s\n", gxp_path);
-
-    char glsl_path[128];
-    snprintf(glsl_path, sizeof(glsl_path), "%s/%s.glsl", GLSL_PATH, sha_name);
-
-    file = sceLibcBridge_fopen(glsl_path, "w");
-    if (file) {
-      sceLibcBridge_fwrite(*string, 1, *length, file);
-      sceLibcBridge_fclose(file);
-    }
-
-    snprintf(gxp_path, sizeof(gxp_path), "%s/%s.gxp", GXP_PATH, "9349e41c5fad90529f8aa627f5ad9ceeb0b75c7c");
-    file = sceLibcBridge_fopen(gxp_path, "rb");
-  }
-
-  if (file) {
-    size_t shaderSize;
-    void *shaderBuf;
-
-    sceLibcBridge_fseek(file, 0, SEEK_END);
-    shaderSize = sceLibcBridge_ftell(file);
-    sceLibcBridge_fseek(file, 0, SEEK_SET);
-
-    shaderBuf = malloc(shaderSize);
-    sceLibcBridge_fread(shaderBuf, 1, shaderSize, file);
-    sceLibcBridge_fclose(file);
-
-    shader_binary_from_gxp(shader, shaderBuf, shaderSize);
-#ifdef LOADER_TRACE
-    {
-      static int bins;
-      if (bins < 40)
-        traceLog("shader: glShaderBinary %d bytes, gl error 0x%x\n",
-                 (int)shaderSize, glGetError());
-      bins++;
-    }
-#endif
-
-    free(shaderBuf);
-  }
-}
-
-#ifdef LOADER_TRACE
-// The game goes quiet after the intro movie without linking a program or
-// drawing anything, so log what it opens: the last name before it stops is
-// what it is waiting on.
-char trace_last_open[128];
-int trace_failed_opens;
-
-static FILE *fopen_hook(const char *name, const char *mode) {
-  if (trace_files < 20)
-    traceLog("file: open %s\n", name ? name : "(null)");
-  trace_files++;
-  if (name)
-    snprintf(trace_last_open, sizeof(trace_last_open), "%s", name);
-
-  FILE *f = sceLibcBridge_fopen(name, mode);
-
-  // The opens that fail are the interesting ones: the game is spinning on
-  // something it cannot find, and the name it keeps asking for is the answer.
-  if (!f) {
-    if (trace_failed_opens < 30)
-      traceLog("file: FAILED %s\n", name ? name : "(null)");
-    trace_failed_opens++;
-  }
-  return f;
-}
-#endif
-
-#ifdef LOADER_TRACE
-// The game loads its shaders and then stops without ever linking a program or
-// drawing. Log the first call to each step of GLES2 program setup so the trace
-// says which step it never reaches.
-#define TRACE_FIRST(tag) \
-  do { static int seen; if (!seen) { seen = 1; traceLog("gl: first " tag "\n"); } } while (0)
-
-static GLuint glCreateProgramTrace(void) { TRACE_FIRST("glCreateProgram"); return glCreateProgram(); }
-static void glAttachShaderTrace(GLuint p, GLuint s) { TRACE_FIRST("glAttachShader"); glAttachShader(p, s); }
-static void glUseProgramTrace(GLuint p) { TRACE_FIRST("glUseProgram"); glUseProgram(p); }
-static void glClearTrace(GLbitfield m) { TRACE_FIRST("glClear"); trace_clears++; glClear(m); }
-static void glViewportTrace(GLint x, GLint y, GLsizei w, GLsizei h) { TRACE_FIRST("glViewport"); glViewport(x, y, w, h); }
-static void glBufferDataTrace(GLenum t, GLsizeiptr sz, const void *d, GLenum u) {
-  // Logged on both sides: vitaGL's allocation failure path waits on the
-  // garbage collector's semaphore and sleeps a second per retry, so a call
-  // that is entered and never left is a thread parked inside vitaGL rather
-  // than a game that decided to stop.
-  int n = trace_buffers++;
-  if (n < 3)
-    traceLog("gl: glBufferData %d entering, %d bytes\n", n, (int)sz);
-  glBufferData(t, sz, d, u);
-  if (n < 3)
-    traceLog("gl: glBufferData %d returned\n", n);
-}
-static void glVertexAttribPointerTrace(GLuint i, GLint sz, GLenum t, GLboolean n, GLsizei st, const void *p) { TRACE_FIRST("glVertexAttribPointer"); glVertexAttribPointer(i, sz, t, n, st, p); }
-static void glGetProgramivTrace(GLuint p, GLenum pn, GLint *v) { TRACE_FIRST("glGetProgramiv"); glGetProgramiv(p, pn, v); }
-#endif
-
-void glLinkProgramHook(GLuint prog) {
-  glLinkProgram(prog);
-#ifdef LOADER_TRACE
-  static int links;
-  if (links < 6) {
-    GLint linked = 0;
-    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
-    traceLog("program: %u link status %d, gl error 0x%x\n", prog, (int)linked, glGetError());
-  }
-  links++;
-#endif
-}
-
-void glDrawElementsHook(GLenum mode, GLsizei count, GLenum type, const void *indices) {
-  glDrawElements(mode, count, type, indices);
-#ifdef LOADER_TRACE
-  if (trace_draws == 0 || trace_draws == 100 || trace_draws == 1000)
-    traceLog("draw: glDrawElements %d, %d indices, gl error 0x%x\n", trace_draws, count, glGetError());
-  trace_draws++;
-#endif
-}
-
-void glGetShaderivHook(GLuint shader, GLenum pname, GLint *params) {
-  *params = 1;
-}
-
-void glCompileShaderHook(GLuint shader) {
-#ifdef LOADER_TRACE
-  TRACE_FIRST("glCompileShader");
-#endif
-  return;
-}
-
-void glBindAttribLocationHook(GLuint prog, GLuint index, const GLchar *name) {
-  char new_name[64];
-  snprintf(new_name, sizeof(new_name), "input._%s", name);
-  glBindAttribLocation(prog, index, new_name);
-}
-
-GLint glGetUniformLocationHook(GLuint prog, const GLchar *name) {
-  char new_name[64];
-  snprintf(new_name, sizeof(new_name), "_%s", name);
-  return glGetUniformLocation(prog, new_name);
-}
-
-GLint glGetAttribLocationHook(GLuint prog, const GLchar *name) {
-  char new_name[64];
-  snprintf(new_name, sizeof(new_name), "input._%s", name);
-  return glGetAttribLocation(prog, new_name);
-}
 
 extern void *__aeabi_dcmplt;
 extern void *__aeabi_dmul;
@@ -846,11 +678,8 @@ static so_default_dynlib default_dynlib[] = {
   // { "fgetc", (uintptr_t)&fgetc },
   // { "fgets", (uintptr_t)&fgets },
 
-#ifdef LOADER_TRACE
-  { "fopen", (uintptr_t)&fopen_hook },
-#else
   { "fopen", (uintptr_t)&sceLibcBridge_fopen },
-#endif
+
   { "fprintf", (uintptr_t)&sceLibcBridge_fprintf },
   // { "fputc", (uintptr_t)&sceLibcBridge_fputc },
   // { "fputs", (uintptr_t)&sceLibcBridge_fputs },
@@ -866,40 +695,28 @@ static so_default_dynlib default_dynlib[] = {
   // { "gettid", (uintptr_t)&gettid },
 
   { "glActiveTexture", (uintptr_t)&glActiveTextureHook },
-#ifdef LOADER_TRACE
-  { "glAttachShader", (uintptr_t)&glAttachShaderTrace },
-#else
   { "glAttachShader", (uintptr_t)&glAttachShader },
-#endif
-  { "glBindAttribLocation", (uintptr_t)&glBindAttribLocationHook },
+
+  { "glBindAttribLocation", (uintptr_t)&glBindAttribLocation },
   { "glBindBuffer", (uintptr_t)&glBindBuffer },
   { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer },
   { "glBindRenderbuffer", (uintptr_t)&ret0 },
   { "glBindTexture", (uintptr_t)&glBindTextureHook },
   { "glBlendFunc", (uintptr_t)&glBlendFunc },
   { "glBlendFuncSeparate", (uintptr_t)&glBlendFuncSeparate },
-#ifdef LOADER_TRACE
-  { "glBufferData", (uintptr_t)&glBufferDataTrace },
-#else
   { "glBufferData", (uintptr_t)&glBufferData },
-#endif
-#ifdef LOADER_TRACE
-  { "glClear", (uintptr_t)&glClearTrace },
-#else
+
   { "glClear", (uintptr_t)&glClear },
-#endif
+
   { "glClearColor", (uintptr_t)&glClearColor },
   { "glClearDepthf", (uintptr_t)&glClearDepthf },
   { "glClearStencil", (uintptr_t)&glClearStencil },
   { "glColorMask", (uintptr_t)&glColorMask },
-  { "glCompileShader", (uintptr_t)&glCompileShaderHook },
+  { "glCompileShader", (uintptr_t)&glCompileShader },
   { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2DHook },
   { "glCompressedTexSubImage2D", (uintptr_t)&ret0 }, // TODO
-#ifdef LOADER_TRACE
-  { "glCreateProgram", (uintptr_t)&glCreateProgramTrace },
-#else
   { "glCreateProgram", (uintptr_t)&glCreateProgram },
-#endif
+
   { "glCreateShader", (uintptr_t)&glCreateShader },
   { "glCullFace", (uintptr_t)&glCullFace },
   { "glDeleteBuffers", (uintptr_t)&glDeleteBuffers },
@@ -923,27 +740,24 @@ static so_default_dynlib default_dynlib[] = {
   { "glGenFramebuffers", (uintptr_t)&glGenFramebuffers },
   { "glGenRenderbuffers", (uintptr_t)&ret0 },
   { "glGenTextures", (uintptr_t)&glGenTexturesHook },
-  { "glGetAttribLocation", (uintptr_t)&glGetAttribLocationHook },
+  { "glGetAttribLocation", (uintptr_t)&glGetAttribLocation },
   { "glGetBooleanv", (uintptr_t)&glGetBooleanv },
   { "glGetError", (uintptr_t)&glGetError },
   { "glGetIntegerv", (uintptr_t)&glGetIntegerv },
   { "glGetProgramInfoLog", (uintptr_t)&glGetProgramInfoLog },
-#ifdef LOADER_TRACE
-  { "glGetProgramiv", (uintptr_t)&glGetProgramivTrace },
-#else
   { "glGetProgramiv", (uintptr_t)&glGetProgramiv },
-#endif
+
   { "glGetShaderInfoLog", (uintptr_t)&glGetShaderInfoLog },
-  { "glGetShaderiv", (uintptr_t)&glGetShaderivHook },
+  { "glGetShaderiv", (uintptr_t)&glGetShaderiv },
   { "glGetString", (uintptr_t)&glGetString },
-  { "glGetUniformLocation", (uintptr_t)&glGetUniformLocationHook },
+  { "glGetUniformLocation", (uintptr_t)&glGetUniformLocation },
   { "glLineWidth", (uintptr_t)&glLineWidth },
   { "glLinkProgram", (uintptr_t)&glLinkProgramHook },
   { "glPolygonOffset", (uintptr_t)&glPolygonOffset },
   { "glReadPixels", (uintptr_t)&glReadPixels },
   { "glRenderbufferStorage", (uintptr_t)&ret0 },
   { "glScissor", (uintptr_t)&glScissor },
-  { "glShaderSource", (uintptr_t)&glShaderSourceHook },
+  { "glShaderSource", (uintptr_t)&glShaderSource },
   { "glStencilFunc", (uintptr_t)&glStencilFunc },
   { "glStencilMask", (uintptr_t)&glStencilMask },
   { "glStencilOp", (uintptr_t)&glStencilOp },
@@ -954,21 +768,12 @@ static so_default_dynlib default_dynlib[] = {
   { "glUniform1i", (uintptr_t)&glUniform1i },
   { "glUniform4fv", (uintptr_t)&glUniform4fv },
   { "glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv },
-#ifdef LOADER_TRACE
-  { "glUseProgram", (uintptr_t)&glUseProgramTrace },
-#else
   { "glUseProgram", (uintptr_t)&glUseProgram },
-#endif
-#ifdef LOADER_TRACE
-  { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointerTrace },
-#else
+
   { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
-#endif
-#ifdef LOADER_TRACE
-  { "glViewport", (uintptr_t)&glViewportTrace },
-#else
+
   { "glViewport", (uintptr_t)&glViewport },
-#endif
+
 
   { "longjmp", (uintptr_t)&longjmp },
   { "setjmp", (uintptr_t)&setjmp },
@@ -1193,6 +998,13 @@ int main(int argc, char *argv[]) {
   texture_cache_init();
 
   traceLog("boot: texture cache done, initialising vitaGL\n");
+  // The game ships GLSL and this hands it to vitaGL's runtime compiler, which
+  // caches the compiled result on the card. The precompiled .gxp route this
+  // port used instead only works with the 2021 vitaGL: current versions read a
+  // glShaderBinary payload as their own serialized container, and a bare GXP
+  // wrapped to satisfy that parser registers a program that links, draws
+  // without error and rasterises nothing. Requires libshacccg.suprx.
+  vglSetupRuntimeShaderCompiler(SHARK_OPT_UNSAFE, SHARK_ENABLE, SHARK_ENABLE, SHARK_ENABLE);
   vglSetCircularPoolSize(MEMORY_VITAGL_CIRCULAR_POOL_MB * 1024 * 1024);
   vglSetupGarbageCollector(127, 0x20000);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);

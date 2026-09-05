@@ -94,6 +94,11 @@ make -C vitaGL \
 That is the revision this port was written and released against, and two later
 changes break it outright:
 
+The port now compiles the game's GLSL at runtime through vitaGL's shader
+compiler and caches the result, which is what current ports of this family do
+(see gtasa_vita). **This requires `libshacccg.suprx` to be installed on the
+console.** The `gxp` folder in `gamefiles.zip` is no longer used.
+
 - `glShaderBinary` now expects vitaGL's own serialized shader-cache format
   instead of a raw GXP. The `.gxp` files in `gamefiles.zip` are raw GXPs, so a
   newer vitaGL reads one as a cache blob and registers no shader at all. Nothing

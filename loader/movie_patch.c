@@ -22,8 +22,6 @@
 #include "config.h"
 #include "so_util.h"
 
-#include "shaders/movie_f.h"
-#include "shaders/movie_v.h"
 
 #define FB_ALIGNMENT 0x40000
 
@@ -222,15 +220,22 @@ void movie_draw_frame(void) {
   }
 }
 
-static void movie_shader_binary(GLuint shader, const void *gxp, size_t size) {
-  uint8_t *wrapped = malloc(size + sizeof(uint32_t));
-  if (!wrapped)
-    return;
-  *(uint32_t *)wrapped = 0;
-  sceClibMemcpy(wrapped + sizeof(uint32_t), gxp, size);
-  glShaderBinary(1, &shader, 0, wrapped, size + sizeof(uint32_t));
-  free(wrapped);
-}
+static const char *movie_vert_glsl =
+  "attribute vec2 inPos;\n"
+  "attribute vec2 inTex;\n"
+  "varying vec2 vTex;\n"
+  "void main() {\n"
+  "  vTex = inTex;\n"
+  "  gl_Position = vec4(inPos, 0.0, 1.0);\n"
+  "}\n";
+
+static const char *movie_frag_glsl =
+  "precision mediump float;\n"
+  "varying vec2 vTex;\n"
+  "uniform sampler2D tex;\n"
+  "void main() {\n"
+  "  gl_FragColor = texture2D(tex, vTex);\n"
+  "}\n";
 
 void movie_setup_player(void) {
   sceSysmoduleLoadModule(SCE_SYSMODULE_AVPLAYER);
@@ -243,13 +248,17 @@ void movie_setup_player(void) {
     vglFree(vglGetTexDataPointer(GL_TEXTURE_2D));
   }
 
-  // Same raw-GXP-to-vitaGL-container wrapping the game's shaders need; see
-  // shader_binary_from_gxp in main.c.
+  // Compiled at runtime like the game's own shaders. The .gxp versions in
+  // shaders/ were built for the 2021 vitaGL's glShaderBinary and cannot be fed
+  // to a current one. The video frame is a YVU420 texture with CSC done by the
+  // texture unit, so sampling it needs nothing but a plain texture2D.
   movie_vs = glCreateShader(GL_VERTEX_SHADER);
-  movie_shader_binary(movie_vs, movie_v, size_movie_v);
+  glShaderSource(movie_vs, 1, &movie_vert_glsl, NULL);
+  glCompileShader(movie_vs);
 
   movie_fs = glCreateShader(GL_FRAGMENT_SHADER);
-  movie_shader_binary(movie_fs, movie_f, size_movie_f);
+  glShaderSource(movie_fs, 1, &movie_frag_glsl, NULL);
+  glCompileShader(movie_fs);
 
   movie_prog = glCreateProgram();
   glAttachShader(movie_prog, movie_vs);

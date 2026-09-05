@@ -63,6 +63,7 @@ jobs:
           make -C vitaGL \
             CC="arm-vita-eabi-gcc -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion" \
             SOFTFP_ABI=1 UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 NO_SPLASHSCREEN=1 \
+            HAVE_SHADER_CACHE=1 \
             -j"$(nproc)" install
           # Fail loudly rather than silently shipping a mixed archive.
           if arm-vita-eabi-ar t "$VITASDK/arm-vita-eabi/lib/libvitaGL.a" | grep -qx 'buffers.o'; then
