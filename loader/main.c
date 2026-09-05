@@ -1197,6 +1197,24 @@ int main(int argc, char *argv[]) {
   vglSetupGarbageCollector(127, 0x20000);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
 
+#ifdef LOADER_TRACE
+  // Does the main GXM context rasterise anything at all? Nothing but glClear
+  // and vglSwapBuffers -- no shaders, no textures, no game. The last time this
+  // ran, vitaGL's archive still mixed two revisions, so the answer it gave then
+  // is worth nothing now. No CPU fill this time: that wrote into a colour
+  // surface the game then cycled back onto the screen.
+  glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+  for (int i = 0; i < 120; i++) {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    vglSwapBuffers(GL_FALSE);
+  }
+  uint32_t red_px = 0;
+  glReadPixels(SCREEN_W / 2, SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &red_px);
+  traceLog("display: red clear readback 0x%08x (want 0xff0000ff), gl error 0x%x\n",
+           red_px, glGetError());
+  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+#endif
+
   traceLog("boot: vitaGL up (%s / %s), setting up movie player\n",
            (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER));
 
