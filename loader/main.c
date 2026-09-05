@@ -100,6 +100,22 @@ int debugPrintf(char *text, ...) {
   return 0;
 }
 
+// vitaGL calls this for every error it reports when built with LOG_ERRORS.
+// Its own vgl_log is sceClibPrintf, which goes to a debug console that is not
+// attached on a retail Vita, so point it at the trace file instead.
+void vgl_file_log(const char *fmt, ...) {
+#ifdef LOADER_TRACE
+  va_list list;
+  char string[512];
+
+  va_start(list, fmt);
+  vsnprintf(string, sizeof(string), fmt, list);
+  va_end(list);
+
+  traceLog("vgl: %s", string);
+#endif
+}
+
 int traceLog(char *text, ...) {
 #ifdef LOADER_TRACE
   va_list list;

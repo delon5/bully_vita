@@ -114,6 +114,13 @@ versions of vitaGL at once: it links cleanly, `sceGxmInitialize`,
 `sceGxmBeginScene` and `sceGxmEndScene` all return success, and nothing is ever
 drawn.
 
+vitaGL's own error reporting (`LOG_ERRORS=1`) goes through `vgl_log`, which it
+defines as `sceClibPrintf` -- a debug console that is not attached on a retail
+Vita, so nothing reaches the card. Patch `source/utils/debug_utils.h` to call
+`vgl_file_log` instead and the loader supplies one that appends to its trace
+file. Without that, an absent log means nothing was routed anywhere, not that
+nothing went wrong.
+
 Do not take a newer vitaGL without checking both. The overridden `CC` demotes
 diagnostics GCC 14 turned into errors; this is 2021 code written under the older
 default, so demoting them preserves its behaviour rather than changing it.
