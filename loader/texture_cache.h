@@ -49,4 +49,10 @@ typedef struct {
 
 void texture_cache_stats(TextureCacheStats *out);
 
+// The newlib heap in use, sampled once a frame in the tick. Shared so that
+// anything else needing it does not take the malloc lock again for the same
+// number -- mallinfo walks the free list, and asking for it on a hot path is
+// what turned area loads into a stutter once already.
+size_t texture_cache_heap_used(void);
+
 #endif

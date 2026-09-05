@@ -48,6 +48,7 @@
 #include "main.h"
 #include "so_util.h"
 #include "streaming_patch.h"
+#include "texture_cache.h"
 
 // The original refuses anything over this regardless, and the caller copes with
 // a refusal by evicting and then giving up gracefully. Keep the behaviour.
@@ -59,7 +60,7 @@ static uint32_t refusal_count, backoff_count;
 static size_t budget;
 static int installed;
 
-// How much the streamer is holding, by the game's own reckoning.
+// How much the game is holding.
 //
 // A correction, because the reasoning that used to be written here was wrong
 // and it closed off the most promising route in the port.
@@ -82,17 +83,21 @@ static int installed;
 // accounting when it stubbed the memory check -- but it is still there and
 // still correct, so the loader calls it.
 static size_t streamer_used(void) {
-  static uint32_t calls;
-  static size_t cached;
-
-  if (!update_memory_used || !ms_memory_used)
-    return 0;
-  if ((calls++ & 31) == 0) {
-    update_memory_used();
-    int used = *ms_memory_used;
-    cached = used > 0 ? (size_t)used : 0;
-  }
-  return cached;
+  // The newlib heap, which is the thing that actually runs out, sampled once a
+  // frame by the texture cache and read here for free.
+  //
+  // CStreaming::ms_memoryUsed was the obvious choice and it is useless: nothing
+  // in the binary calls UpdateMemoryUsed, so the accounting behind it stopped
+  // being maintained when the Android build stubbed the memory check, and
+  // driving it by hand reported 1 MB of a 156 MB heap. The gate never fired
+  // once in a whole session.
+  //
+  // The heap is the right measure here for a reason that was, until today,
+  // written down backwards: MemoryMgrMalloc branches to memalign@plt and
+  // MemoryMgrFree to free@plt, with CMemoryHeap::Init called from nowhere at
+  // all. The engine has no arena. When a model is freed, the memory goes back
+  // to newlib, so the heap figure moves and refusing has somewhere to go.
+  return texture_cache_heap_used();
 }
 
 // The budget, taken from what the game turns out to need rather than from a
@@ -102,8 +107,20 @@ static size_t streamer_used(void) {
 static void calibrate(size_t used) {
   if (budget || frames_swapped < STREAMING_CALIBRATE_FRAMES || used == 0)
     return;
+
+  // Measured, not chosen. Twice now a figure picked in advance has landed below
+  // what the game needs to run, and the game answered by evicting until the
+  // level itself was gone. Starting from what it is actually holding once it is
+  // in play cannot do that: the budget is above the floor by construction.
   budget = used + (size_t)STREAMING_BUDGET_MARGIN_MB * 1024 * 1024;
-  traceLog("streaming: settled at %d MB, budget set to %d MB\n",
+
+  // And never past what the heap can give, or the gate would be asking for
+  // room that does not exist by the time it matters.
+  size_t ceiling = (size_t)(MEMORY_NEWLIB_MB - STREAMING_HEAP_KEEP_FREE_MB) * 1024 * 1024;
+  if (budget > ceiling)
+    budget = ceiling;
+
+  traceLog("streaming: settled at %d MB of heap, budget %d MB\n",
            (int)(used / (1024 * 1024)), (int)(budget / (1024 * 1024)));
 }
 
@@ -119,14 +136,17 @@ static void calibrate(size_t used) {
 // to bring the heap down, the streamer has nothing useful left to give up, and
 // the honest answer becomes yes -- a game that is short of memory beats a game
 // with no scenery.
+// Frames, now, rather than calls -- so this is how long the gate insists before
+// accepting that the game has nothing more it can usefully give up.
 #define REFUSALS_WITHOUT_PROGRESS 8
 #define PROGRESS_BYTES (256 * 1024)
-#define BACKOFF_CALLS 4096
+#define BACKOFF_CALLS 4096 // calls, deliberately: long enough to load an area
 
 static int should_refuse(void) {
   static size_t used_at_last_progress;
   static uint32_t fruitless;
   static uint32_t backoff;
+  static int judged_on_frame;
 
   size_t used = streamer_used();
   calibrate(used);
@@ -154,6 +174,15 @@ static int should_refuse(void) {
     fruitless = 0;
     return 1;
   }
+
+  // Progress is judged once a frame, not once a call. The heap figure is
+  // sampled in the tick, so every call within a frame reads the same number:
+  // counting each of them as a failure would exhaust the allowance inside a
+  // single frame, on evidence that had no chance to change, and the gate would
+  // spend its life backed off and do nothing at all.
+  if (judged_on_frame == frames_swapped)
+    return 1;
+  judged_on_frame = frames_swapped;
 
   if (++fruitless >= REFUSALS_WITHOUT_PROGRESS) {
     // Refusing has stopped helping. Let the game load what it needs.

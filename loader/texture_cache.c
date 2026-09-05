@@ -183,10 +183,19 @@ static uint32_t checksum(const void *data, uint32_t size) {
 // in and allocating hardest. That is a stutter, not a measurement.
 static int heap_tight;
 
+// Also published, because the streaming gate needs the same figure and taking
+// it twice would mean taking the malloc lock twice a frame for one number.
+static size_t heap_used_bytes;
+
 static void sample_heap(void) {
   struct mallinfo info = mallinfo();
   size_t limit = (size_t)(MEMORY_NEWLIB_MB - TEXTURE_HEAP_KEEP_FREE_MB) * 1024 * 1024;
-  heap_tight = (size_t)info.uordblks > limit;
+  heap_used_bytes = (size_t)info.uordblks;
+  heap_tight = heap_used_bytes > limit;
+}
+
+size_t texture_cache_heap_used(void) {
+  return heap_used_bytes;
 }
 
 static int heap_is_tight(void) {

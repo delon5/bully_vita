@@ -70,7 +70,14 @@
 // is asked to let something go. Measured rather than chosen, because a figure
 // picked in advance was wrong in the dangerous direction -- below what the game
 // needs, so every answer was "no" and it evicted the world.
-#define STREAMING_BUDGET_MARGIN_MB 16
+// How far the game may grow past what it settled at before the streamer is
+// told to let something go. The traces put the growth at 86 MB over a session
+// with nothing ever freed, so this is the size of the leak we are willing to
+// carry rather than a guess at what the game wants.
+#define STREAMING_BUDGET_MARGIN_MB 24
+// The budget is never set above this much of the heap, whatever the game
+// settled at, so the gate cannot end up asking for room that will not exist.
+#define STREAMING_HEAP_KEEP_FREE_MB 24
 // Frames to let pass before taking that measurement, so it is a settled figure
 // and not the middle of the first area load.
 #define STREAMING_CALIBRATE_FRAMES 1800
