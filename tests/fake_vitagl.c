@@ -45,11 +45,13 @@ void fake_reset(size_t free_memory) {
   memset(fake_slot_take, 0, sizeof(fake_slot_take));
   fake_bound = 0;
   fake_free_memory = free_memory;
-  // All of it in CDRAM unless a test asks for a split, so the existing tests
-  // keep meaning what they meant.
-  fake_pool_free[0] = free_memory;
-  for (int i = 1; i < FAKE_POOLS; i++)
-    fake_pool_free[i] = 0;
+  // Split the way the console splits it -- 81 / 122 / 26 MB of 229 measured on
+  // hardware -- rather than putting it all in one pool. Which pool memory comes
+  // from decides whether the cache reclaims at all, so a fake that pools it in
+  // CDRAM tests a policy the console never runs.
+  fake_pool_free[0] = free_memory / 229 * 81;
+  fake_pool_free[1] = free_memory / 229 * 122;
+  fake_pool_free[2] = free_memory - fake_pool_free[0] - fake_pool_free[1];
   memcpy(fake_pool_start, fake_pool_free, sizeof(fake_pool_start));
   fake_low_water = free_memory;
   fake_reject_next_upload = 0;

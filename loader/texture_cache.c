@@ -120,7 +120,9 @@ static uint8_t *restore_scratch;
 static int backup_ready;
 static int cache_enabled = 1;
 static size_t ram_cache_bytes; // evicted textures currently parked in the heap
-static int card_writes_this_frame;
+// Whether reclaiming may fall back to the memory card at all. Set only when a
+// pool is genuinely at its floor, where a hitch beats running out of memory.
+static int card_writes_allowed;
 // Counted for the trace, to tell an eviction that cost a memcpy from one that
 // cost a write.
 static uint32_t ram_evicted_count, card_evicted_count, ram_restored_count;
@@ -170,7 +172,7 @@ static uint32_t checksum(const void *data, uint32_t size) {
 // never per upload.
 static int heap_is_tight(void) {
   struct mallinfo info = mallinfo();
-  size_t limit = (size_t)MEMORY_NEWLIB_MB * 1024 * 1024 / 100 * TEXTURE_HEAP_PARK_PERCENT;
+  size_t limit = (size_t)(MEMORY_NEWLIB_MB - TEXTURE_HEAP_KEEP_FREE_MB) * 1024 * 1024;
   return (size_t)info.uordblks > limit;
 }
 
@@ -334,7 +336,6 @@ void texture_cache_init(void) {
   active_unit = 0;
   tracked_bytes = 0;
   ram_cache_bytes = 0;
-  card_writes_this_frame = 0;
   starved_frames = 0;
   evicted_count = restored_count = restore_failed_count = 0;
   ram_evicted_count = card_evicted_count = ram_restored_count = deferred_count = 0;
@@ -455,8 +456,17 @@ static int backup_capture(TextureInfo *info, GLuint id) {
   // its card writes does not pay for a bind and a pointer fetch to find out.
   int to_card = ram_cache_bytes + info->resident_size > (size_t)TEXTURE_RAM_CACHE_MB * 1024 * 1024 ||
                 heap_is_tight();
-  if (to_card && card_writes_this_frame >= TEXTURE_CARD_WRITES_PER_FRAME)
-    return -1; // out of writes for this frame, not out of options
+  // The card is for emergencies only. A write of a few hundred KB costs more
+  // than a frame is worth, and an area load evicts continuously: doing that
+  // through the card is 1-5 frames a second on hardware. When there is nowhere
+  // cheap to put a texture and memory is not actually running out, the texture
+  // simply stays where it is.
+  //
+  // No per-frame ration once it is allowed. Rationing existed to protect the
+  // frame rate, and the only thing that reaches here now is a pool at its floor
+  // -- where the alternative to a stutter is running out of memory.
+  if (to_card && !card_writes_allowed)
+    return -1; // not now; nothing wrong with the texture
 
   glBindTexture(GL_TEXTURE_2D, id);
   const void *pixels = vglGetTexDataPointer(GL_TEXTURE_2D);
@@ -475,8 +485,8 @@ static int backup_capture(TextureInfo *info, GLuint id) {
       ram_evicted_count++;
       return 1;
     }
-    if (card_writes_this_frame >= TEXTURE_CARD_WRITES_PER_FRAME)
-      return -1;
+    if (!card_writes_allowed)
+      return -1; // the heap would not give and the card is not open
   }
 
   char dir[160], path[160];
@@ -491,7 +501,6 @@ static int backup_capture(TextureInfo *info, GLuint id) {
   record.bytes = info->resident_size;
   record.checksum = checksum(pixels, info->resident_size);
 
-  card_writes_this_frame++;
   SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
   if (fd < 0)
     return -1;
@@ -758,7 +767,6 @@ void texture_cache_tick(void) {
     return;
 
   frame_counter++;
-  card_writes_this_frame = 0;
 
   // A texture stays bound to its unit until something displaces it, so one the
   // game bound once and keeps drawing with is still in use even though we never
@@ -789,8 +797,12 @@ void texture_cache_tick(void) {
   // back to RAM and then to the newlib heap rather than failing, so an
   // exhausted CDRAM shows up as the game running out of heap somewhere else
   // entirely.
+  // Pool 0 is CDRAM and is deliberately not counted. vitaGL allocates from it
+  // first and falls back to RAM, so CDRAM at zero with RAM free is the
+  // allocator doing its job, not a shortage -- and reclaiming against it meant
+  // evicting continuously through every area load for no gain at all.
   size_t deficit = 0;
-  for (int pool = 0; pool < VGL_POOLS; pool++) {
+  for (int pool = 1; pool < VGL_POOLS; pool++) {
     size_t reserve = pool_start[pool] / 100 * TEXTURE_FREE_HEADROOM_PERCENT;
     if (free_now[pool] < reserve)
       deficit += reserve - free_now[pool];
@@ -810,6 +822,13 @@ void texture_cache_tick(void) {
     target = budget - budget / 8;
   if (deficit)
     target = target > deficit ? target - deficit : 0;
+
+  // Only a pool actually close to empty justifies touching the card. Being over
+  // the byte budget does not: that is a backstop against hoarding, not a
+  // shortage, and paying a card write per frame for it is what made area loads
+  // unplayable.
+  size_t emergency = pool_start[1] / 100 * TEXTURE_POOL_EMERGENCY_PERCENT;
+  card_writes_allowed = free_now[1] < emergency;
   evict_textures(target, TEXTURE_IDLE_FRAMES);
 
   if (tracked_bytes <= budget) {
@@ -849,6 +868,19 @@ void glBindTextureHook(GLenum target, GLuint texture) {
 
   TextureInfo *info = cache_enabled ? texture_info(texture) : NULL;
   if (info && info->evicted && target == GL_TEXTURE_2D) {
+    // Walking back into an area restores hundreds of textures, and all of it
+    // can happen between two ticks -- so waiting for the next tick to make room
+    // is waiting too long, and the restore that finds no memory is the crash
+    // this cache exists to stop. If the pool a restore allocates from is at its
+    // floor, take some back first. Urgent idle window, because anything drawn
+    // recently is part of the area being walked into.
+    if (pool_start[1] && vglMemFree((vglMemType)1) <
+                             pool_start[1] / 100 * TEXTURE_POOL_EMERGENCY_PERCENT) {
+      card_writes_allowed = 1; // genuinely out of memory: a hitch beats a crash
+      size_t target = tracked_bytes > info->resident_size ? tracked_bytes - info->resident_size : 0;
+      evict_textures(target, TEXTURE_IDLE_FRAMES_URGENT);
+    }
+
     // The game is about to draw with a texture we dropped. Put it back.
     if (!is_restorable(info) || !restore_texture(texture)) {
       info->unbacked = 1; // nothing we can do; stop pretending it is reloadable

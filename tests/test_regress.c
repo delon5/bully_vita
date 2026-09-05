@@ -138,12 +138,12 @@ int main(void) {
   // a generation of it, and the next run hands both out to different textures.
   // Left alone the folder would grow every session.
   {
-    harness_start(1024 * MB);
-    // Enough to fill the budget and the heap tier and still have textures left
-    // over, so eviction has no choice but to reach the card. Counted rather
-    // than measured against tracked_bytes, which stops growing once the cache
-    // starts keeping up and would leave the loop running forever.
-    const size_t over = ((size_t)TEXTURE_BUDGET_MB + TEXTURE_RAM_CACHE_MB + 64) * MB;
+    // A driver small enough that the RAM pool genuinely runs out -- smaller
+    // than the byte budget, so the budget cannot cap the pressure first. The
+    // card is only for that case now: past the heap tier, with memory to spare,
+    // a texture stays resident rather than costing a write inside a frame.
+    harness_start(192 * MB);
+    const size_t over = ((size_t)TEXTURE_BUDGET_MB + TEXTURE_RAM_CACHE_MB + 96) * MB;
     for (size_t i = 0; i < over / TEX_BYTES; i++) {
       tex_upload(0xDE000000u + (unsigned)i, 512, 512, TEX_BYTES);
       drain();
@@ -151,7 +151,7 @@ int main(void) {
     }
     frames(TEXTURE_IDLE_FRAMES * 8);
     unsigned spilled = fake_store_files();
-    assert(spilled > 0 && "past the heap tier, eviction has to reach the card");
+    assert(spilled > 0 && "a pool actually running out has to be able to reach the card");
     texture_cache_init();
     printf("store purge  : %u files spilled, %u after a restart     OK\n", spilled,
            fake_store_files());

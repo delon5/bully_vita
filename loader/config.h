@@ -19,10 +19,16 @@
 #define LOAD_ADDRESS 0x98000000
 
 #define MEMORY_SCELIBC_MB 4
+// The game's own heap. A session that crashed had it at 153 MB of 160 while
+// vitaGL still had 101 MB free across its pools -- so the memory that ran out
+// was the game's, not the renderer's, and no amount of evicting textures was
+// ever going to help. vitaGL takes whatever is left after this, so raising it
+// moves memory from the texture pools to the game, which is where the shortage
+// actually was: the pools never fell below 101 MB of 229 all session.
 #ifdef HAVE_RAZOR
 #define MEMORY_NEWLIB_MB 256
 #else
-#define MEMORY_NEWLIB_MB 160
+#define MEMORY_NEWLIB_MB 208
 #endif
 #define MEMORY_VITAGL_THRESHOLD_MB 8
 
@@ -60,13 +66,28 @@
 // build never evicts anything, so this is what keeps it inside what vitaGL can
 // hand out on a Vita (128MB of CDRAM plus whatever is left of main RAM once the
 // game heap above has been carved out).
-// Reclaim to keep this much of vitaGL's memory free, as a percentage of what
-// it had when the game started drawing. A byte budget cannot work on its own:
-// it only counts textures this cache tracks, while framebuffers, vertex
-// buffers, shader programs, render targets and untracked textures come out of
-// the same pools -- so CDRAM reached zero on hardware while the counter still
-// read comfortably under budget. Free memory counts all of it.
+// Reclaim to keep this much of vitaGL's memory free, as a percentage of what it
+// had when the game started drawing. A byte budget cannot work on its own: it
+// only counts textures this cache tracks, while framebuffers, vertex buffers,
+// shader programs, render targets and untracked textures come out of the same
+// pools. Free memory counts all of it.
+//
+// Measured against the RAM and phycont pools, not CDRAM. CDRAM running to zero
+// is normal and not a problem: vitaGL allocates from it first and falls back to
+// RAM, so an empty CDRAM alongside 75 MB of free RAM is the allocator working
+// as designed. Treating it as pressure made the cache evict continuously
+// against a shortage that did not exist, and on hardware that was the
+// difference between playable and 1-5 frames a second. It is the RAM pool
+// draining that is dangerous, because what lies past it is the newlib heap the
+// game is using.
 #define TEXTURE_FREE_HEADROOM_PERCENT 25
+// The point at which a pool counts as actually running out, rather than merely
+// below its target. Only here may reclaiming fall back to the memory card, so
+// this is the floor the cache really defends: above it a texture with nowhere
+// cheap to go simply stays resident, because a write inside a frame costs more
+// than the memory is worth. Under sustained pressure free memory settles here
+// rather than at the target above, which is the intended hysteresis.
+#define TEXTURE_POOL_EMERGENCY_PERCENT 12
 
 // Still capped in bytes as well, so a scene that never pressures the pools does
 // not sit on an unbounded pile of textures it stopped drawing with. This is a
@@ -74,9 +95,12 @@
 // normally be doing the reclaiming. Set too low it evicts constantly while
 // there is memory to spare, and every eviction is work in the middle of a
 // frame: at 64 MB that showed up on hardware as the framerate falling off 30
-// down to nothing. Set too high it never fires at all: at 144 MB a session that
-// crashed had reached 110 MB tracked having evicted nothing.
-#define TEXTURE_BUDGET_MB 96
+// down to nothing. It is a backstop against a scene that hoards without ever
+// pressuring the pools, not the working limit -- so it belongs above the
+// working set, not through it. A session traced on hardware peaked at 110 MB of
+// textures with 101 MB still free across the pools: nothing needed evicting,
+// and a 96 MB budget had the cache fighting a working set that fitted.
+#define TEXTURE_BUDGET_MB 160
 // Evict regardless of the budget once vitaGL has less than this much free, so
 // that memory pressure coming from anywhere else does not kill us either.
 #define TEXTURE_RESERVE_MB 32
@@ -87,10 +111,6 @@
 // Upper bound on how many textures a single frame may evict, so that reclaiming
 // memory does not turn into a visible hitch.
 #define TEXTURE_EVICTIONS_PER_FRAME 64
-// Of those, how many may fall through to the memory card in one frame. A card
-// write of a few hundred KB costs more than a frame is worth, so evictions that
-// have to make one are rationed hard even though evictions into RAM are not.
-#define TEXTURE_CARD_WRITES_PER_FRAME 1
 
 // Evicted textures are held in the newlib heap up to this much, and only spill
 // to the memory card past it. The heap is not GPU-mappable, so a texture parked
@@ -98,12 +118,14 @@
 // this cache exists to reclaim -- and putting it back is a memcpy rather than a
 // read off the card. Kept well short of the heap so the game still has its own
 // room; when it is full, or the heap will not give, eviction uses the card.
-#define TEXTURE_RAM_CACHE_MB 24
-// And never past this share of the heap, whatever the ceiling above allows. The
-// heap is the game's before it is ours: a session that crashed had it at 153 MB
-// of 160, so parking textures by our own ceiling alone would have been what
-// killed it. Past this, eviction spills to the card instead.
-#define TEXTURE_HEAP_PARK_PERCENT 60
+#define TEXTURE_RAM_CACHE_MB 40
+// And never within this much of the end of the heap, whatever the ceiling above
+// allows. The heap is the game's before it is ours: a session that crashed had
+// it at 153 MB of 160, so parking textures by our own ceiling alone would have
+// been what killed it. Measured against what is actually free rather than as a
+// share of the total, because the game's own usage is most of it and a
+// percentage of the total says nothing about what is left.
+#define TEXTURE_HEAP_KEEP_FREE_MB 40
 
 // Where the source bytes of uploaded textures are kept so that an evicted one
 // can be uploaded again when the game draws with it. Truncated on every boot,
