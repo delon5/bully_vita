@@ -11,6 +11,7 @@
 #include <psp2/touch.h>
 #include <vitaGL.h>
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -66,6 +67,26 @@ static NameToMethodID name_to_method_ids[] = {
   { "GetGamepadButtons", GET_GAMEPAD_BUTTONS },
   { "GetGamepadAxis", GET_GAMEPAD_AXIS },
 };
+
+#ifdef LOADER_TRACE
+// Each JNI entry point the game reaches is logged once, so a trace shows how
+// far startup got without drowning the file in per-frame lines.
+static void trace_jni_once(int methodID) {
+  static uint32_t seen;
+  if (methodID <= 0 || methodID >= 32 || (seen & (1u << methodID)))
+    return;
+  seen |= 1u << methodID;
+  for (int i = 0; i < (int)(sizeof(name_to_method_ids) / sizeof(name_to_method_ids[0])); i++) {
+    if (name_to_method_ids[i].id == (enum MethodIDs)methodID) {
+      traceLog("jni: first call to %s\n", name_to_method_ids[i].name);
+      return;
+    }
+  }
+  traceLog("jni: first call to method %d\n", methodID);
+}
+#else
+#define trace_jni_once(id) ((void)0)
+#endif
 
 static char fake_vm[0x1000];
 static char fake_env[0x1000];
@@ -260,6 +281,7 @@ int DeleteFile(char *file) {
 }
 
 int CallBooleanMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
+  trace_jni_once(methodID);
   switch (methodID) {
     case INIT_EGL_AND_GLES2:
       return InitEGLAndGLES2();
@@ -279,6 +301,7 @@ int CallBooleanMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 }
 
 float CallFloatMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
+  trace_jni_once(methodID);
   switch (methodID) {
     case GET_GAMEPAD_AXIS:
       return GetGamepadAxis(args[0], args[1]);
@@ -290,6 +313,7 @@ float CallFloatMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 }
 
 int CallIntMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
+  trace_jni_once(methodID);
   switch (methodID) {
     case GET_GAMEPAD_TYPE:
       return GetGamepadType(args[0]);
@@ -309,6 +333,7 @@ int CallIntMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 }
 
 void *CallObjectMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
+  trace_jni_once(methodID);
   switch (methodID) {
     case GET_APP_LOCAL_VALUE:
       return getAppLocalValue((char *)args[0]);
@@ -320,6 +345,7 @@ void *CallObjectMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 }
 
 void CallVoidMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
+  trace_jni_once(methodID);
   return;
 }
 

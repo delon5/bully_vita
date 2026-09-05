@@ -231,8 +231,13 @@ int thread_stub(SceSize args, uintptr_t *argp) {
   int (* func)(void *arg) = (void *)argp[0];
   void *arg = (void *)argp[1];
   char *out = (char *)argp[2];
+  const char *name = (const char *)argp[3];
   out[0x41] = 1; // running
+  traceLog("thread: %s entered\n", name ? name : "?");
   func(arg);
+  // A thread that faults never gets here, so the absence of this line for a
+  // given thread is what tells a trace apart from a clean shutdown.
+  traceLog("thread: %s returned\n", name ? name : "?");
   return sceKernelExitDeleteThread(0);
 }
 
@@ -286,10 +291,11 @@ void *OS_ThreadLaunch(int (* func)(), void *arg, int cpu, char *name, int unused
     char *out = malloc(0x48);
     *(int *)(out + 0x24) = thid;
 
-    uintptr_t args[3];
+    uintptr_t args[4];
     args[0] = (uintptr_t)func;
     args[1] = (uintptr_t)arg;
     args[2] = (uintptr_t)out;
+    args[3] = (uintptr_t)name;
     sceKernelStartThread(thid, sizeof(args), args);
 
     return out;

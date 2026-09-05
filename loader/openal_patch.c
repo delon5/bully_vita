@@ -14,7 +14,46 @@
 #include <AL/efx.h>
 
 #include "main.h"
+#include "config.h"
 #include "so_util.h"
+
+#ifdef LOADER_TRACE
+// The mixer is the one part of openal that runs on its own thread and touches
+// NEON-aligned state, so a trace needs to say whether the device and context
+// ever came up before the game went quiet.
+static ALCdevice *traced_alcOpenDevice(const ALCchar *name) {
+  ALCdevice *dev = alcOpenDevice(name);
+  traceLog("openal: alcOpenDevice(%s) -> %p\n", name ? name : "(default)", dev);
+  return dev;
+}
+
+static ALCcontext *traced_alcCreateContext(ALCdevice *dev, const ALCint *attrs) {
+  ALCcontext *ctx = alcCreateContext(dev, attrs);
+  traceLog("openal: alcCreateContext(%p) -> %p\n", dev, ctx);
+  return ctx;
+}
+
+static ALCboolean traced_alcMakeContextCurrent(ALCcontext *ctx) {
+  traceLog("openal: alcMakeContextCurrent(%p) entering mixer setup\n", ctx);
+  ALCboolean ok = alcMakeContextCurrent(ctx);
+  traceLog("openal: alcMakeContextCurrent -> %d\n", (int)ok);
+  return ok;
+}
+
+static ALvoid traced_alSourcePlay(ALuint src) {
+  static int first = 1;
+  if (first) {
+    first = 0;
+    traceLog("openal: first alSourcePlay(%u)\n", src);
+  }
+  alSourcePlay(src);
+}
+
+#define alcOpenDevice traced_alcOpenDevice
+#define alcCreateContext traced_alcCreateContext
+#define alcMakeContextCurrent traced_alcMakeContextCurrent
+#define alSourcePlay traced_alSourcePlay
+#endif
 
 void patch_openal(void) {
   hook_addr(so_symbol(&bully_mod, "alAuxiliaryEffectSlotf"), (uintptr_t)alAuxiliaryEffectSlotf);
