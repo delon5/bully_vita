@@ -257,7 +257,7 @@ int swapBuffers(void) {
   if (frames_swapped < 3 || frames_swapped == 60 || frames_swapped == 600)
     traceLog("frame: %d presented\n", frames_swapped);
 #ifdef LOADER_TRACE
-  if (frames_swapped == 2 || frames_swapped == 60 || frames_swapped == 600)
+  if (frames_swapped < 3 || frames_swapped == 60 || frames_swapped == 600)
     trace_frame_contents(frames_swapped);
 #endif
   frames_swapped++;

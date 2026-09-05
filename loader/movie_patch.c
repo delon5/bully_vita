@@ -191,8 +191,16 @@ void movie_draw_frame(void) {
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, &movie_texcoord[0]);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 #ifdef LOADER_TRACE
-        if (drawn <= 1)
-          traceLog("movie: drew frame, gl error 0x%x\n", glGetError());
+        if (drawn <= 1) {
+          // Same question as the game's own frames: is anything actually in
+          // the surface, and is a framebuffer object still bound (which makes
+          // vitaGL skip the display queue entirely)?
+          extern void *in_use_framebuffer;
+          uint32_t px = 0;
+          glReadPixels(SCREEN_W / 2, SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &px);
+          traceLog("movie: drew frame, gl error 0x%x, centre 0x%08x, fbo bound %p\n",
+                   glGetError(), px, in_use_framebuffer);
+        }
 #endif
         vglSwapBuffers(GL_FALSE);
       }
