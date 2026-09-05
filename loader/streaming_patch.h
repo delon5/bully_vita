@@ -13,8 +13,9 @@ void streaming_patch_init(void);
 // For the trace: how much the streamer thinks it is holding, and how many times
 // we have told it to make room.
 typedef struct {
-  int memory_used_mb; // CStreaming::ms_memoryUsed, the game's own figure
+  int memory_used_mb; // heap the game is holding
   int refusals;       // times the gate said "no", each of which frees something
+  int backoffs;       // times refusing stopped helping and we let it load again
   int installed;
 } StreamingStats;
 

@@ -50,7 +50,13 @@
 // dropped; too large and it runs out before it is ever asked to free anything.
 // A traced session reached 194 MB of a 208 MB heap before dying, so there is
 // real room to reclaim here.
-#define STREAMING_HEAP_KEEP_FREE_MB 32
+// Kept above what the game actually needs to run. Set below it, every answer is
+// "no" for ever: the game evicts until the world itself is gone, which on
+// hardware left a black corridor with the characters still in it.
+#define STREAMING_HEAP_KEEP_FREE_MB 24
+// An empty file here turns the streaming fix off, the way no_texcache does for
+// the texture cache.
+#define STREAMING_DISABLE_PATH DATA_PATH "/" "no_streamfix"
 
 // How long a texture must go undrawn before vitaGL's own cache is allowed to
 // write it out and free it, in frames. vitaGL defaults to 3600 -- two minutes
