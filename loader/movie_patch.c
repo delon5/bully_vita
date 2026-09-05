@@ -155,11 +155,22 @@ int movie_audio_thread(SceSize args, void *argp) {
   return sceKernelExitDeleteThread(0);
 }
 
+int movie_player_state(void) {
+  return player_state;
+}
+
 void movie_draw_frame(void) {
   if (player_state == PLAYER_ACTIVE) {
     if (sceAvPlayerIsActive(movie_player)) {
       SceAvPlayerFrameInfo frame;
       if (sceAvPlayerGetVideoData(movie_player, &frame)) {
+#ifdef LOADER_TRACE
+        static int drawn;
+        if (drawn == 0 || drawn == 60)
+          traceLog("movie: video frame %d, %dx%d\n", drawn,
+                   frame.details.video.width, frame.details.video.height);
+        drawn++;
+#endif
         movie_frame_idx = (movie_frame_idx + 1) % 2;
         sceGxmTextureInitLinear(
           movie_tex[movie_frame_idx],
@@ -219,9 +230,18 @@ void movie_setup_player(void) {
   glBindAttribLocation(movie_prog, 0, "inPos");
   glBindAttribLocation(movie_prog, 1, "inTex");
   glLinkProgram(movie_prog);
+
+  // These two shaders are raw GXP compiled into the loader, so they exercise
+  // the same glShaderBinary path the game's own shaders take. If this program
+  // does not link, neither will anything the game loads.
+  GLint linked = 0;
+  glGetProgramiv(movie_prog, GL_LINK_STATUS, &linked);
+  traceLog("movie: shader program %u link status %d, gl error 0x%x\n",
+           movie_prog, (int)linked, glGetError());
 }
 
 int OS_MoviePlay(const char *file, int a2, int a3, float a4) {
+  traceLog("movie: OS_MoviePlay(%s)\n", file ? file : "(null)");
   movie_audio_init();
 
   SceAvPlayerInitData playerInit;

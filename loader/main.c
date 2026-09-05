@@ -158,6 +158,14 @@ int OS_ScreenGetWidth(void) {
 }
 
 int ProcessEvents(void) {
+#ifdef LOADER_TRACE
+  // The game's main loop calls this every iteration, so it tells apart a loop
+  // that is running but never drawing from one that is not running at all.
+  static int events;
+  if (events == 0 || events == 60 || events == 600 || events == 3000)
+    traceLog("loop: ProcessEvents %d, movie player state %d\n", events, movie_player_state());
+  events++;
+#endif
   movie_draw_frame();
   return 0; // 1 is exit!
 }
@@ -517,6 +525,16 @@ void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, con
   snprintf(gxp_path, sizeof(gxp_path), "%s/%s.gxp", GXP_PATH, sha_name);
 
   FILE *file = sceLibcBridge_fopen(gxp_path, "rb");
+#ifdef LOADER_TRACE
+  {
+    // Only the first handful, but enough to say whether the game's shaders are
+    // being found on the card and accepted by vitaGL at all.
+    static int loads;
+    if (loads < 4)
+      traceLog("shader: %s %s\n", sha_name, file ? "found" : "MISSING");
+    loads++;
+  }
+#endif
   if (!file) {
     debugPrintf("Could not find %s\n", gxp_path);
 
@@ -546,6 +564,15 @@ void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, con
     sceLibcBridge_fclose(file);
 
     glShaderBinary(1, &shader, 0, shaderBuf, shaderSize);
+#ifdef LOADER_TRACE
+    {
+      static int bins;
+      if (bins < 4)
+        traceLog("shader: glShaderBinary %d bytes, gl error 0x%x\n",
+                 (int)shaderSize, glGetError());
+      bins++;
+    }
+#endif
 
     free(shaderBuf);
   }
@@ -1007,7 +1034,8 @@ int main(int argc, char *argv[]) {
   vglSetupGarbageCollector(127, 0x20000);
   vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
 
-  traceLog("boot: vitaGL up, setting up movie player\n");
+  traceLog("boot: vitaGL up (%s / %s), setting up movie player\n",
+           (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER));
   movie_setup_player();
 
   traceLog("boot: handing over to the game\n");
