@@ -39,14 +39,6 @@
 // hand out on a Vita (128MB of CDRAM plus whatever is left of main RAM once the
 // game heap above has been carved out).
 #define TEXTURE_BUDGET_MB 128
-// Nothing is evicted while we are comfortably under budget, so a copy taken
-// then is written to the card for no reason -- and taking one for every
-// texture the game loads means writing a couple of hundred megabytes to slow
-// storage during startup, competing with the game's own asset reads. Start
-// copying once resident textures pass this mark. What was loaded before it is
-// the core set the game keeps hot anyway, and the growth that used to run the
-// console out of memory is all above the line and backed as normal.
-#define TEXTURE_BACKUP_START_MB 64
 // Evict regardless of the budget once vitaGL has less than this much free, so
 // that memory pressure coming from anywhere else does not kill us either.
 #define TEXTURE_RESERVE_MB 32
@@ -61,7 +53,12 @@
 // Where the source bytes of uploaded textures are kept so that an evicted one
 // can be uploaded again when the game draws with it. Truncated on every boot,
 // since texture names are handed out afresh each run.
-#define TEXTURE_BACKUP_PATH DATA_PATH "/" "texcache.bin"
+// One file per texture, named by a key derived from its contents, spread over
+// 256 subdirectories so no single directory grows to thousands of entries. The
+// store outlives the process on purpose: the key does not depend on the texture
+// name vitaGL handed out this run, so a second run finds its textures already
+// there and writes nothing. Deleting the folder is always safe.
+#define TEXTURE_CACHE_DIR DATA_PATH "/" "textures"
 // Ceiling on the cache file, and how much of the card to leave alone. The
 // actual limit is whichever is smaller: this, or the free space minus the
 // reserve. Filling a memory card is not a fair thing to do to somebody -- the

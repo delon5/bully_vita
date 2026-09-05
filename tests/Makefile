@@ -7,7 +7,7 @@
 #
 # make VITASDK=/path/to/vitasdk
 
-VITASDK ?= /usr/local/vitasdk
+VITASDK ?= $(VITASDK)
 OUT     ?= out
 
 CFLAGS := -idirafter $(VITASDK)/arm-vita-eabi/include -I../loader -I. \

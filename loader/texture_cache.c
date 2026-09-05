@@ -6,11 +6,16 @@
  *
  * So we drop the textures the game has stopped drawing with. The game has no
  * idea we did and will never upload them again, which means dropping one has to
- * be reversible: every upload is copied to a cache file on ux0 by a background
- * writer thread, evicting frees the GPU allocation and remembers where the
- * source bytes went, and the next time the game binds the texture we read them
- * back and replay the original upload. Walking out of an area and back into it
- * costs a disk read rather than a wall of white.
+ * be reversible: every upload is written to its own file under
+ * ux0:data/Bully/textures, evicting frees the GPU allocation, and the next time
+ * the game binds the texture we read the file back and replay the original
+ * upload. Walking out of an area and back into it costs a disk read rather than
+ * a wall of white.
+ *
+ * Each file is named by a key derived from the texture's own bytes rather than
+ * by the name vitaGL handed out, so the store is still valid on the next run:
+ * the second time the game loads a texture it is already there and nothing is
+ * written.
  *
  * Replay works because vitaGL's upload path is a pure function of the arguments
  * plus the texture's own descriptor: PVRTC is memcpy'd into the GPU buffer
@@ -30,6 +35,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "main.h"
@@ -46,23 +52,10 @@
 // upload the game has since replaced, can never be replayed into a texture.
 #define BACKUP_MAGIC 0x31435442
 
-#define QUEUE_SLOTS 64 // must be a power of two
-#define QUEUE_MASK (QUEUE_SLOTS - 1)
-// Staged payload buffers up to this size are kept and reused by their queue
-// slot. Anything larger is returned to the heap rather than held indefinitely.
-#define PAYLOAD_KEEP_BYTES (64 * 1024)
-
-// The cache file is carved into extents whose sizes are these buckets, so that a
-// texture the game uploads again can go back into the space its previous
-// generation occupied instead of appending for ever.
-#define NUM_BUCKETS 7
-#define SMALLEST_BUCKET (64 * 1024)
-#define FREE_LIST_CAP 512
-
 typedef struct {
   uint32_t magic;
-  uint32_t id;
-  uint32_t serial; // which generation of this texture name the record belongs to
+  uint32_t key_lo; // content key, so a record can be checked against the file it is in
+  uint32_t key_hi;
   uint32_t level;
   uint32_t width;
   uint32_t height;
@@ -80,11 +73,9 @@ typedef struct {
   uint32_t last_frame; // frame counter at the time of the last bind
 
   uint32_t serial;
-  uint32_t backup_offset; // where its records live in the cache file
+  uint32_t key_lo, key_hi; // content key: names the file its records live in
   uint32_t backup_bytes; // how many bytes of records it has
-  uint32_t backup_seq; // queue position its last record was staged at
   int32_t min_filter; // the game's last glTexParameteri, clobbered while evicted
-  uint8_t backup_bucket;
   uint8_t levels;
 
   uint8_t tracked;
@@ -98,15 +89,6 @@ typedef struct {
   uint32_t last_frame;
 } EvictionCandidate;
 
-// One queued write. The payload is a private copy, so the game is free to reuse
-// or free its own buffer the moment the upload call returns.
-typedef struct {
-  BackupRecord record;
-  uint32_t offset; // where in the cache file this record belongs
-  void *payload;
-  uint32_t capacity; // how big payload actually is, so slots can reuse it
-} PendingWrite;
-
 static TextureInfo textures[MAX_TEXTURES];
 static GLuint bound_textures[MAX_TEXTURE_UNITS];
 static int active_unit = 0;
@@ -117,28 +99,11 @@ static uint32_t starved_frames; // frames the lossless pass has failed to keep u
 // Counted for the trace: this is the first time any of this has run on hardware.
 static uint32_t evicted_count, restored_count, restore_failed_count;
 
-static PendingWrite queue[QUEUE_SLOTS];
-static volatile uint32_t queue_head; // producer: the render thread
-static volatile uint32_t queue_tail; // consumer: the writer thread
-static volatile uint32_t queued_bytes; // producer only, wraps harmlessly
-static volatile uint32_t written_bytes; // consumer only, wraps harmlessly
 
-static SceUID backup_fd = -1;
-static SceUID backup_sema = -1;
 static uint8_t *restore_scratch;
 static int backup_ready;
 static int cache_enabled = 1;
 
-// Cache file allocator.
-static uint32_t file_cursor;
-static uint32_t file_limit; // how far the cache file may grow, set from free space
-static uint32_t free_list[NUM_BUCKETS][FREE_LIST_CAP];
-static uint16_t free_count[NUM_BUCKETS];
-// Every record a texture can own must be readable back in one go, so a texture's
-// extent is capped by the buffer we read it through.
-static uint32_t bucket_bytes(int bucket) {
-  return (uint32_t)SMALLEST_BUCKET << bucket;
-}
 
 // vglMemFree refuses VGL_MEM_ALL: it is the enum terminator and the wrapper
 // returns 0 for anything greater than or equal to it, so asking for "all" would
@@ -182,76 +147,56 @@ static TextureInfo *texture_info(GLuint id) {
 // A texture can only be evicted if we can put it back, which means all of its
 // records have actually reached the card.
 static int is_restorable(const TextureInfo *info) {
-  if (!backup_ready || info->unbacked || info->levels == 0)
-    return 0;
-  // Anything still sitting in the queue has not reached the card yet, and
-  // dropping a texture whose copy is not written is how you lose it. Records go
-  // out in the order they were staged, so a texture is safe once the writer has
-  // consumed past the position its last one took.
-  return (int32_t)(__atomic_load_n(&queue_tail, __ATOMIC_ACQUIRE) - info->backup_seq) >= 0;
+  return backup_ready && !info->unbacked && info->levels > 0;
 }
 
 /*
  * Cache file allocator
  */
 
-static int bucket_for(uint32_t size) {
-  for (int bucket = 0; bucket < NUM_BUCKETS; bucket++)
-    if (size <= bucket_bytes(bucket))
-      return bucket;
-  return -1;
-}
-
-static int extent_alloc(uint32_t size, uint32_t *offset) {
-  int bucket = bucket_for(size);
-  if (bucket < 0)
-    return -1;
-
-  if (free_count[bucket] > 0) {
-    *offset = free_list[bucket][--free_count[bucket]];
-    return bucket;
+// A texture is stored in its own file, named by a key derived from the bytes
+// and parameters of its base level. Two consequences follow. The store survives
+// a reboot, because the key does not depend on the texture name vitaGL happened
+// to hand out this run -- so the second time the game loads a texture it is
+// already there and nothing is written. And there is no allocator: no extents,
+// no free lists, no offsets to keep straight, which is where most of the
+// bookkeeping in here used to live.
+//
+// Files are spread over 256 subdirectories by the top byte of the key. A single
+// directory holding ten thousand entries is slow to open on a memory card.
+static void content_key(const void *data, uint32_t size, GLsizei width, GLsizei height,
+                        GLint internalformat, GLenum type, uint32_t *lo, uint32_t *hi) {
+  // Two independent FNV-1a passes. A 32 bit key over thousands of textures
+  // would collide often enough to matter; 64 bits does not, and a collision
+  // that did happen still has to survive the header and checksum checks on
+  // restore before it could do any harm.
+  uint32_t a = 2166136261u, b = 0x811c9dc5u ^ 0x9e3779b9u;
+  const uint8_t *p = (const uint8_t *)data;
+  for (uint32_t i = 0; i < size; i++) {
+    a = (a ^ p[i]) * 16777619u;
+    b = (b + p[i]) * 2654435761u;
   }
-  if ((uint64_t)file_cursor + bucket_bytes(bucket) > (uint64_t)file_limit)
-    return -1;
-  *offset = file_cursor;
-  file_cursor += bucket_bytes(bucket);
-  return bucket;
-}
-
-static void extent_free(uint32_t offset, int bucket) {
-  if (free_count[bucket] < FREE_LIST_CAP)
-    free_list[bucket][free_count[bucket]++] = offset;
-}
-
-// Gives a texture an extent big enough for the mipmap levels that will follow
-// the base one. A compressed mip chain is at most four thirds of its base level,
-// so we ask for half again and never have to move the extent mid-upload.
-static int extent_claim(TextureInfo *info, uint32_t base_bytes) {
-  uint32_t wanted = base_bytes + base_bytes / 2;
-  int bucket = bucket_for(wanted);
-  if (bucket < 0)
-    return 0;
-
-  if (info->levels > 0 && info->backup_bucket == bucket)
-    return 1; // its previous generation's extent is the right size, reuse it
-
-  if (info->levels > 0)
-    extent_free(info->backup_offset, info->backup_bucket);
-
-  uint32_t offset;
-  int got = extent_alloc(wanted, &offset);
-  if (got < 0) {
-    info->levels = 0;
-    return 0;
+  uint32_t params[5] = { (uint32_t)width, (uint32_t)height, (uint32_t)internalformat,
+                         (uint32_t)type, size };
+  for (int i = 0; i < 5; i++) {
+    a = (a ^ params[i]) * 16777619u;
+    b = (b + params[i]) * 2654435761u;
   }
-  info->backup_offset = offset;
-  info->backup_bucket = got;
-  return 1;
+  *lo = a;
+  *hi = b;
+}
+
+static void texture_path(char *out, size_t out_size, uint32_t lo, uint32_t hi) {
+  snprintf(out, out_size, "%s/%02x/%08x%08x.tex", TEXTURE_CACHE_DIR, (unsigned)(hi >> 24), hi, lo);
+}
+
+static void texture_dir(char *out, size_t out_size, uint32_t hi) {
+  snprintf(out, out_size, "%s/%02x", TEXTURE_CACHE_DIR, (unsigned)(hi >> 24));
 }
 
 static void backup_release(TextureInfo *info) {
-  if (info->levels > 0)
-    extent_free(info->backup_offset, info->backup_bucket);
+  // The file stays. It is keyed by content, so it is still valid for whatever
+  // uploads those exact bytes next -- this run or a later one.
   info->levels = 0;
   info->backup_bytes = 0;
 }
@@ -283,32 +228,6 @@ static void texture_pin(GLuint id) {
  * Backing store
  */
 
-static int backup_thread(SceSize args, void *argp) {
-  for (;;) {
-    if (sceKernelWaitSema(backup_sema, 1, NULL) < 0)
-      return sceKernelExitDeleteThread(0);
-
-    uint32_t tail = queue_tail;
-    PendingWrite *write = &queue[tail & QUEUE_MASK];
-
-    // Seek explicitly rather than trusting the file position: extents are
-    // reused out of order, and a short write must not shift what follows it.
-    sceIoLseek(backup_fd, write->offset, SCE_SEEK_SET);
-    sceIoWrite(backup_fd, &write->record, sizeof(BackupRecord));
-    sceIoWrite(backup_fd, write->payload, write->record.size);
-
-    // A failed or partial write leaves a region that will not pass validation on
-    // restore, and that texture falls back to a placeholder. That is better than
-    // holding up every texture queued behind it.
-    if (write->capacity > PAYLOAD_KEEP_BYTES) {
-      free(write->payload);
-      write->payload = NULL;
-      write->capacity = 0;
-    }
-    __atomic_store_n(&written_bytes, written_bytes + write->record.size, __ATOMIC_RELAXED);
-    __atomic_store_n(&queue_tail, tail + 1, __ATOMIC_RELEASE);
-  }
-}
 
 void texture_cache_init(void) {
   SceIoStat stat;
@@ -321,12 +240,9 @@ void texture_cache_init(void) {
   for (GLuint id = 0; id < MAX_TEXTURES; id++)
     textures[id].min_filter = GL_LINEAR;
 
-  // The cache lives next to the game's own files, in the data directory the user
-  // installed them into. It is only meaningful for the run that wrote it --
-  // texture names are handed out afresh every time -- so it starts empty, and
-  // truncating is also what stops it growing across sessions.
-  // Work out how much of the card we may actually use. The cap is a ceiling,
-  // not an entitlement: whatever is free minus a reserve wins if it is smaller.
+  // The store lives next to the game's own files, in the data directory the
+  // user installed them into, and is kept across runs. Check there is room for
+  // it before promising anything reloadable.
   uint64_t card_size = 0, card_free = 0;
   if (sceAppMgrGetDevInfo("ux0:", &card_size, &card_free) < 0) {
     traceLog("texture cache: could not read free space on ux0, running without a backing store\n");
@@ -341,147 +257,108 @@ void texture_cache_init(void) {
              (int)(card_free / (1024 * 1024)));
     return;
   }
-  file_limit = (uint32_t)usable;
-
   sceIoMkdir(DATA_PATH, 0777);
-  // One descriptor, read/write: the writer seeks and writes, the render thread
-  // seeks and reads, and both are on the render thread's side of a handshake
-  // that never lets them touch the same record at the same time.
-  backup_fd = sceIoOpen(TEXTURE_BACKUP_PATH, SCE_O_RDWR | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-  if (backup_fd < 0) {
-    debugPrintf("texture cache: could not open %s, textures will not be reloadable\n", TEXTURE_BACKUP_PATH);
-    return;
-  }
+  sceIoMkdir(TEXTURE_CACHE_DIR, 0777);
 
-  restore_scratch = malloc(bucket_bytes(NUM_BUCKETS - 1));
-  backup_sema = sceKernelCreateSema("bully_texcache", 0, 0, QUEUE_SLOTS, NULL);
-  SceUID thid = -1;
-  if (restore_scratch && backup_sema >= 0)
-    thid = sceKernelCreateThread("bully_texcache", backup_thread, TEXTURE_BACKUP_THREAD_PRIORITY,
-                                 64 * 1024, 0, TEXTURE_BACKUP_THREAD_AFFINITY, NULL);
-
-  if (thid < 0 || sceKernelStartThread(thid, 0, NULL) < 0) {
-    debugPrintf("texture cache: backing store unavailable, textures will not be reloadable\n");
-    free(restore_scratch);
-    restore_scratch = NULL;
-    if (backup_sema >= 0)
-      sceKernelDeleteSema(backup_sema);
-    sceIoClose(backup_fd);
-    backup_fd = -1;
+  restore_scratch = malloc((size_t)TEXTURE_BACKUP_MAX_KB * 1024);
+  if (!restore_scratch) {
+    debugPrintf("texture cache: no scratch buffer, textures will not be reloadable\n");
     return;
   }
 
   backup_ready = 1;
-  traceLog("texture cache: backing store at %s, limit %d MB (%d MB free on ux0)\n",
-           TEXTURE_BACKUP_PATH, (int)(file_limit / (1024 * 1024)), (int)(card_free / (1024 * 1024)));
+  traceLog("texture cache: store at %s (%d MB free on ux0)\n",
+           TEXTURE_CACHE_DIR, (int)(card_free / (1024 * 1024)));
 }
 
 void texture_cache_shutdown(void) {
   if (!backup_ready)
     return;
-
-  // Stop the writer before touching the file: removing a path with a write in
-  // flight is not something we should ask the filesystem to make sense of.
+  // The store is deliberately left behind: it is keyed by texture contents, so
+  // the next run finds its textures already written and starts faster. Deleting
+  // ux0:data/Bully/textures is always safe.
   backup_ready = 0;
-  sceKernelDeleteSema(backup_sema);
-  backup_sema = -1;
-  sceIoClose(backup_fd);
-  backup_fd = -1;
-  // Leaving a multi-hundred-megabyte file on the user's card after they quit
-  // would be rude. If it does not take, the next boot truncates it anyway.
-  sceIoRemove(TEXTURE_BACKUP_PATH);
+  free(restore_scratch);
+  restore_scratch = NULL;
 }
 
-static int backup_has_room(uint32_t size) {
-  uint32_t in_flight = queued_bytes - __atomic_load_n(&written_bytes, __ATOMIC_RELAXED);
-  if (in_flight + size > (uint32_t)TEXTURE_BACKUP_STAGING_KB * 1024)
-    return 0;
-  if (queue_head - __atomic_load_n(&queue_tail, __ATOMIC_ACQUIRE) >= QUEUE_SLOTS)
-    return 0;
-  return 1;
-}
 
 // A texture with no copy on the card cannot be freed, so how hard we try to get
 // one written depends on how badly we need to be able to free things.
-static int backup_make_room(uint32_t size) {
-  if (backup_has_room(size))
-    return 1;
 
-  const size_t budget = (size_t)TEXTURE_BUDGET_MB * 1024 * 1024;
-
-  // Plenty of headroom: nothing is going to be evicted any time soon, so a
-  // missed copy costs us nothing and is not worth stalling the render thread.
-  if (tracked_bytes < budget - budget / 4)
-    return 0;
-
-  // Near or over the budget, waiting for the card is cheaper than ending up with
-  // memory we are not allowed to reclaim.
-  int wait_ms = tracked_bytes > budget ? TEXTURE_BACKUP_WAIT_MS_MAX : TEXTURE_BACKUP_WAIT_MS;
-  for (int i = 0; i < wait_ms; i++) {
-    sceKernelDelayThread(1000);
-    if (backup_has_room(size))
-      return 1;
-  }
-  return 0;
-}
-
-// Hands one upload to the writer thread. Returns 0 if it could not be queued, in
+// Writes one upload's record to the cache file. Returns 0 if it could not be, in
 // which case the texture simply stays resident rather than being lost.
 static int backup_stage(TextureInfo *info, GLuint id, GLint level, GLsizei width, GLsizei height,
                         uint32_t size, GLint internalformat, GLenum format, GLenum type,
                         int compressed, const void *data) {
   if (!backup_ready || !data || size == 0)
     return 0;
+  if (sizeof(BackupRecord) + size > (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
+    return 0;
+
+  char path[160];
 
   if (level == 0) {
-    if (!extent_claim(info, sizeof(BackupRecord) + size))
-      return 0;
+    content_key(data, size, width, height, internalformat, type, &info->key_lo, &info->key_hi);
     info->backup_bytes = 0;
     info->levels = 0;
+
+    texture_path(path, sizeof(path), info->key_lo, info->key_hi);
+    SceIoStat st;
+    if (sceIoGetstat(path, &st) >= 0 && st.st_size >= (SceOff)(sizeof(BackupRecord) + size)) {
+      // Already stored, by this run or a previous one. Nothing to write: adopt
+      // it and let restore validate the contents if it is ever needed.
+      info->backup_bytes = (uint32_t)st.st_size;
+      info->levels = 1; // at least the base level; restore counts what it finds
+      return 1;
+    }
+    char dir[160];
+    texture_dir(dir, sizeof(dir), info->key_hi);
+    sceIoMkdir(dir, 0777);
   } else if (info->levels != (uint8_t)level) {
     // Levels have to arrive in order and exactly once: replay walks them from
     // zero, and a gap or a repeat would rebuild a different texture.
     return 0;
+  } else {
+    texture_path(path, sizeof(path), info->key_lo, info->key_hi);
   }
 
-  if (info->backup_bytes + sizeof(BackupRecord) + size > bucket_bytes(info->backup_bucket))
-    return 0; // more mipmap levels than the extent was sized for
+  if (info->backup_bytes + sizeof(BackupRecord) + size > (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
+    return 0; // more mipmap levels than we are willing to store
 
-  if (!backup_make_room(size))
+  BackupRecord record;
+  record.magic = BACKUP_MAGIC;
+  record.key_lo = info->key_lo;
+  record.key_hi = info->key_hi;
+  record.level = level;
+  record.width = width;
+  record.height = height;
+  record.size = size;
+  record.internalformat = internalformat;
+  record.format = format;
+  record.type = type;
+  record.compressed = compressed;
+  record.checksum = checksum(data, size);
+
+  // Written here on the uploading thread. This used to be staged into a queue
+  // and written by a background thread, which shared the file handle and the
+  // staging buffers with the renderer for a copy that is only read after an
+  // eviction. One file per texture and one writer removes all of that.
+  int flags = level == 0 ? (SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC)
+                         : (SCE_O_WRONLY | SCE_O_APPEND);
+  SceUID fd = sceIoOpen(path, flags, 0777);
+  if (fd < 0)
     return 0;
-
-  uint32_t head = queue_head;
-  PendingWrite *write = &queue[head & QUEUE_MASK];
-  if (write->capacity < size) {
-    free(write->payload);
-    write->payload = malloc(size);
-    write->capacity = write->payload ? size : 0;
+  int ok = sceIoWrite(fd, &record, sizeof(record)) == (int)sizeof(record) &&
+           sceIoWrite(fd, data, size) == (int)size;
+  sceIoClose(fd);
+  if (!ok) {
+    sceIoRemove(path); // a short write must not be mistaken for a usable store
+    return 0;
   }
-  if (!write->payload)
-    return 0;
-  memcpy(write->payload, data, size);
-
-  write->record.magic = BACKUP_MAGIC;
-  write->record.id = id;
-  write->record.serial = info->serial;
-  write->record.level = level;
-  write->record.width = width;
-  write->record.height = height;
-  write->record.size = size;
-  write->record.internalformat = internalformat;
-  write->record.format = format;
-  write->record.type = type;
-  write->record.compressed = compressed;
-  write->record.checksum = checksum(write->payload, size);
-  write->offset = info->backup_offset + info->backup_bytes;
 
   info->backup_bytes += sizeof(BackupRecord) + size;
   info->levels++;
-  info->backup_seq = head + 1;
-  queued_bytes += size;
-
-  __atomic_store_n(&queue_head, head + 1, __ATOMIC_RELEASE);
-  sceKernelSignalSema(backup_sema, 1);
   return 1;
 }
 
@@ -506,31 +383,41 @@ static void install_placeholder(GLuint id) {
 static int restore_texture(GLuint id) {
   TextureInfo *info = &textures[id];
 
-  if (sceIoLseek(backup_fd, info->backup_offset, SCE_SEEK_SET) < 0 ||
-      sceIoRead(backup_fd, restore_scratch, info->backup_bytes) != (int)info->backup_bytes)
+  char path[160];
+  texture_path(path, sizeof(path), info->key_lo, info->key_hi);
+  SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+  if (fd < 0)
+    return 0;
+  int read_bytes = sceIoRead(fd, restore_scratch, (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024);
+  sceIoClose(fd);
+  if (read_bytes <= 0)
     return 0;
 
-  // Validate every record before touching GL: a half-written or superseded one
-  // must leave the placeholder alone rather than upload garbage.
+  // Validate every record before touching GL: a half written file, or one that
+  // happens to collide on the key, must leave the placeholder alone rather than
+  // upload garbage. The level count comes from the file rather than from what
+  // we remember, so a store written by an earlier run is read on its own terms.
   uint32_t offset = 0;
-  for (int i = 0; i < info->levels; i++) {
-    if (offset + sizeof(BackupRecord) > info->backup_bytes)
-      return 0;
+  int levels = 0;
+  while (offset + sizeof(BackupRecord) <= (uint32_t)read_bytes) {
     BackupRecord *record = (BackupRecord *)(restore_scratch + offset);
-    if (record->magic != BACKUP_MAGIC || record->id != id || record->serial != info->serial ||
-        record->level != (uint32_t)i)
+    if (record->magic != BACKUP_MAGIC || record->key_lo != info->key_lo ||
+        record->key_hi != info->key_hi || record->level != (uint32_t)levels)
       return 0;
-    if (offset + sizeof(BackupRecord) + record->size > info->backup_bytes)
+    if (offset + sizeof(BackupRecord) + record->size > (uint32_t)read_bytes)
       return 0;
     if (checksum(restore_scratch + offset + sizeof(BackupRecord), record->size) != record->checksum)
       return 0;
     offset += sizeof(BackupRecord) + record->size;
+    levels++;
   }
+  if (levels == 0)
+    return 0;
 
   glBindTexture(GL_TEXTURE_2D, id);
 
   offset = 0;
-  for (int i = 0; i < info->levels; i++) {
+  for (int i = 0; i < levels; i++) {
     BackupRecord *record = (BackupRecord *)(restore_scratch + offset);
     const void *payload = restore_scratch + offset + sizeof(BackupRecord);
     if (record->compressed)
@@ -554,6 +441,7 @@ static int restore_texture(GLuint id) {
   // Eviction forced the sampler off mipmaps because the placeholder had none.
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, info->min_filter);
 
+  info->levels = (uint8_t)levels;
   info->size = info->resident_size;
   tracked_bytes += info->resident_size;
   info->evicted = 0;
@@ -822,13 +710,7 @@ static void upload_finished(GLenum target, GLint level, GLsizei width, GLsizei h
   if (level == 0)
     info->serial = ++upload_serial;
 
-  // Below the start mark a copy would never be used: eviction does not run
-  // until we are at the budget, and reaching it only requires the textures
-  // above the line to be reloadable.
-  int worth_backing = tracked_bytes >= (size_t)TEXTURE_BACKUP_START_MB * 1024 * 1024;
-  if (!worth_backing)
-    info->unbacked = 1;
-  else if (level == 0 || !info->unbacked)
+  if (level == 0 || !info->unbacked)
     info->unbacked = !backup_stage(info, id, level, width, height, source_bytes, internalformat,
                                    format, type, compressed, data);
   if (info->unbacked)

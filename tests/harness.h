@@ -45,15 +45,10 @@ static void tex_reupload(GLuint id, uint32_t tag, GLsizei width, GLsizei height,
                              0, size, source_bytes);
 }
 
-// Let the writer catch up, as it would between frames on real hardware where
-// uploads are paced by the game rather than by a tight loop.
+// Backups are written on the uploading thread now, so a record is on disk by
+// the time the upload call returns and there is nothing to wait for. Kept so
+// the tests still read as "upload, let it settle, then assert".
 static void drain(void) {
-  for (int spin = 0; spin < 200000; spin++) {
-    if (__atomic_load_n(&written_bytes, __ATOMIC_RELAXED) == queued_bytes)
-      return;
-    usleep(200);
-  }
-  assert(0 && "writer thread never drained");
 }
 
 static void frames(int count) {
