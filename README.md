@@ -96,8 +96,11 @@ changes break it outright:
 
 - `glShaderBinary` now expects vitaGL's own serialized shader-cache format
   instead of a raw GXP. The `.gxp` files in `gamefiles.zip` are raw GXPs, so a
-  newer vitaGL reads one as a cache blob, takes a garbage length out of it and
-  allocates on that. This is what made the game crash on launch.
+  newer vitaGL reads one as a cache blob and registers no shader at all. Nothing
+  reports an error: the game boots, plays audio and renders a black screen.
+  `CMakeLists.txt` checks the installed `libvitaGL.a` for `unserialize_shader`
+  at configure time and refuses to build, so this shows up as a build error
+  rather than as a black screen.
 - `vglEnableRuntimeShaderCompiler` was removed, so `vglInit` always starts the
   runtime shader compiler, which loads `SceShaccCg` and patches it through
   taiHEN. This port supplies precompiled shaders and has no reason to.
