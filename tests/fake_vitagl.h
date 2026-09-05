@@ -17,6 +17,7 @@
 // tell a genuinely restored texture from a white placeholder that merely
 // happens to be bound.
 extern size_t fake_slot_bytes[FAKE_SLOTS];
+extern void *fake_slot_data[FAKE_SLOTS];
 extern uint32_t fake_slot_content[FAKE_SLOTS];
 extern int fake_slot_alive[FAKE_SLOTS];
 extern GLuint fake_bound;

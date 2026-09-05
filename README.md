@@ -35,7 +35,7 @@ In order to properly install the game, you'll have to follow these steps precise
 
 ## Notice
 
-- The official game does not free unused textures (as modern smartphones have more RAM than the PS Vita), which used to make the game crash after a long gameplay session. The loader now tracks the textures the game uploads and, once they no longer fit in the *PS Vita*'s video memory, drops the ones it has stopped drawing with. Dropping one is reversible: a copy is kept in `ux0:data/Bully/texcache.bin` and the texture is uploaded again the moment the game draws with it, so revisiting an area you have already been to looks the same as the first time. That file is emptied on every boot and removed when you quit. It is sized from the free space on your memory card and never takes the last 512MB of it; with less than that spare the loader does without it entirely, which costs the reloading but still keeps the game inside the *PS Vita*'s memory.
+- The official game does not free unused textures (as modern smartphones have more RAM than the PS Vita), which used to make the game crash after a long gameplay session. The loader now tracks the textures the game uploads and, once they no longer fit in the *PS Vita*'s video memory, drops the ones it has stopped drawing with. Dropping one is reversible: at the moment a texture is dropped its bytes are read back out of the GPU into `ux0:data/Bully/textures`, and it is uploaded again the moment the game draws with it, so revisiting an area you have already been to looks the same as the first time. Nothing is written while the game is merely loading -- only a texture actually being evicted costs a write -- and a texture the cache could not copy is never dropped. The folder is emptied on every boot and removed when you quit. With too little free space on the memory card the loader does without it entirely; the game then keeps every texture it uploads, which is the original behaviour. Create an empty file at `ux0:data/Bully/no_texcache` to turn it off deliberately.
 - If the game crashes, and there are files available in `ux0:data/Bully/glsl`, please send them to us. If there are too many, then it is because you forgot to install `gamefiles.zip`, in which case do not send us the files.
 
 ## Build Instructions (For Developers)
@@ -139,16 +139,13 @@ Do not take a newer vitaGL without checking both. The overridden `CC` demotes
 diagnostics GCC 14 turned into errors; this is 2021 code written under the older
 default, so demoting them preserves its behaviour rather than changing it.
 
-`HAVE_TEXTURE_CACHE=1` turns on vitaGL's own texture cache, which does what the
-loader's `texture_cache.c` was written to do and does it better. When a GPU
-allocation fails it walks its list of textures the game has not drawn with
-recently, writes each one's data to `ux0:data/vgl_cache/BULLY0000` under a name
-taken from an XXH3 hash of the contents, and frees the memory; binding the
-texture again reads the file straight back into a new allocation. Because it
-holds the texture in its swizzled GPU form it restores with a memcpy rather
-than by replaying the original upload, it needs no interception of the game's
-GL calls, and it writes nothing until an allocation actually fails -- so it
-costs nothing during startup.
+`HAVE_TEXTURE_CACHE=1` turns on vitaGL's own texture cache. It is left on, but
+it does not do this port's reclaiming and cannot be relied on to. It only ever
+runs when a GPU allocation *fails*, and in vitaGL an allocation does not fail:
+the allocator falls back from CDRAM to RAM and from RAM to the newlib heap, so
+the sweep is never reached. Measured on hardware, `ux0:data/vgl_cache/BULLY00000`
+stays empty for an entire session right up to the crash. Reclaiming here has to
+be driven by a budget, which is what `loader/texture_cache.c` does.
 
 Do not turn on `TEXTURE_UPLOADS_SPEEDHACK`: it changes the ownership of texture
 memory underneath the loader.
@@ -166,21 +163,38 @@ The result is `build/Bully.vpk`.
 [`.github/workflows/build.yml`](.github/workflows/build.yml) runs exactly these
 steps on every push and pins the same vitaGL revision.
 
-Unused textures are freed by vitaGL's own texture cache, built in with
-`HAVE_TEXTURE_CACHE=1` (see above). It writes textures the game has stopped
-drawing with to `ux0:data/vgl_cache/BULLY0000` and reads them back when the game
-binds them again, so a long session stays inside what the console has rather
-than growing until it dies. Deleting that folder is safe; it is rebuilt as
-needed.
+Unused textures are freed by `loader/texture_cache.c`, which is on by default.
+It intercepts the game's texture calls, keeps a record of every upload, and once
+either limit is crossed -- more than `TEXTURE_BUDGET_MB` of tracked texture
+memory, or less than `TEXTURE_FREE_HEADROOM_PERCENT` of vitaGL's pools still
+free -- it drops the textures the game has gone longest without drawing.
 
-The loader also carries its own texture cache in `loader/texture_cache.c`,
-which predates that discovery and does the same job by intercepting the game's
-GL calls. It is **off** unless an empty file exists at
-`ux0:data/Bully/use_texcache`, because working from outside vitaGL is both more
-fragile and, on hardware, crashed once the game reached actual gameplay. It is
-kept for now because it is covered by the tests in `tests/` and because its
-eviction policy is budget-driven rather than allocation-failure-driven, which is
-worth keeping as a fallback until vitaGL's has more time on real hardware.
+Dropping a texture reads its bytes back out of the GPU with
+`vglGetTexDataPointer` and writes them to `ux0:data/Bully/textures`, then
+replaces it with a 1x1 placeholder so vitaGL frees the real allocation. When the
+game next binds it the loader replays the upload -- every mip level, with no
+pixels -- and copies the saved bytes straight back into the new allocation. The
+saved form is vitaGL's own swizzled layout, so restoring is a `memcpy` and not a
+re-encode.
+
+Two rules keep it honest, both learned on hardware:
+
+- Nothing is written at upload time. An earlier version copied every texture as
+  it arrived, which turned loading a new area into thousands of memory card
+  writes and made loads far slower than the leak ever did.
+- A texture that cannot be copied is never dropped. An earlier version had a
+  last resort that evicted uncopied textures under pressure, on the reasoning
+  that bounded memory beats running out of it. It is not: the ground and the
+  buildings went black and never came back, because the game has no idea the
+  cache exists and was never going to upload them again. Staying over budget is
+  the better failure.
+
+The behaviour is covered by the tests in `tests/`, which run the cache on the
+build machine against stand-ins for GL and the Vita OS:
+
+```bash
+make -C tests VITASDK=/path/to/vitasdk
+```
 
 ## Credits
 

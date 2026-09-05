@@ -54,18 +54,20 @@
 
 typedef struct {
   uint32_t magic;
-  uint32_t key_lo; // content key, so a record can be checked against the file it is in
-  uint32_t key_hi;
-  uint32_t level;
-  uint32_t width;
-  uint32_t height;
-  uint32_t size; // payload bytes following this header
-  uint32_t internalformat;
-  uint32_t format;
-  uint32_t type;
-  uint32_t compressed;
-  uint32_t checksum; // over the payload, so a short write cannot go unnoticed
+  uint32_t id;
+  uint32_t serial; // which generation of this texture name the file belongs to
+  uint32_t bytes; // texture data following this header
+  uint32_t checksum;
 } BackupRecord;
+
+// What a level was uploaded as. Enough to hand the same call back to vitaGL
+// when the texture is restored; the pixels themselves are not kept, they are
+// taken out of GPU memory at the moment of eviction.
+#define MAX_BACKUP_LEVELS 12
+typedef struct {
+  uint16_t width, height;
+  uint32_t size;
+} LevelInfo;
 
 typedef struct {
   uint32_t size; // bytes we believe vitaGL has allocated for this texture
@@ -73,11 +75,13 @@ typedef struct {
   uint32_t last_frame; // frame counter at the time of the last bind
 
   uint32_t serial;
-  uint32_t key_lo, key_hi; // content key: names the file its records live in
-  uint32_t backup_bytes; // how many bytes of records it has
+  uint32_t backup_bytes; // bytes of texture data written when it was evicted
+  int32_t internalformat, format, type;
+  LevelInfo level[MAX_BACKUP_LEVELS];
   int32_t min_filter; // the game's last glTexParameteri, clobbered while evicted
   uint8_t levels;
 
+  uint8_t compressed_upload;
   uint8_t tracked;
   uint8_t pinned; // render target or streamed-into texture, never evict
   uint8_t evicted;
@@ -155,44 +159,21 @@ static int is_restorable(const TextureInfo *info) {
  * Cache file allocator
  */
 
-// A texture is stored in its own file, named by a key derived from the bytes
-// and parameters of its base level. Two consequences follow. The store survives
-// a reboot, because the key does not depend on the texture name vitaGL happened
-// to hand out this run -- so the second time the game loads a texture it is
-// already there and nothing is written. And there is no allocator: no extents,
-// no free lists, no offsets to keep straight, which is where most of the
-// bookkeeping in here used to live.
+// One file per evicted texture, named by the texture and which generation of
+// it this is. Spread over 256 subdirectories, since a single directory holding
+// thousands of entries is slow to open on a memory card.
 //
-// Files are spread over 256 subdirectories by the top byte of the key. A single
-// directory holding ten thousand entries is slow to open on a memory card.
-static void content_key(const void *data, uint32_t size, GLsizei width, GLsizei height,
-                        GLint internalformat, GLenum type, uint32_t *lo, uint32_t *hi) {
-  // Two independent FNV-1a passes. A 32 bit key over thousands of textures
-  // would collide often enough to matter; 64 bits does not, and a collision
-  // that did happen still has to survive the header and checksum checks on
-  // restore before it could do any harm.
-  uint32_t a = 2166136261u, b = 0x811c9dc5u ^ 0x9e3779b9u;
-  const uint8_t *p = (const uint8_t *)data;
-  for (uint32_t i = 0; i < size; i++) {
-    a = (a ^ p[i]) * 16777619u;
-    b = (b + p[i]) * 2654435761u;
-  }
-  uint32_t params[5] = { (uint32_t)width, (uint32_t)height, (uint32_t)internalformat,
-                         (uint32_t)type, size };
-  for (int i = 0; i < 5; i++) {
-    a = (a ^ params[i]) * 16777619u;
-    b = (b + params[i]) * 2654435761u;
-  }
-  *lo = a;
-  *hi = b;
+// This used to be keyed by a hash of the texture's contents so the store could
+// be reused on a later run. That was worth doing when every upload was written;
+// now that only evicted textures are, there is little to reuse and the hash
+// cost a directory lookup per upload -- which is what made a second run no
+// faster than the first.
+static void texture_path(char *out, size_t out_size, GLuint id, uint32_t serial) {
+  snprintf(out, out_size, "%s/%02x/%u_%u.tex", TEXTURE_CACHE_DIR, (unsigned)(id & 0xff), id, serial);
 }
 
-static void texture_path(char *out, size_t out_size, uint32_t lo, uint32_t hi) {
-  snprintf(out, out_size, "%s/%02x/%08x%08x.tex", TEXTURE_CACHE_DIR, (unsigned)(hi >> 24), hi, lo);
-}
-
-static void texture_dir(char *out, size_t out_size, uint32_t hi) {
-  snprintf(out, out_size, "%s/%02x", TEXTURE_CACHE_DIR, (unsigned)(hi >> 24));
+static void texture_dir(char *out, size_t out_size, GLuint id) {
+  snprintf(out, out_size, "%s/%02x", TEXTURE_CACHE_DIR, (unsigned)(id & 0xff));
 }
 
 static void backup_release(TextureInfo *info) {
@@ -289,79 +270,79 @@ void texture_cache_shutdown(void) {
 
 // Writes one upload's record to the cache file. Returns 0 if it could not be, in
 // which case the texture simply stays resident rather than being lost.
+// Called for every upload. Records what the call was, and nothing else: no
+// file is created, no directory is touched, no bytes are copied. The pixels
+// are still in GPU memory and stay there until the texture is actually
+// evicted, which is the only moment a copy is worth making.
 static int backup_stage(TextureInfo *info, GLuint id, GLint level, GLsizei width, GLsizei height,
                         uint32_t size, GLint internalformat, GLenum format, GLenum type,
                         int compressed, const void *data) {
   if (!backup_ready || !data || size == 0)
     return 0;
-  if (sizeof(BackupRecord) + size > (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
+  if (level >= MAX_BACKUP_LEVELS)
     return 0;
-  if (level == 0 && size < TEXTURE_BACKUP_MIN_BYTES)
-    return 0; // see TEXTURE_BACKUP_MIN_BYTES: not worth a file, so kept resident
-
-  char path[160];
 
   if (level == 0) {
-    content_key(data, size, width, height, internalformat, type, &info->key_lo, &info->key_hi);
-    info->backup_bytes = 0;
     info->levels = 0;
-
-    texture_path(path, sizeof(path), info->key_lo, info->key_hi);
-    SceIoStat st;
-    if (sceIoGetstat(path, &st) >= 0 && st.st_size >= (SceOff)(sizeof(BackupRecord) + size)) {
-      // Already stored, by this run or a previous one. Nothing to write: adopt
-      // it and let restore validate the contents if it is ever needed.
-      info->backup_bytes = (uint32_t)st.st_size;
-      info->levels = 1; // at least the base level; restore counts what it finds
-      return 1;
-    }
-    char dir[160];
-    texture_dir(dir, sizeof(dir), info->key_hi);
-    sceIoMkdir(dir, 0777);
+    info->backup_bytes = 0;
+    info->internalformat = internalformat;
+    info->format = format;
+    info->type = type;
+    info->compressed_upload = (uint8_t)compressed;
   } else if (info->levels != (uint8_t)level) {
-    // Levels have to arrive in order and exactly once: replay walks them from
-    // zero, and a gap or a repeat would rebuild a different texture.
+    // Levels have to arrive in order and exactly once: restoring walks them
+    // from zero, and a gap or a repeat would rebuild a different texture.
     return 0;
-  } else {
-    texture_path(path, sizeof(path), info->key_lo, info->key_hi);
   }
 
-  if (info->backup_bytes + sizeof(BackupRecord) + size > (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
-    return 0; // more mipmap levels than we are willing to store
+  info->level[level].width = (uint16_t)width;
+  info->level[level].height = (uint16_t)height;
+  info->level[level].size = size;
+  info->levels++;
+  return 1;
+}
+
+// Takes the texture's pixels out of GPU memory and writes them to the card,
+// just before the memory holding them is handed back. vitaGL keeps a texture
+// in its own swizzled layout, so what is written is the GPU's copy rather than
+// the bytes the game originally uploaded, and restoring puts it back the same
+// way round.
+static int backup_capture(TextureInfo *info, GLuint id) {
+  if (!backup_ready || info->levels == 0 || info->resident_size == 0)
+    return 0;
+  if (info->resident_size > (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
+    return 0;
+  if (info->resident_size < TEXTURE_BACKUP_MIN_BYTES)
+    return 0; // too small to be worth a file; it simply stays resident
+
+  glBindTexture(GL_TEXTURE_2D, id);
+  const void *pixels = vglGetTexDataPointer(GL_TEXTURE_2D);
+  if (!pixels)
+    return 0;
+
+  char dir[160], path[160];
+  texture_dir(dir, sizeof(dir), id);
+  sceIoMkdir(dir, 0777);
+  texture_path(path, sizeof(path), id, info->serial);
 
   BackupRecord record;
   record.magic = BACKUP_MAGIC;
-  record.key_lo = info->key_lo;
-  record.key_hi = info->key_hi;
-  record.level = level;
-  record.width = width;
-  record.height = height;
-  record.size = size;
-  record.internalformat = internalformat;
-  record.format = format;
-  record.type = type;
-  record.compressed = compressed;
-  record.checksum = checksum(data, size);
+  record.id = id;
+  record.serial = info->serial;
+  record.bytes = info->resident_size;
+  record.checksum = checksum(pixels, info->resident_size);
 
-  // Written here on the uploading thread. This used to be staged into a queue
-  // and written by a background thread, which shared the file handle and the
-  // staging buffers with the renderer for a copy that is only read after an
-  // eviction. One file per texture and one writer removes all of that.
-  int flags = level == 0 ? (SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC)
-                         : (SCE_O_WRONLY | SCE_O_APPEND);
-  SceUID fd = sceIoOpen(path, flags, 0777);
+  SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
   if (fd < 0)
     return 0;
   int ok = sceIoWrite(fd, &record, sizeof(record)) == (int)sizeof(record) &&
-           sceIoWrite(fd, data, size) == (int)size;
+           sceIoWrite(fd, pixels, info->resident_size) == (int)info->resident_size;
   sceIoClose(fd);
   if (!ok) {
-    sceIoRemove(path); // a short write must not be mistaken for a usable store
+    sceIoRemove(path); // a short write must not be mistaken for a usable copy
     return 0;
   }
-
-  info->backup_bytes += sizeof(BackupRecord) + size;
-  info->levels++;
+  info->backup_bytes = info->resident_size;
   return 1;
 }
 
@@ -387,64 +368,50 @@ static int restore_texture(GLuint id) {
   TextureInfo *info = &textures[id];
 
   char path[160];
-  texture_path(path, sizeof(path), info->key_lo, info->key_hi);
+  texture_path(path, sizeof(path), id, info->serial);
   SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
   if (fd < 0)
     return 0;
-  int read_bytes = sceIoRead(fd, restore_scratch, (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024);
+  BackupRecord record;
+  int header = sceIoRead(fd, &record, sizeof(record));
+  int got = 0;
+  if (header == (int)sizeof(record) && record.magic == BACKUP_MAGIC && record.id == id &&
+      record.serial == info->serial && record.bytes == info->backup_bytes &&
+      record.bytes <= (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
+    got = sceIoRead(fd, restore_scratch, record.bytes);
   sceIoClose(fd);
-  if (read_bytes <= 0)
+  if (got != (int)record.bytes)
+    return 0;
+  if (checksum(restore_scratch, record.bytes) != record.checksum)
     return 0;
 
-  // Validate every record before touching GL: a half written file, or one that
-  // happens to collide on the key, must leave the placeholder alone rather than
-  // upload garbage. The level count comes from the file rather than from what
-  // we remember, so a store written by an earlier run is read on its own terms.
-  uint32_t offset = 0;
-  int levels = 0;
-  while (offset + sizeof(BackupRecord) <= (uint32_t)read_bytes) {
-    BackupRecord *record = (BackupRecord *)(restore_scratch + offset);
-    if (record->magic != BACKUP_MAGIC || record->key_lo != info->key_lo ||
-        record->key_hi != info->key_hi || record->level != (uint32_t)levels)
-      return 0;
-    if (offset + sizeof(BackupRecord) + record->size > (uint32_t)read_bytes)
-      return 0;
-    if (checksum(restore_scratch + offset + sizeof(BackupRecord), record->size) != record->checksum)
-      return 0;
-    offset += sizeof(BackupRecord) + record->size;
-    levels++;
-  }
-  if (levels == 0)
-    return 0;
-
+  // Allocate the texture again through the same call the game made, with no
+  // pixels, then put the GPU's own copy back into the buffer vitaGL hands out.
+  // Uploading the saved bytes as if they were the game's would send them
+  // through the swizzler a second time and scramble the texture.
+  // Replay every level the game uploaded, with no pixels. Allocating only the
+  // base level would leave a buffer smaller than the mip chain that was
+  // captured, and the copy below would run off the end of it.
   glBindTexture(GL_TEXTURE_2D, id);
-
-  offset = 0;
-  for (int i = 0; i < levels; i++) {
-    BackupRecord *record = (BackupRecord *)(restore_scratch + offset);
-    const void *payload = restore_scratch + offset + sizeof(BackupRecord);
-    if (record->compressed)
-      glCompressedTexImage2D(GL_TEXTURE_2D, record->level, record->internalformat, record->width,
-                             record->height, 0, record->size, payload);
+  for (int i = 0; i < info->levels; i++) {
+    if (info->compressed_upload)
+      glCompressedTexImage2D(GL_TEXTURE_2D, i, info->internalformat, info->level[i].width,
+                             info->level[i].height, 0, info->level[i].size, NULL);
     else
-      glTexImage2D(GL_TEXTURE_2D, record->level, record->internalformat, record->width,
-                   record->height, 0, record->format, record->type, payload);
-
-    // vitaGL frees the old data before it allocates, and reports failure by
-    // quietly not allocating. Left alone that is a texture whose descriptor
-    // points at memory the garbage collector is about to hand out, so put a real
-    // placeholder back rather than returning with a dangling one.
-    if (!texture_is_allocated()) {
-      install_placeholder(id);
-      return 0;
-    }
-    offset += sizeof(BackupRecord) + record->size;
+      glTexImage2D(GL_TEXTURE_2D, i, info->internalformat, info->level[i].width,
+                   info->level[i].height, 0, info->format, info->type, NULL);
   }
+
+  void *pixels = vglGetTexDataPointer(GL_TEXTURE_2D);
+  if (!pixels) {
+    install_placeholder(id);
+    return 0;
+  }
+  memcpy(pixels, restore_scratch, record.bytes);
 
   // Eviction forced the sampler off mipmaps because the placeholder had none.
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, info->min_filter);
 
-  info->levels = (uint8_t)levels;
   info->size = info->resident_size;
   tracked_bytes += info->resident_size;
   info->evicted = 0;
@@ -514,6 +481,17 @@ static void evict_texture(GLuint id) {
   evicted_count++;
   TextureInfo *info = &textures[id];
 
+  // Take the copy first, because install_placeholder is what releases the
+  // memory the pixels are sitting in. If it cannot be taken -- too small to be
+  // worth a file, no room on the card, a write that failed -- the texture stays
+  // exactly where it is. Dropping one we cannot put back is how the ground and
+  // the buildings went black, and there is no pressure that makes it worth it.
+  if (!backup_capture(info, id)) {
+    info->unbacked = 1;
+    evicted_count--;
+    return;
+  }
+
   install_placeholder(id);
 
   tracked_bytes -= info->size;
@@ -529,11 +507,10 @@ static int is_bound(GLuint id) {
 }
 
 // Evicts least recently used textures until we are under target_bytes, leaving
-// anything used within the last min_idle_frames frames alone. When lossy is
-// false only textures we can read back again are touched. Returns how many
-// candidates it found, so the caller can tell "nothing to evict" from "hit the
-// per-frame cap".
-static int evict_textures(size_t target_bytes, uint32_t min_idle_frames, int lossy) {
+// anything used within the last min_idle_frames frames alone, and only ones we
+// can read back again. Returns how many candidates it found, so the caller can
+// tell "nothing to evict" from "hit the per-frame cap".
+static int evict_textures(size_t target_bytes, uint32_t min_idle_frames) {
   EvictionCandidate candidates[TEXTURE_EVICTIONS_PER_FRAME];
   int num_candidates = 0;
 
@@ -550,7 +527,7 @@ static int evict_textures(size_t target_bytes, uint32_t min_idle_frames, int los
     // binding it again, so we would have no moment at which to put it back.
     if (is_bound(id))
       continue;
-    if (!lossy && !is_restorable(info))
+    if (!is_restorable(info))
       continue;
 
     int i;
@@ -581,8 +558,8 @@ static int evict_textures(size_t target_bytes, uint32_t min_idle_frames, int los
 
   glBindTexture(GL_TEXTURE_2D, previous);
 
-  debugPrintf("texture cache: evicted %d textures%s, %d KB still in use\n",
-              evicted, lossy ? " (no copy on disk)" : "", (int)(tracked_bytes / 1024));
+  debugPrintf("texture cache: evicted %d textures, %d KB still in use\n",
+              evicted, (int)(tracked_bytes / 1024));
   return num_candidates;
 }
 
@@ -623,7 +600,7 @@ void texture_cache_tick(void) {
     size_t needed = headroom - free_now;
     target = target > needed ? target - needed : 0;
   }
-  evict_textures(target, TEXTURE_IDLE_FRAMES, 0);
+  evict_textures(target, TEXTURE_IDLE_FRAMES);
 
   if (tracked_bytes <= budget && vitagl_free_memory() >= headroom) {
     starved_frames = 0;

@@ -15,9 +15,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <stdlib.h>
 #include "fake_vitagl.h"
 
 size_t fake_slot_bytes[FAKE_SLOTS];
+void *fake_slot_data[FAKE_SLOTS];
 uint32_t fake_slot_content[FAKE_SLOTS];
 int fake_slot_alive[FAKE_SLOTS];
 GLuint fake_bound;
@@ -36,7 +38,15 @@ void fake_reset(size_t free_memory) {
 }
 
 uint32_t fake_fingerprint_of(uint32_t tag) { return tag; }
-uint32_t fake_sampled(GLuint id) { return fake_slot_content[id]; }
+// What a draw would sample. The bytes in the driver's buffer are the truth,
+// not what was passed to the upload call: a cache that evicts a texture and
+// writes those bytes back must be indistinguishable from one that never
+// touched it.
+uint32_t fake_sampled(GLuint id) {
+  if (fake_slot_data[id])
+    return *(uint32_t *)fake_slot_data[id];
+  return fake_slot_content[id];
+}
 
 // The placeholder vitaGL leaves when handed a NULL pointer: filled with 0xFF.
 #define PLACEHOLDER_CONTENT 0xFFFFFFFFu
@@ -51,6 +61,8 @@ static uint32_t fingerprint(const void *data, size_t size) {
 
 static void set_slot(GLuint id, size_t size, uint32_t content) {
   fake_free_memory += fake_slot_bytes[id];
+  free(fake_slot_data[id]);
+  fake_slot_data[id] = NULL;
   fake_slot_bytes[id] = size;
   assert(fake_free_memory >= size && "driver ran out of memory: this is the crash being fixed");
   fake_free_memory -= size;
@@ -67,6 +79,8 @@ void glGenTextures(GLsizei n, GLuint *res) {
       if (!fake_slot_alive[slot]) { id = slot; break; }
     assert(id && "ran out of texture names");
     fake_slot_alive[id] = 1;
+    free(fake_slot_data[id]);
+    fake_slot_data[id] = NULL;
     fake_slot_bytes[id] = 0;
     fake_slot_content[id] = 0;
     res[i] = id;
@@ -118,9 +132,24 @@ void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalFormat, G
 }
 
 // Non-NULL exactly when the driver holds data for the bound texture, which is
-// how the cache tells an accepted upload from a rejected one.
+// how the cache tells an accepted upload from a rejected one. It has to be a
+// real buffer of the slot's size now: the cache reads the texture back through
+// this pointer when it evicts, and writes back through it when it restores,
+// the way vitaGL hands out its own swizzled copy.
 void *vglGetTexDataPointer(GLenum target) {
-  return fake_slot_bytes[fake_bound] ? (void *)(uintptr_t)fake_bound : NULL;
+  if (!fake_slot_bytes[fake_bound])
+    return NULL;
+  if (!fake_slot_data[fake_bound]) {
+    fake_slot_data[fake_bound] = malloc(fake_slot_bytes[fake_bound]);
+    // Fill with the slot's content marker so a round trip through the cache is
+    // checkable: what comes back must be what went in.
+    if (fake_slot_data[fake_bound]) {
+      memset(fake_slot_data[fake_bound], 0, fake_slot_bytes[fake_bound]);
+      if (fake_slot_bytes[fake_bound] >= sizeof(uint32_t))
+        *(uint32_t *)fake_slot_data[fake_bound] = fake_slot_content[fake_bound];
+    }
+  }
+  return fake_slot_data[fake_bound];
 }
 
 // Mirrors the real one, including the trap: VGL_MEM_ALL is the enum terminator

@@ -112,11 +112,6 @@
 // the largest texture, or the biggest textures -- the ones most worth evicting
 // -- only ever get a copy when the queue happens to be completely empty.
 #define TEXTURE_BACKUP_STAGING_KB (4 * TEXTURE_BACKUP_MAX_KB)
-// Frames the lossless pass may fail to reach the budget before we accept losing
-// textures that have no copy. vitaGL frees texture memory on its garbage
-// collector several frames after we drop a texture, so a shorter window would
-// escalate against memory that is already on its way back.
-#define TEXTURE_LOSSY_AFTER_FRAMES 60
 // The writer thread only ever touches the memory card, so it runs below every
 // thread the game creates (which sit at 64-65) and shares the streaming core.
 // How long an upload may wait for the writer to make room. While we are far

@@ -28,12 +28,15 @@ int main(void) {
 
   const size_t budget = (size_t)TEXTURE_BUDGET_MB * MB;
 
-  // A texture is written on the thread that uploaded it, so by the time the
-  // upload call returns its file is on the card and it is reloadable. There is
-  // no window any more where it is tracked but not yet written.
+  // Nothing is copied at upload time any more -- the bytes are read back out of
+  // the GPU at the moment a texture is actually dropped. What an upload has to
+  // leave behind is the description of the upload itself: the level sizes and
+  // formats needed to rebuild the texture later. Once that is recorded the
+  // texture is evictable, without a single byte having touched the card.
   GLuint pending = tex_upload(0x1234u, 512, 512, TEX_BYTES);
-  assert(is_restorable(&textures[pending]) && "must be reloadable as soon as it is uploaded");
-  printf("write timing : reloadable as soon as the upload returns  OK\n");
+  assert(is_restorable(&textures[pending]) && "an upload must leave enough behind to rebuild it");
+  assert(fake_store_files() == 0 && "an upload must not write anything");
+  printf("write timing : evictable after upload, nothing written yet  OK\n");
 
   // A card with no room to spare must not get a backing store at all -- filling
   // it would take the game's own saves and .obb indexes down with it.
@@ -54,7 +57,7 @@ int main(void) {
     texture_cache_tick();
     uploaded++;
   }
-  frames(TEXTURE_LOSSY_AFTER_FRAMES + TEXTURE_IDLE_FRAMES + 200);
+  frames(TEXTURE_IDLE_FRAMES + 260);
   printf("  %zu MB in use, %d evicted\n", tracked_bytes / MB, count_evicted());
   assert(count_evicted() == 0 && "must not lose textures it cannot get back while merely over budget");
 
@@ -70,7 +73,7 @@ int main(void) {
     texture_cache_tick();
     uploaded++;
   }
-  frames(TEXTURE_LOSSY_AFTER_FRAMES + TEXTURE_IDLE_FRAMES + 400);
+  frames(TEXTURE_IDLE_FRAMES + 460);
   printf("  after pushing well past budget: %zu MB in use, %d evicted\n",
          tracked_bytes / MB, count_evicted());
   assert(count_evicted() == 0 && "must never drop a texture it cannot restore");
