@@ -156,7 +156,10 @@ static void remember_block(void *ptr, size_t size, uint32_t caller) {
       b->ptr = ptr;
       b->size = (uint32_t)size;
       b->caller = caller;
-      if (!(caller & SAMPLED_FLAG))
+      // The game's large blocks only. Sampled blocks belong to the small
+      // totals, and the eboot has its own, so counting either here made the
+      // game's figure open at 68 MB before it had allocated anything.
+      if (!(caller & SAMPLED_FLAG) && caller < EBOOT_TEXT_BASE)
         large_live_bytes += size;
       CallerTotals *c = caller_slot(caller);
       if (c) {
@@ -183,7 +186,7 @@ static size_t forget_block(void *ptr, uint32_t *caller_out) {
       size_t size = b->size;
       if (caller_out)
         *caller_out = b->caller;
-      if (!(b->caller & SAMPLED_FLAG))
+      if (!(b->caller & SAMPLED_FLAG) && b->caller < EBOOT_TEXT_BASE)
         large_live_bytes -= size;
       CallerTotals *c = caller_slot(b->caller);
       if (c && c->caller == b->caller) {
@@ -344,8 +347,13 @@ void alloc_trace_report(void) {
       // second was never printed.
       if (c->total_count == 0 || c->caller >= EBOOT_TEXT_BASE)
         continue;
+      // Skip what has already been printed: anything bigger, or the same size
+      // with a call site at or before the last one shown. Comparing the other
+      // way round skipped every tie rather than stepping through them, which is
+      // how a 68 MB total came to list 36 MB of holders -- the two .obb caches
+      // are exactly the same size.
       if (c->live_bytes > ceiling_bytes ||
-          (c->live_bytes == ceiling_bytes && c->caller >= ceiling_caller))
+          (c->live_bytes == ceiling_bytes && c->caller <= ceiling_caller))
         continue;
       if (!best || c->live_bytes > best->live_bytes ||
           (c->live_bytes == best->live_bytes && c->caller < best->caller))
@@ -442,7 +450,17 @@ static void account_free(void *ptr) {
   uint32_t caller = 0;
   size_t reclaimed = forget_block(ptr, &caller);
   if (reclaimed) {
-    if (caller >= EBOOT_TEXT_BASE) {
+    if (caller & SAMPLED_FLAG) {
+      // A sampled block is a small block that also happens to be in the table.
+      // Its bytes are counted in the small totals, and this is the only path
+      // that frees it -- forget() is never reached from here, which is where
+      // the previous attempt at this fix was put. Left as it was, one small
+      // block in every sixty-four was counted in and never out, and the small
+      // total grew forever: a fabricated leak in the exact figure being
+      // investigated.
+      __atomic_sub_fetch(&small_live_bytes, reclaimed, __ATOMIC_RELAXED);
+      __atomic_sub_fetch(&small_live_count, 1, __ATOMIC_RELAXED);
+    } else if (caller >= EBOOT_TEXT_BASE) {
       __atomic_sub_fetch(&loader_live_bytes, reclaimed, __ATOMIC_RELAXED);
       __atomic_sub_fetch(&loader_live_count, 1, __ATOMIC_RELAXED);
     }
@@ -463,8 +481,13 @@ void alloc_trace_loader_report(void) {
       CallerTotals *c = &callers[i];
       if (c->total_count == 0 || c->caller < EBOOT_TEXT_BASE)
         continue;
+      // Skip what has already been printed: anything bigger, or the same size
+      // with a call site at or before the last one shown. Comparing the other
+      // way round skipped every tie rather than stepping through them, which is
+      // how a 68 MB total came to list 36 MB of holders -- the two .obb caches
+      // are exactly the same size.
       if (c->live_bytes > ceiling_bytes ||
-          (c->live_bytes == ceiling_bytes && c->caller >= ceiling_caller))
+          (c->live_bytes == ceiling_bytes && c->caller <= ceiling_caller))
         continue;
       if (!best || c->live_bytes > best->live_bytes ||
           (c->live_bytes == best->live_bytes && c->caller < best->caller))
