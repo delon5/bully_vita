@@ -52,6 +52,16 @@
 // build never evicts anything, so this is what keeps it inside what vitaGL can
 // hand out on a Vita (128MB of CDRAM plus whatever is left of main RAM once the
 // game heap above has been carved out).
+// Reclaim to keep this much of vitaGL's memory free, as a percentage of what
+// it had when the game started drawing. A byte budget cannot work on its own:
+// it only counts textures this cache tracks, while framebuffers, vertex
+// buffers, shader programs, render targets and untracked textures come out of
+// the same pools -- so CDRAM reached zero on hardware while the counter still
+// read comfortably under budget. Free memory counts all of it.
+#define TEXTURE_FREE_HEADROOM_PERCENT 25
+
+// Still capped in bytes as well, so a scene that never pressures the pools
+// does not sit on an unbounded pile of textures it stopped drawing with.
 #define TEXTURE_BUDGET_MB 64
 // Evict regardless of the budget once vitaGL has less than this much free, so
 // that memory pressure coming from anywhere else does not kill us either.

@@ -96,6 +96,7 @@ static uint32_t frame_counter = 1;
 static size_t tracked_bytes = 0;
 static uint32_t upload_serial = 1;
 static uint32_t starved_frames; // frames the lossless pass has failed to keep up
+static size_t pool_total; // vitaGL's free memory once it was up, sampled on the first tick
 // Counted for the trace: this is the first time any of this has run on hardware.
 static uint32_t evicted_count, restored_count, restore_failed_count;
 
@@ -597,16 +598,32 @@ void texture_cache_tick(void) {
 
   const size_t budget = (size_t)TEXTURE_BUDGET_MB * 1024 * 1024;
 
-  if (tracked_bytes <= budget) {
+  // How much vitaGL had to give out once it was up and the game had started
+  // drawing. Sampled here rather than at init, which runs before vglInit.
+  size_t free_now = vitagl_free_memory();
+  if (!pool_total)
+    pool_total = free_now;
+  size_t headroom = pool_total / 100 * TEXTURE_FREE_HEADROOM_PERCENT;
+
+  if (tracked_bytes <= budget && free_now >= headroom) {
     starved_frames = 0;
     return;
   }
 
-  // Trim back below the budget, but only touch textures the game has left alone
-  // long enough that they cannot be part of what it is currently drawing.
-  evict_textures(budget - budget / 8, TEXTURE_IDLE_FRAMES, 0);
+  // Trim back, but only touch textures the game has left alone long enough that
+  // they cannot be part of what it is currently drawing. Aim under both limits:
+  // the byte budget for a scene that simply hoards, and the headroom for one
+  // whose pressure comes from everything else sharing these pools.
+  size_t target = tracked_bytes;
+  if (tracked_bytes > budget)
+    target = budget - budget / 8;
+  if (free_now < headroom) {
+    size_t needed = headroom - free_now;
+    target = target > needed ? target - needed : 0;
+  }
+  evict_textures(target, TEXTURE_IDLE_FRAMES, 0);
 
-  if (tracked_bytes <= budget) {
+  if (tracked_bytes <= budget && vitagl_free_memory() >= headroom) {
     starved_frames = 0;
     return;
   }
