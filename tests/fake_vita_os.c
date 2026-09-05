@@ -34,12 +34,40 @@ int traceLog(char *text, ...) { (void)text; return 0; }
 // has not reached the card yet" is a state the test can actually observe.
 volatile int fake_stall_writes;
 
+// Textures live one per file in hashed subdirectories now, so the mapping has
+// to keep the path shape rather than flattening to a basename. Everything under
+// the game's data directory is rooted at TEXCACHE_DIR.
 static const char *host_path(const char *vita_path) {
   static char buf[512];
   const char *base = getenv("TEXCACHE_DIR");
-  const char *slash = strrchr(vita_path, '/');
-  snprintf(buf, sizeof(buf), "%s/%s", base ? base : ".", slash ? slash + 1 : vita_path);
+  const char *rel = strstr(vita_path, "Bully/");
+  if (rel)
+    rel += strlen("Bully/");
+  else {
+    const char *slash = strrchr(vita_path, '/');
+    rel = slash ? slash + 1 : vita_path;
+  }
+  snprintf(buf, sizeof(buf), "%s/%s", base ? base : ".", rel);
   return buf;
+}
+
+// What the store is doing, so a test can assert on it rather than on an
+// allocator's internals.
+static unsigned store_writes;
+unsigned fake_store_writes(void) { return store_writes; }
+
+unsigned fake_store_files(void) {
+  const char *base = getenv("TEXCACHE_DIR");
+  char cmd[512];
+  snprintf(cmd, sizeof(cmd), "find '%s' -name '*.tex' 2>/dev/null | wc -l", base ? base : ".");
+  FILE *p = popen(cmd, "r");
+  unsigned n = 0;
+  if (p) {
+    if (fscanf(p, "%u", &n) != 1)
+      n = 0;
+    pclose(p);
+  }
+  return n;
 }
 
 SceUID sceIoOpen(const char *file, int flags, SceMode mode) {
@@ -49,6 +77,9 @@ SceUID sceIoOpen(const char *file, int flags, SceMode mode) {
   else f |= O_RDONLY;
   if (flags & SCE_O_CREAT) f |= O_CREAT;
   if (flags & SCE_O_TRUNC) f |= O_TRUNC;
+  if (flags & SCE_O_APPEND) f |= O_APPEND;
+  if (f & O_CREAT)
+    store_writes++;
   int fd = open(host_path(file), f, 0666);
   return fd < 0 ? -1 : fd;
 }
@@ -68,7 +99,7 @@ int sceIoRead(SceUID fd, void *data, SceSize size) {
   return (int)got;
 }
 SceOff sceIoLseek(SceUID fd, SceOff offset, int whence) { return lseek(fd, offset, SEEK_SET); }
-int sceIoMkdir(const char *dir, SceMode mode) { return mkdir(host_path(dir), 0777); }
+int sceIoMkdir(const char *dir, SceMode mode) { (void)mode; return mkdir(host_path(dir), 0777); }
 int sceIoRemove(const char *file) { return unlink(host_path(file)); }
 
 // Free space on the card. Tests set fake_card_free to exercise both the
@@ -84,7 +115,14 @@ int sceAppMgrGetDevInfo(const char *dev, uint64_t *max_size, uint64_t *free_size
 // that it is not there -- unless a test deliberately creates it.
 int sceIoGetstat(const char *file, SceIoStat *out) {
   struct stat probe;
-  return stat(host_path(file), &probe) == 0 ? 0 : -1;
+  if (stat(host_path(file), &probe) != 0)
+    return -1;
+  // st_size matters: the cache uses it to decide whether a texture it is about
+  // to write is already stored, so leaving it unset made every hit look like a
+  // miss.
+  if (out)
+    out->st_size = probe.st_size;
+  return 0;
 }
 
 #define MAX_SEMA 8

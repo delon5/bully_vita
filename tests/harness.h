@@ -45,6 +45,9 @@ static void tex_reupload(GLuint id, uint32_t tag, GLsizei width, GLsizei height,
                              0, size, source_bytes);
 }
 
+unsigned fake_store_files(void);
+unsigned fake_store_writes(void);
+
 // Backups are written on the uploading thread now, so a record is on disk by
 // the time the upload call returns and there is nothing to wait for. Kept so
 // the tests still read as "upload, let it settle, then assert".

@@ -54,33 +54,38 @@ int main(void) {
   assert(!textures[bad].tracked && "a rejected upload must not be tracked");
   printf("bad uploads  : rejected, not accounted                OK\n");
 
-  // The cache file only ever appended, so a long session -- the exact case this
-  // feature exists for -- walked it to its cap, after which nothing could be
-  // copied and everything degraded to white.
+  // The store used to be one file carved into extents, and re-uploading a
+  // texture appended rather than reusing its space, so a long session -- the
+  // exact case this feature exists for -- walked the file to its cap and
+  // everything after that degraded to white. Each texture has its own file now,
+  // named by its contents, so re-uploading the same bytes rewrites one path
+  // instead of consuming more of the card.
   GLuint churn[64];
   for (int i = 0; i < 64; i++) {
     churn[i] = tex_upload(0xF00D0000u + i, 512, 512, TEX_BYTES);
     drain();
   }
-  uint32_t after_one_round = file_cursor;
+  uint32_t after_one_round = fake_store_files();
   for (int round = 0; round < 40; round++)
     for (int i = 0; i < 64; i++) {
       tex_reupload(churn[i], 0xF00D0000u + i, 512, 512, TEX_BYTES);
       drain();
     }
-  printf("extent reuse : %u KB after 1 round, %u KB after 41    OK\n", after_one_round / 1024,
-         file_cursor / 1024);
-  assert(file_cursor == after_one_round && "re-uploads must reuse their extent, not append");
+  printf("store growth : %u files after 1 round, %u after 41     OK\n", after_one_round,
+         fake_store_files());
+  assert(fake_store_files() == after_one_round &&
+         "re-uploading the same contents must not add files");
 
-  // And a deleted texture must give its extent back.
-  for (int i = 0; i < 64; i++)
-    glDeleteTexturesHook(1, &churn[i]);
+  // A texture whose contents the store already holds needs no write at all,
+  // which is what makes keeping the store across runs worth doing.
+  uint32_t writes_before = fake_store_writes();
   for (int i = 0; i < 64; i++) {
-    churn[i] = tex_upload(0xBEEF0000u + i, 512, 512, TEX_BYTES);
+    tex_reupload(churn[i], 0xF00D0000u + i, 512, 512, TEX_BYTES);
     drain();
   }
-  assert(file_cursor == after_one_round && "freed extents must be reused");
-  printf("extent free  : still %u KB after delete and realloc   OK\n", file_cursor / 1024);
+  assert(fake_store_writes() == writes_before &&
+         "a texture already in the store must not be written again");
+  printf("store reuse  : no writes for contents already stored   OK\n");
 
   // A texture still bound to a unit can be drawn without the game ever binding
   // it again, so there would be no moment at which to restore it.

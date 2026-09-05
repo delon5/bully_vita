@@ -28,27 +28,21 @@ int main(void) {
 
   const size_t budget = (size_t)TEXTURE_BUDGET_MB * MB;
 
-  // A texture whose copy is still sitting in the queue has not reached the card
-  // and must not be treated as reloadable yet.
-  __atomic_store_n(&fake_stall_writes, 1, __ATOMIC_RELEASE); // hold the writer
+  // A texture is written on the thread that uploaded it, so by the time the
+  // upload call returns its file is on the card and it is reloadable. There is
+  // no window any more where it is tracked but not yet written.
   GLuint pending = tex_upload(0x1234u, 512, 512, TEX_BYTES);
-  assert(!is_restorable(&textures[pending]) && "must not be reloadable before it is written");
-  __atomic_store_n(&fake_stall_writes, 0, __ATOMIC_RELEASE);
-  drain();
-  frames(1);
-  assert(is_restorable(&textures[pending]) && "must become reloadable once written");
-  printf("write queue  : not reloadable until written to the card  OK\n");
+  assert(is_restorable(&textures[pending]) && "must be reloadable as soon as it is uploaded");
+  printf("write timing : reloadable as soon as the upload returns  OK\n");
 
   // A card with no room to spare must not get a backing store at all -- filling
   // it would take the game's own saves and .obb indexes down with it.
   {
-    uint32_t limit_when_roomy = file_limit;
-    backup_ready = 0; file_limit = 0; file_cursor = 0;
+    backup_ready = 0;
     fake_card_free = 200ull * 1024 * 1024;   // less than the reserve
     texture_cache_init();
     assert(!backup_ready && "a nearly full card must not get a backing store");
-    printf("full card    : no backing store taken (had %u MB when roomy)  OK\n",
-           limit_when_roomy / (1024 * 1024));
+    printf("full card    : no store taken when the card is nearly full  OK\n");
   }
   printf("backing store disabled\n");
 
