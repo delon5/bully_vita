@@ -166,7 +166,10 @@ int ProcessEvents(void) {
   // that is running but never drawing from one that is not running at all.
   static int events;
   if (events % 600 == 0)
-    traceLog("loop: ProcessEvents %d, movie player state %d\n", events, movie_player_state());
+    traceLog("loop: ProcessEvents %d, movie player state %d, vitaGL ram %d KB cdram %d KB phycont %d KB\n",
+             events, movie_player_state(),
+             (int)(vglMemFree(VGL_MEM_RAM) / 1024), (int)(vglMemFree(VGL_MEM_VRAM) / 1024),
+             (int)(vglMemFree(VGL_MEM_PHYCONT) / 1024));
   events++;
 #endif
   movie_draw_frame();
@@ -626,7 +629,19 @@ static void glAttachShaderTrace(GLuint p, GLuint s) { TRACE_FIRST("glAttachShade
 static void glUseProgramTrace(GLuint p) { TRACE_FIRST("glUseProgram"); glUseProgram(p); }
 static void glClearTrace(GLbitfield m) { TRACE_FIRST("glClear"); glClear(m); }
 static void glViewportTrace(GLint x, GLint y, GLsizei w, GLsizei h) { TRACE_FIRST("glViewport"); glViewport(x, y, w, h); }
-static void glBufferDataTrace(GLenum t, GLsizeiptr sz, const void *d, GLenum u) { TRACE_FIRST("glBufferData"); glBufferData(t, sz, d, u); }
+static void glBufferDataTrace(GLenum t, GLsizeiptr sz, const void *d, GLenum u) {
+  // Logged on both sides: vitaGL's allocation failure path waits on the
+  // garbage collector's semaphore and sleeps a second per retry, so a call
+  // that is entered and never left is a thread parked inside vitaGL rather
+  // than a game that decided to stop.
+  static int calls;
+  int n = calls++;
+  if (n < 3)
+    traceLog("gl: glBufferData %d entering, %d bytes\n", n, (int)sz);
+  glBufferData(t, sz, d, u);
+  if (n < 3)
+    traceLog("gl: glBufferData %d returned\n", n);
+}
 static void glVertexAttribPointerTrace(GLuint i, GLint sz, GLenum t, GLboolean n, GLsizei st, const void *p) { TRACE_FIRST("glVertexAttribPointer"); glVertexAttribPointer(i, sz, t, n, st, p); }
 static void glGetProgramivTrace(GLuint p, GLenum pn, GLint *v) { TRACE_FIRST("glGetProgramiv"); glGetProgramiv(p, pn, v); }
 #endif
