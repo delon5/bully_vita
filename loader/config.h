@@ -85,6 +85,18 @@
 // the texture cache.
 #define STREAMING_DISABLE_PATH DATA_PATH "/" "no_streamfix"
 
+// How long a vertex buffer must go unlocked before the loader takes back the
+// CPU-side copy of its data. The game keeps that copy for the life of the
+// buffer so it can be locked again without reading back from the GPU, which is
+// a fair trade on a phone and is the largest single leak here.
+//
+// Long enough that anything the game touches regularly is never swept -- those
+// are the buffers where handing back fresh memory could matter, since a buffer
+// filled completely before it is unlocked does not care.
+#define VERTEX_CACHE_IDLE_FRAMES 600
+// An empty file here turns it off.
+#define VERTEX_CACHE_DISABLE_PATH DATA_PATH "/" "no_vertexfix"
+
 // How long a texture must go undrawn before vitaGL's own cache is allowed to
 // write it out and free it, in frames. vitaGL defaults to 3600 -- two minutes
 // at the frame rate this runs at -- and it only reclaims when an allocation has

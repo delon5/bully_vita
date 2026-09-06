@@ -20,6 +20,7 @@
 #include "config.h"
 #include "so_util.h"
 #include "texture_cache.h"
+#include "vertex_cache.h"
 
 enum MethodIDs {
   UNKNOWN = 0,
@@ -266,6 +267,7 @@ int swapBuffers(void) {
   frames_swapped++;
 
   texture_cache_tick();
+  vertex_cache_tick();
   vglSwapBuffers(GL_FALSE);
   return 1;
 }

@@ -22,6 +22,7 @@ add_executable(Bully
   loader/main.c
   loader/alloc_trace.c
   loader/streaming_patch.c
+  loader/vertex_cache.c
   loader/dialog.c
   loader/fios.c
   loader/so_util.c

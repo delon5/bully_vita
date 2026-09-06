@@ -56,6 +56,7 @@
 #include "openal_patch.h"
 #include "alloc_trace.h"
 #include "streaming_patch.h"
+#include "vertex_cache.h"
 #include "texture_cache.h"
 
 #include "sha1.h"
@@ -278,6 +279,12 @@ int ProcessEvents(void) {
     // vitaGL's fourth pool. Reported because it is a real pool that textures
     // fall back to, and nothing here has ever looked at it.
     traceLog("vgl: budget pool %d MB free\n", (int)(vglMemFree(VGL_MEM_BUDGET) / (1024 * 1024)));
+
+    VertexCacheStats vertex;
+    vertex_cache_stats(&vertex);
+    traceLog("vertex: %s, %d buffers, %d KB held, %d KB released, %d relocked\n",
+             vertex.installed ? "on" : "OFF", vertex.tracked, vertex.held_kb,
+             vertex.released_kb, vertex.relocked);
 
     StreamingStats stream;
     streaming_patch_stats(&stream);
@@ -549,6 +556,7 @@ void patch_game(void) {
   hook_addr(so_symbol(&bully_mod, "_Znaj"), (uintptr_t)&bully_operator_new_array);
 #endif
   streaming_patch_init();
+  vertex_cache_init();
   hook_addr(so_symbol(&bully_mod, "__cxa_guard_acquire"), (uintptr_t)&__cxa_guard_acquire);
   hook_addr(so_symbol(&bully_mod, "__cxa_guard_release"), (uintptr_t)&__cxa_guard_release);
 
