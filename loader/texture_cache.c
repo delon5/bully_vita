@@ -886,6 +886,25 @@ void texture_cache_tick(void) {
   size_t emergency = pool_start[1] / 100 * TEXTURE_POOL_EMERGENCY_PERCENT;
   card_writes_allowed =
       card_tier_enabled && (free_now[1] < emergency || blocked_frames >= TEXTURE_BLOCKED_FRAMES);
+
+  // Stop rescanning once it is established that there is nowhere to put
+  // anything.
+  //
+  // The scan walks every texture the game has ever named -- thirty thousand of
+  // them, two megabytes of struct -- to build a candidate list, and then places
+  // none of them because the heap tier is full and the card is shut. A session
+  // with the card tier shut did that for 3.4 million consecutive frames and
+  // counted 11736069 deferrals doing it: the cache burned a full scan a frame,
+  // for an hour, to reach the same answer every time.
+  //
+  // Being blocked normally opens the card, which resolves it. This only bites
+  // when the card cannot open at all, so throttle rather than stop: one scan in
+  // thirty still notices the moment conditions change.
+  static uint32_t idle_scan;
+  if (blocked_frames >= TEXTURE_BLOCKED_FRAMES && !card_writes_allowed &&
+      ++idle_scan % TEXTURE_BLOCKED_RESCAN_FRAMES)
+    return;
+
   size_t before = tracked_bytes;
   evict_textures(target, TEXTURE_IDLE_FRAMES);
   // Wanted to reclaim and got nothing: the heap tier is full or the game has

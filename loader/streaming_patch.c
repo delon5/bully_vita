@@ -59,8 +59,8 @@ static void (*update_memory_used)(void);
 static uint32_t call_count, refusal_count, backoff_count;
 // Exposed so the trace can tell "the gate stopped refusing" from "the game
 // stopped asking". A whole session read 160 refusals from start to finish and
-// there was no way to tell which of the two had happened.
-static uint32_t backoff_remaining;
+// there was no way to tell which of the two had happened. It was the second.
+static uint32_t backoff_until_frame;
 static size_t budget;
 static int installed;
 
@@ -144,7 +144,19 @@ static void calibrate(size_t used) {
 // accepting that the game has nothing more it can usefully give up.
 #define REFUSALS_WITHOUT_PROGRESS 8
 #define PROGRESS_BYTES (256 * 1024)
-#define BACKOFF_CALLS 4096 // calls, deliberately: long enough to load an area
+// Frames, and this is the correction. It used to be 4096 calls, "deliberately:
+// long enough to load an area" -- and the new call counter shows what that
+// actually bought. Over a session of 3.9 million frames the game asked this
+// question 2084 times in total, and the backoff still had 2950 calls left to
+// run when the session ended. One backoff turned the gate off for longer than a
+// whole session, which is exactly what the previous trace was showing when it
+// read a flat 160 refusals for 7.8 million frames and there was no way to tell
+// whether the gate had stopped refusing or the game had stopped asking.
+//
+// Frames cannot do that: the game's request rate has no bearing on how long the
+// gate stays out of the way, and this is thirty seconds at thirty frames a
+// second -- long enough to load an area, short enough to be temporary.
+#define BACKOFF_FRAMES 900
 
 static int should_refuse(void) {
   static size_t used_at_last_progress;
@@ -167,9 +179,10 @@ static int should_refuse(void) {
   }
 
   // Backing off after a fruitless run, so the game can put the world back.
-  if (backoff_remaining) {
-    backoff_remaining--;
-    return 0;
+  if (backoff_until_frame) {
+    if ((uint32_t)frames_swapped < backoff_until_frame)
+      return 0;
+    backoff_until_frame = 0;
   }
 
   if (!used_at_last_progress || used + PROGRESS_BYTES < used_at_last_progress) {
@@ -191,7 +204,7 @@ static int should_refuse(void) {
     // Refusing has stopped helping. Let the game load what it needs.
     fruitless = 0;
     used_at_last_progress = 0;
-    backoff_remaining = BACKOFF_CALLS;
+    backoff_until_frame = (uint32_t)frames_swapped + BACKOFF_FRAMES;
     backoff_count++;
     return 0;
   }
@@ -249,6 +262,8 @@ void streaming_patch_stats(StreamingStats *out) {
   out->calls = (int)call_count;
   out->refusals = (int)refusal_count;
   out->backoffs = (int)backoff_count;
-  out->backoff_left = (int)backoff_remaining;
+  out->backoff_left = backoff_until_frame > (uint32_t)frames_swapped
+                          ? (int)(backoff_until_frame - (uint32_t)frames_swapped)
+                          : 0;
   out->installed = installed;
 }

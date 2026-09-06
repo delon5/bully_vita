@@ -266,31 +266,41 @@ void game_memory_report(void) {
   char used[512];
   char moved[512];
   int u = 0, m = 0;
-  uint32_t total = 0, blocks = 0;
+  int32_t total = 0, blocks = 0;
 
   for (int id = 0; id < MEM_CATEGORIES; id++) {
-    uint32_t bytes = alloced_bytes[id];
-    uint32_t count = alloced_blocks[id];
+    // Signed, because they go negative. The first trace with this in it read
+    // "24=4193657K/4294965844", which is -647 KB in -1452 blocks printed as
+    // unsigned -- the engine frees against these categories more often than it
+    // allocates into them, so the counters run below zero and the report was
+    // four gigabytes of nonsense in the middle of a line meant to be read at a
+    // glance. Exactly the kind of number that has cost days already.
+    int32_t bytes = (int32_t)alloced_bytes[id];
+    int32_t count = (int32_t)alloced_blocks[id];
     total += bytes;
     blocks += count;
 
     if (bytes && u < (int)sizeof(used) - 32)
-      u += snprintf(used + u, sizeof(used) - u, " %d%s=%uK/%u", id,
-                    is_streamed_category(id) ? "*" : "", (unsigned)(bytes / 1024),
-                    (unsigned)count);
+      u += snprintf(used + u, sizeof(used) - u, " %d%s=%dK/%d", id,
+                    is_streamed_category(id) ? "*" : "", (int)(bytes / 1024), (int)count);
 
     if (have_previous && m < (int)sizeof(moved) - 32) {
-      int32_t delta = (int32_t)bytes - (int32_t)previous_bytes[id];
+      int32_t delta = bytes - (int32_t)previous_bytes[id];
       if (delta >= GAME_MEMORY_DELTA_KB * 1024 || delta <= -GAME_MEMORY_DELTA_KB * 1024)
         m += snprintf(moved + m, sizeof(moved) - m, " %d%s%+dK", id,
                       is_streamed_category(id) ? "*" : "", (int)(delta / 1024));
     }
-    previous_bytes[id] = bytes;
+    previous_bytes[id] = (uint32_t)bytes;
   }
   have_previous = 1;
 
-  traceLog("gamemem: %d MB in %u blocks, streamed %d MB, txd %d MB, texheap %d MB |%s\n",
-           (int)(total / (1024 * 1024)), (unsigned)blocks,
+  // The total is worth reading with the same scepticism. On hardware these
+  // categories account for 17 MB of a 142 MB heap: MemoryMgrMalloc branches
+  // straight to memalign@plt in this build, so most of what the game allocates
+  // never passes through MallocWithMemID and is never tagged at all. What is
+  // here is exact; it is simply not most of it.
+  traceLog("gamemem: %d MB in %d blocks tagged, streamed %d MB, txd %d MB, texheap %d MB |%s\n",
+           (int)(total / (1024 * 1024)), (int)blocks,
            streaming_used ? (int)(*streaming_used / (1024 * 1024)) : -1,
            txd_loaded ? (int)(*txd_loaded / (1024 * 1024)) : -1,
            texture_heap_used ? (int)(*texture_heap_used / (1024 * 1024)) : -1,

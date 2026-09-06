@@ -181,6 +181,20 @@
 // fell below 19 MB free and phycont was never touched.
 #define TEXTURE_DISK_DISABLE_PATH DATA_PATH "/" "no_texdisk"
 
+// Tested, and the answer is no: the pools cannot carry the working set on their
+// own. With the card tier shut the cache evicted 337 textures in the first
+// 540000 frames, filled its 13 MB of heap tier, and then had nowhere to put
+// anything for the remaining 3.4 million -- the RAM pool bled 11 MB -> 0, took
+// phycont's 26 MB down with it, and vitaGL was failing 32 KB allocations by the
+// end. The newlib heap was never the problem in that session: 142 MB live of a
+// 176 MB arena, and not one refused allocation.
+//
+// So the switch stays for diagnosis and the tier stays on by default.
+
+// How often to rescan when the cache is blocked and the card cannot open.
+// One frame in this many; see the comment at the use.
+#define TEXTURE_BLOCKED_RESCAN_FRAMES 30
+
 // How much texture data the game is allowed to keep resident. The Android
 // build never evicts anything, so this is what keeps it inside what vitaGL can
 // hand out on a Vita (128MB of CDRAM plus whatever is left of main RAM once the
