@@ -353,6 +353,15 @@ void *bully_operator_new_array(size_t size) {
   return op_new(size, __builtin_return_address(0));
 }
 
+// What a call site really holds. A sampled site has one block in every
+// sixty-four in the table, so its recorded bytes are a sixty-fourth of the
+// truth -- and ranking on that raw figure put a site holding 19 MB below one
+// holding 1 MB. The two biggest sampled sites were the only ones that ever
+// surfaced; everything growing sat under a crowd of sites holding nothing.
+static size_t weigh(const CallerTotals *c) {
+  return (c->caller & SAMPLED_FLAG) ? (size_t)c->live_bytes * SMALL_SAMPLE : c->live_bytes;
+}
+
 void alloc_trace_report(void) {
   // The biggest holders, found by a few passes rather than by sorting the
   // table, since this runs inside the game's loop.
@@ -379,14 +388,14 @@ void alloc_trace_report(void) {
       // way round skipped every tie rather than stepping through them, which is
       // how a 68 MB total came to list 36 MB of holders -- the two .obb caches
       // are exactly the same size.
-      if (c->live_bytes > ceiling_bytes ||
-          (c->live_bytes == ceiling_bytes && c->caller <= ceiling_caller))
+      if (weigh(c) > ceiling_bytes ||
+          (weigh(c) == ceiling_bytes && c->caller <= ceiling_caller))
         continue;
-      if (!best || c->live_bytes > best->live_bytes ||
-          (c->live_bytes == best->live_bytes && c->caller < best->caller))
+      if (!best || weigh(c) > weigh(best) ||
+          (weigh(c) == weigh(best) && c->caller < best->caller))
         best = c;
     }
-    if (!best || best->live_bytes < 16 * 1024)
+    if (!best || weigh(best) < 512 * 1024)
       break;
     if (best->caller & SAMPLED_FLAG)
       traceLog("heap:   libBully.so+0x%x holds about %d MB in small blocks (1 in %d sampled)\n",
@@ -395,7 +404,7 @@ void alloc_trace_report(void) {
     else
       traceLog("heap:   libBully.so+0x%x holds %d MB in %u blocks (%u ever)\n", best->caller,
                (int)(best->live_bytes / (1024 * 1024)), best->live_count, best->total_count);
-    ceiling_bytes = best->live_bytes;
+    ceiling_bytes = weigh(best);
     ceiling_caller = best->caller;
   }
 }
@@ -513,11 +522,11 @@ void alloc_trace_loader_report(void) {
       // way round skipped every tie rather than stepping through them, which is
       // how a 68 MB total came to list 36 MB of holders -- the two .obb caches
       // are exactly the same size.
-      if (c->live_bytes > ceiling_bytes ||
-          (c->live_bytes == ceiling_bytes && c->caller <= ceiling_caller))
+      if (weigh(c) > ceiling_bytes ||
+          (weigh(c) == ceiling_bytes && c->caller <= ceiling_caller))
         continue;
-      if (!best || c->live_bytes > best->live_bytes ||
-          (c->live_bytes == best->live_bytes && c->caller < best->caller))
+      if (!best || weigh(c) > weigh(best) ||
+          (weigh(c) == weigh(best) && c->caller < best->caller))
         best = c;
     }
     // Down to 64 KB: the three sites over a quarter of a megabyte came to 37 MB
@@ -527,7 +536,7 @@ void alloc_trace_loader_report(void) {
       break;
     traceLog("loader heap:   eboot 0x%x holds %d KB in %u blocks (%u ever)\n", best->caller,
              (int)(best->live_bytes / 1024), best->live_count, best->total_count);
-    ceiling_bytes = best->live_bytes;
+    ceiling_bytes = weigh(best);
     ceiling_caller = best->caller;
   }
 }
