@@ -128,6 +128,10 @@ static size_t ram_cache_bytes; // evicted textures currently parked in the heap
 // Whether reclaiming may fall back to the memory card at all. Set only when a
 // pool is genuinely at its floor, where a hitch beats running out of memory.
 static int card_writes_allowed;
+// ...and whether it may at all, ever. Off leaves the cache its heap tier and
+// nothing else: a texture with nowhere cheap to go stays where it is, which
+// defers the eviction rather than losing the texture.
+static int card_tier_enabled = 1;
 // Consecutive frames the cache has wanted to free memory and freed none.
 static uint32_t blocked_frames;
 // Counted for the trace, to tell an eviction that cost a memcpy from one that
@@ -348,6 +352,10 @@ void texture_cache_init(void) {
     traceLog("texture cache: disabled by %s\n", TEXTURE_CACHE_DISABLE_PATH);
     return;
   }
+  card_tier_enabled = sceIoGetstat(TEXTURE_DISK_DISABLE_PATH, &stat) < 0;
+  if (!card_tier_enabled)
+    traceLog("texture cache: card tier shut by %s, heap tier only\n",
+             TEXTURE_DISK_DISABLE_PATH);
 
   // Start from nothing. On the console this runs once and there is nothing to
   // clear, but leaving state behind would mean a heap copy from a previous run
@@ -396,8 +404,9 @@ void texture_cache_init(void) {
   // against the possibility is four megabytes the game could have had -- and it
   // is dying of exactly that.
   backup_ready = 1;
-  traceLog("texture cache: store at %s (%d MB free on ux0)\n",
-           TEXTURE_CACHE_DIR, (int)(card_free / (1024 * 1024)));
+  traceLog("texture cache: store at %s (%d MB free on ux0), card tier %s\n",
+           TEXTURE_CACHE_DIR, (int)(card_free / (1024 * 1024)),
+           card_tier_enabled ? "open" : "shut");
 }
 
 void texture_cache_shutdown(void) {
@@ -875,7 +884,8 @@ void texture_cache_tick(void) {
   // has wanted to free memory for this many consecutive frames and freed
   // nothing, cheap has been tried and cheap has failed.
   size_t emergency = pool_start[1] / 100 * TEXTURE_POOL_EMERGENCY_PERCENT;
-  card_writes_allowed = free_now[1] < emergency || blocked_frames >= TEXTURE_BLOCKED_FRAMES;
+  card_writes_allowed =
+      card_tier_enabled && (free_now[1] < emergency || blocked_frames >= TEXTURE_BLOCKED_FRAMES);
   size_t before = tracked_bytes;
   evict_textures(target, TEXTURE_IDLE_FRAMES);
   // Wanted to reclaim and got nothing: the heap tier is full or the game has
@@ -930,7 +940,10 @@ void glBindTextureHook(GLenum target, GLuint texture) {
     // recently is part of the area being walked into.
     if (pool_start[1] && vglMemFree((vglMemType)1) <
                              pool_start[1] / 100 * TEXTURE_POOL_EMERGENCY_PERCENT) {
-      card_writes_allowed = 1; // genuinely out of memory: a hitch beats a crash
+      // Genuinely out of memory: a hitch beats a crash. Still nothing doing if
+      // the tier is shut -- the eviction is deferred instead, and the pools
+      // carry what the card would have taken.
+      card_writes_allowed = card_tier_enabled;
       size_t target = tracked_bytes > info->resident_size ? tracked_bytes - info->resident_size : 0;
       evict_textures(target, TEXTURE_IDLE_FRAMES_URGENT);
     }

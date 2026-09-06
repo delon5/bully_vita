@@ -163,6 +163,24 @@
 // from a budget, while there is still memory to reclaim into.
 #define TEXTURE_CACHE_DISABLE_PATH DATA_PATH "/" "no_texcache"
 
+// Create this file to keep the cache but shut the memory card tier, leaving it
+// the heap tier and nothing else.
+//
+// Worth being able to answer without a rebuild, because the writes have never
+// paid for themselves. Across four sessions the cache spilled 500, 415, 681 and
+// 1100 textures to the card and restored 84, 21, 122 and 327 -- and those
+// restore figures include the ones that came back from the heap, so the share
+// of writes ever read is lower still. What kept the tier was that it is the
+// only thing standing between a texture the cache had to drop and a texture the
+// game cannot get back, and a white placeholder is not an acceptable answer.
+//
+// With this set, a texture with nowhere cheap to go simply stays where it is.
+// That is safe -- nothing is lost, the eviction is deferred -- and the question
+// it settles is whether the pools can carry the working set without the card at
+// all. On the last session they never came close to empty: the RAM pool never
+// fell below 19 MB free and phycont was never touched.
+#define TEXTURE_DISK_DISABLE_PATH DATA_PATH "/" "no_texdisk"
+
 // How much texture data the game is allowed to keep resident. The Android
 // build never evicts anything, so this is what keeps it inside what vitaGL can
 // hand out on a Vita (128MB of CDRAM plus whatever is left of main RAM once the
