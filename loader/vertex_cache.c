@@ -44,6 +44,7 @@
  */
 
 #include <psp2/io/stat.h>
+#include <vitaGL.h>
 
 #include <malloc.h>
 #include <stdint.h>
@@ -59,6 +60,7 @@
 // Allocate. All four agree on them.
 #define VB_COUNT 0x0c
 #define VB_DECLARATION 0x10
+#define VB_GLBUFFER 0x24
 #define VB_DATA 0x28
 #define VB_UPLOADED 0x2c
 
@@ -114,15 +116,40 @@ static void *VertexBufferES_Lock(void *self) {
   if (*uploaded && *data)
     return *data;
 
-  if (*uploaded && !*data)
-    relocked_count++; // we took this one back and the game wants it again
-
   uint32_t size = buffer_size(self);
   if (!size)
     return *data;
 
+  int restoring = *uploaded && !*data;
   *data = memalign(8, size);
-  if (*data && t) {
+  if (!*data)
+    return NULL;
+
+  if (restoring) {
+    // Put the vertices back, rather than handing over uninitialised memory.
+    //
+    // This is the part a real GLES2 driver could not do: once glBufferData has
+    // taken the data, it is the GPU's and there is no way to read it back. But
+    // vitaGL is not a driver on the far side of a bus -- it keeps the buffer in
+    // memory it owns, and glMapBuffer hands back a pointer to it. So a buffer
+    // the loader reclaimed can be handed back to the game byte for byte, and
+    // freeing the staging copy stops being a trade at all.
+    //
+    // Without this, a buffer locked to amend a few vertices in place would get
+    // whatever was in the heap, and the geometry would be wrong.
+    glBindBuffer(GL_ARRAY_BUFFER, *(GLuint *)((char *)self + VB_GLBUFFER));
+    const void *uploaded_data = glMapBuffer(GL_ARRAY_BUFFER, GL_READ_ONLY);
+    if (uploaded_data)
+      memcpy(*data, uploaded_data, size);
+    else
+      memset(*data, 0, size); // no readback: at least it is not stale heap
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+    // Unlock leaves the binding cleared, so the game already copes with this.
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    relocked_count++;
+  }
+
+  if (t) {
     t->bytes = size;
     held_bytes += size;
   }
