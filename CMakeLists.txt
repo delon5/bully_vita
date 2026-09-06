@@ -25,6 +25,7 @@ add_executable(Bully
   loader/vertex_cache.c
   loader/dialog.c
   loader/fios.c
+  loader/game_memory.c
   loader/so_util.c
   loader/jni_patch.c
   loader/movie_patch.c

@@ -16,7 +16,8 @@ void vertex_cache_tick(void);
 
 typedef struct {
   int tracked;       // buffers seen
-  int held_kb;       // staging copies still held
+  int held_kb;       // staging copies still held, summed from the table
+  int churn_mb;      // every staging copy ever handed out, cumulative
   int released_kb;   // freed so far
   int relocked;      // buffers locked again after being released
   int installed;

@@ -74,7 +74,15 @@ typedef struct {
 
 static TrackedBuffer tracked[MAX_BUFFERS];
 static uint32_t frame_counter;
-static uint32_t held_bytes, released_bytes;
+// What the tracked buffers are holding right now. Summed from the table rather
+// than accumulated, because accumulating it was wrong: the game reallocates a
+// buffer's staging copy through its own Allocate, which frees the old one
+// without going through here, so every lock added to the total and nothing ever
+// took anything off. It read 413905 KB against 1677 buffers and had wrapped
+// past 4 GB twice by the end of the session -- a number nobody could act on.
+static uint32_t held_bytes;
+static uint64_t churn_bytes;    // every staging copy ever handed out
+static uint32_t released_bytes; // ...of which the sweep freed this many
 static uint32_t relocked_count;
 static int installed;
 
@@ -150,9 +158,13 @@ static void *VertexBufferES_Lock(void *self) {
   }
 
   if (t) {
+    // A slot that already had a size is being reallocated under us -- the game
+    // freed the old copy itself. Replace the figure, do not add to it.
+    held_bytes -= t->bytes < held_bytes ? t->bytes : held_bytes;
     t->bytes = size;
     held_bytes += size;
   }
+  churn_bytes += size;
   return *data;
 }
 
@@ -212,6 +224,7 @@ void vertex_cache_stats(VertexCacheStats *out) {
       n++;
   out->tracked = n;
   out->held_kb = (int)(held_bytes / 1024);
+  out->churn_mb = (int)(churn_bytes / (1024 * 1024));
   out->released_kb = (int)(released_bytes / 1024);
   out->relocked = (int)relocked_count;
   out->installed = installed;

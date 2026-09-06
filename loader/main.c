@@ -50,6 +50,7 @@
 #include "config.h"
 #include "dialog.h"
 #include "fios.h"
+#include "game_memory.h"
 #include "so_util.h"
 #include "jni_patch.h"
 #include "movie_patch.h"
@@ -282,15 +283,21 @@ int ProcessEvents(void) {
 
     VertexCacheStats vertex;
     vertex_cache_stats(&vertex);
-    traceLog("vertex: %s, %d buffers, %d KB held, %d KB released, %d relocked\n",
+    traceLog("vertex: %s, %d buffers, %d KB held, %d MB handed out, %d KB released, "
+             "%d relocked\n",
              vertex.installed ? "on" : "OFF", vertex.tracked, vertex.held_kb,
-             vertex.released_kb, vertex.relocked);
+             vertex.churn_mb, vertex.released_kb, vertex.relocked);
 
     StreamingStats stream;
     streaming_patch_stats(&stream);
-    traceLog("stream: gate %s, streamer holds %d MB of %d, %d refusals, %d backoffs\n",
+    traceLog("stream: gate %s, streamer holds %d MB of %d, %d asked, %d refused, "
+             "%d backoffs, %d calls left in this one\n",
              stream.installed ? "on" : "OFF", stream.memory_used_mb, stream.budget_mb,
-             stream.refusals, stream.backoffs);
+             stream.calls, stream.refusals, stream.backoffs, stream.backoff_left);
+
+    // What the engine says it is holding, broken down by its own categories.
+    // The heap figures above say how much went; this says what took it.
+    game_memory_report();
 
 #ifdef LOADER_ALLOC_TRACE
     // Less often than the heartbeat: this one walks a table and prints several
@@ -555,6 +562,7 @@ void patch_game(void) {
   hook_addr(so_symbol(&bully_mod, "_Znwj"), (uintptr_t)&bully_operator_new);
   hook_addr(so_symbol(&bully_mod, "_Znaj"), (uintptr_t)&bully_operator_new_array);
 #endif
+  game_memory_init();
   streaming_patch_init();
   vertex_cache_init();
   hook_addr(so_symbol(&bully_mod, "__cxa_guard_acquire"), (uintptr_t)&__cxa_guard_acquire);
@@ -734,15 +742,22 @@ static so_default_dynlib default_dynlib[] = {
   { "tan", (uintptr_t)&tan },
   { "tanf", (uintptr_t)&tanf },
 
-  // These names resolve to __wrap_malloc and friends when the allocation trace
-  // is on, so the game's allocations and the eboot's are counted in the same
-  // place and told apart by return address. No separate wrappers: two layers
-  // would count everything twice.
-  { "calloc", (uintptr_t)&calloc },
+  // The game's allocators go through game_memory.c, which passes them straight
+  // to newlib and only does anything when one comes back NULL: it writes down
+  // the size and the caller, and hands over a block reserved at boot so the
+  // call can be retried. The game never checks a result -- ReadBuffer::
+  // RequestData stores through it two instructions later -- so a NULL returned
+  // here is a null dereference in the game, and every session so far has ended
+  // as one.
+  //
+  // Underneath, these still resolve to __wrap_malloc and friends when the
+  // allocation trace is on, so the game's allocations and the eboot's are
+  // counted in the same place and told apart by return address.
+  { "calloc", (uintptr_t)&game_calloc },
   { "free", (uintptr_t)&free },
-  { "malloc", (uintptr_t)&malloc },
-  { "memalign", (uintptr_t)&memalign },
-  { "realloc", (uintptr_t)&realloc },
+  { "malloc", (uintptr_t)&game_malloc },
+  { "memalign", (uintptr_t)&game_memalign },
+  { "realloc", (uintptr_t)&game_realloc },
 
   { "atoi", (uintptr_t)&atoi },
 

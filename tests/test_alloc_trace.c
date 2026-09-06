@@ -31,7 +31,7 @@
 #define SMALL 200
 #define LARGE (96 * 1024)
 
-static void *slots[40000];
+static void *slots[LIVE_SLOTS + 8000];
 
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
@@ -64,13 +64,25 @@ int main(void) {
     printf("eboot blocks : kept apart from the game's, and balanced        OK\n");
   }
 
-  // Enough live blocks to fill the table, then free them all. A block the table
-  // could not hold must not be unaccounted for on the way out: that is what
-  // ran the small total below zero on hardware once the table filled.
+  // More live blocks than the table has slots, then free them all. A block the
+  // table could not hold must not be unaccounted for on the way out: that is
+  // what ran the small total below zero on hardware once the table filled, and
+  // what left the eboot's total holding the size of every overflow for ever.
+  //
+  // Deliberately past LIVE_SLOTS rather than just near it. At 30000 blocks in a
+  // 32768 slot table the overflow depended on how the host allocator happened
+  // to lay the blocks out, so the case this exists to cover was exercised in
+  // about one run in twenty -- and the run that did exercise it was the one
+  // that found the bug.
   {
+    // Eboot sites, because those are tabled whatever their size. A mixture
+    // would not do: two thirds of the game's blocks are small and only one in
+    // sixty-four of those reaches the table, so a run of LIVE_SLOTS + 4000
+    // mixed allocations only put about 24000 entries in a 32768 slot table and
+    // overflowed once, by luck, in about one run in twenty.
     int n = 0;
-    for (; n < 30000; n++) {
-      slots[n] = trace_alloc(n % 3 ? SMALL : LARGE, n % 2 ? GAME_SITE(n % 16) : EBOOT_SITE(n % 16));
+    for (; n < LIVE_SLOTS + 4000; n++) {
+      slots[n] = trace_alloc(n % 3 ? SMALL : LARGE, EBOOT_SITE(n % 16));
       if (!slots[n])
         break;
     }
@@ -78,6 +90,7 @@ int main(void) {
       trace_free(slots[i]);
     printf("table full   : %d blocks through a %d slot table, %u overflowed\n", n, LIVE_SLOTS,
            table_full);
+    assert(table_full > 0 && "the table has to have actually overflowed to test this");
     assert(small_live_bytes == 0 && "a full table must not corrupt the small total");
     assert(large_live_bytes == 0 && "nor the large one");
     assert(loader_live_bytes == 0 && "nor the eboot's");

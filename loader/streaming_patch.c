@@ -56,7 +56,11 @@
 
 static volatile int *ms_memory_used;
 static void (*update_memory_used)(void);
-static uint32_t refusal_count, backoff_count;
+static uint32_t call_count, refusal_count, backoff_count;
+// Exposed so the trace can tell "the gate stopped refusing" from "the game
+// stopped asking". A whole session read 160 refusals from start to finish and
+// there was no way to tell which of the two had happened.
+static uint32_t backoff_remaining;
 static size_t budget;
 static int installed;
 
@@ -145,7 +149,6 @@ static void calibrate(size_t used) {
 static int should_refuse(void) {
   static size_t used_at_last_progress;
   static uint32_t fruitless;
-  static uint32_t backoff;
   static int judged_on_frame;
 
   size_t used = streamer_used();
@@ -164,8 +167,8 @@ static int should_refuse(void) {
   }
 
   // Backing off after a fruitless run, so the game can put the world back.
-  if (backoff) {
-    backoff--;
+  if (backoff_remaining) {
+    backoff_remaining--;
     return 0;
   }
 
@@ -188,7 +191,7 @@ static int should_refuse(void) {
     // Refusing has stopped helping. Let the game load what it needs.
     fruitless = 0;
     used_at_last_progress = 0;
-    backoff = BACKOFF_CALLS;
+    backoff_remaining = BACKOFF_CALLS;
     backoff_count++;
     return 0;
   }
@@ -198,6 +201,7 @@ static int should_refuse(void) {
 
 // The honest answer to the question the game is asking.
 static int IsThereEnoughFreeMemory(int size) {
+  call_count++;
   if (size > ORIGINAL_MAX_REQUEST)
     return 0;
 
@@ -242,7 +246,9 @@ void streaming_patch_init(void) {
 void streaming_patch_stats(StreamingStats *out) {
   out->memory_used_mb = (int)(streamer_used() / (1024 * 1024));
   out->budget_mb = (int)(budget / (1024 * 1024));
+  out->calls = (int)call_count;
   out->refusals = (int)refusal_count;
   out->backoffs = (int)backoff_count;
+  out->backoff_left = (int)backoff_remaining;
   out->installed = installed;
 }

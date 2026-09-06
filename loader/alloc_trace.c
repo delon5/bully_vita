@@ -165,7 +165,12 @@ static inline int sampled(const void *ptr) {
   return (hash_ptr(ptr) & (SMALL_SAMPLE - 1)) == 0;
 }
 
-static void remember_block(void *ptr, size_t size, uint32_t caller) {
+// Returns whether the block got a slot. The eboot's totals are kept in step
+// with that answer rather than bumped alongside it: they used to be added on
+// the way in and only subtracted if the block was still findable on the way
+// out, so a block lost to a full table was counted in and never out, and the
+// loader's figure grew by exactly the size of every overflow, for ever.
+static int remember_block(void *ptr, size_t size, uint32_t caller) {
   uint32_t i = hash_ptr(ptr) & LIVE_MASK;
   lock_table();
   for (uint32_t probe = 0; probe < 64; probe++) {
@@ -186,11 +191,12 @@ static void remember_block(void *ptr, size_t size, uint32_t caller) {
         c->total_count++;
       }
       unlock_table();
-      return;
+      return 1;
     }
   }
   table_full++;
   unlock_table();
+  return 0;
 }
 
 // Take a block back out, returning how big it was, or 0 if it was never in
@@ -280,37 +286,6 @@ static void forget(void *ptr) {
 
   if (!forget_block(ptr, NULL))
     untracked_frees++; // allocated before tracking began, or lost to a full table
-}
-
-void *bully_malloc(size_t size) {
-  void *ptr = malloc(size);
-  remember(ptr, size, __builtin_return_address(0));
-  return ptr;
-}
-
-void *bully_calloc(size_t count, size_t size) {
-  void *ptr = calloc(count, size);
-  remember(ptr, count * size, __builtin_return_address(0));
-  return ptr;
-}
-
-void *bully_realloc(void *ptr, size_t size) {
-  if (ptr)
-    forget(ptr);
-  void *out = realloc(ptr, size);
-  remember(out, size, __builtin_return_address(0));
-  return out;
-}
-
-void *bully_memalign(size_t alignment, size_t size) {
-  void *ptr = memalign(alignment, size);
-  remember(ptr, size, __builtin_return_address(0));
-  return ptr;
-}
-
-void bully_free(void *ptr) {
-  forget(ptr);
-  free(ptr);
 }
 
 // operator new and operator new[], replaced rather than merely observed.
@@ -470,12 +445,15 @@ static void account_alloc(void *ptr, void *return_address) {
   }
 
   size_t size = malloc_usable_size(ptr);
-  __atomic_add_fetch(&loader_live_bytes, size, __ATOMIC_RELAXED);
-  __atomic_add_fetch(&loader_live_count, 1, __ATOMIC_RELAXED);
   // Tabled at any size: the eboot allocates orders of magnitude less often than
   // the game, so the lock is uncontended, and a leak made of small blocks needs
-  // naming just as much as one made of large ones.
-  remember_block(ptr, size, (uint32_t)(uintptr_t)return_address);
+  // naming just as much as one made of large ones. Only what reached the table
+  // is counted, because only what reached the table can be found again to take
+  // back off.
+  if (remember_block(ptr, size, (uint32_t)(uintptr_t)return_address)) {
+    __atomic_add_fetch(&loader_live_bytes, size, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&loader_live_count, 1, __ATOMIC_RELAXED);
+  }
 }
 
 static void account_free(void *ptr) {
@@ -563,6 +541,17 @@ void *__real_aligned_alloc(size_t alignment, size_t size);
 void __real_free(void *ptr);
 #define account_alloc(ptr, ra) ((void)0)
 #define account_free(ptr) ((void)0)
+#endif
+
+#ifdef LOADER_ALLOC_TRACE
+void alloc_trace_alloc(void *ptr, size_t size, void *caller) {
+  (void)size; // the heap's own answer is used, so that in and out agree
+  account_alloc(ptr, caller);
+}
+
+void alloc_trace_free(void *ptr) {
+  account_free(ptr);
+}
 #endif
 
 void *__wrap_malloc(size_t size) {

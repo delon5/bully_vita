@@ -45,12 +45,48 @@
 // that thrashes. The extra heap did buy longer sessions before the game ran out
 // of memory, but it bought them with a permanent stutter, and the leak it was
 // meant to address is not the renderer's to fix.
+//
+// 160 -> 176, on measurement rather than hope. Over a session of 8.45 million
+// frames the vitaGL RAM pool never fell below 19 MB free in any of 14087
+// samples, and the phycont pool -- which vitaGL falls back to when RAM runs
+// short -- reported its full 26 MB free in 14086 of them. So there are 19 MB
+// the renderer demonstrably never wants and 26 MB behind it that it has never
+// once had to reach for.
+//
+// The 208 MB attempt failed for a different reason than "too much heap": it cut
+// the pools to 133 MB against a 104 MB texture working set, and the cache
+// thrashed against its own limit for the whole session. 176 MB leaves 213 MB of
+// pools against a working set that peaked at 137 MB, which is nowhere near
+// that. The session that prompted this died with the arena at 159 MB of the
+// 160 available and 16 KB of contiguous space left in it.
 #ifdef HAVE_RAZOR
 #define MEMORY_NEWLIB_MB 256
 #else
-#define MEMORY_NEWLIB_MB 160
+#define MEMORY_NEWLIB_MB 176
 #endif
 #define MEMORY_VITAGL_THRESHOLD_MB 8
+
+// Held back at startup and handed over the first time the game asks for memory
+// and cannot have it.
+//
+// The failure that ends a session is never a clean one. ReadBuffer::RequestData
+// grows its buffer by 21/13 each time, calls memalign, and stores a refcount
+// through the result without looking at it -- so an allocation that returns
+// NULL is a write to address zero two instructions later. The last coredump was
+// that exact instruction, wanting 295356 bytes.
+//
+// The heap was not out of memory when it happened: 11 MB were free. They were
+// simply in pieces, the largest of them 16 KB. A block reserved at boot and
+// never touched is contiguous by construction, so giving it up supplies the one
+// thing the free list had run out of.
+//
+// Set to 0 to turn the reserve off.
+#define MEMORY_RESCUE_RESERVE_MB 4
+
+// How much a memory category has to move between two heartbeats before the
+// trace mentions it. Small enough to catch a slow climb, large enough that the
+// line is not every category every time.
+#define GAME_MEMORY_DELTA_KB 64
 
 // How much of the newlib heap to keep clear of the game's streamer.
 //
