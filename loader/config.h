@@ -113,7 +113,19 @@
 #define STREAMING_BUDGET_MARGIN_MB 24
 // The budget is never set above this much of the heap, whatever the game
 // settled at, so the gate cannot end up asking for room that will not exist.
-#define STREAMING_HEAP_KEEP_FREE_MB 24
+// 24 -> 18. The gate's ceiling was 152 MB and the game's working set in play is
+// 151, so the ceiling was sitting exactly where the game wanted to be and the
+// gate ground against it for a whole session. Measured against the arena rather
+// than guessed: a session holding 153 MB live ran an arena of 164, so eleven
+// megabytes above live covers the fragmentation, and a 158 MB ceiling leaves
+// the arena around 169 of 176 with the rescue reserve behind it.
+#define STREAMING_HEAP_KEEP_FREE_MB 18
+
+// How much room to give the game above a figure it has proved it needs, when
+// the budget follows it up. Smaller than the margin taken at calibration time:
+// that one is a guess about a game that has barely started, this one is added
+// to a reading of the game in play.
+#define STREAMING_BUDGET_RAISE_MB 6
 // Frames to let pass before taking that measurement, so it is a settled figure
 // and not the middle of the first area load.
 #define STREAMING_CALIBRATE_FRAMES 1800

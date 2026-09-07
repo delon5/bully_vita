@@ -293,9 +293,10 @@ int ProcessEvents(void) {
     StreamingStats stream;
     streaming_patch_stats(&stream);
     traceLog("stream: gate %s, streamer holds %d MB of %d, %d asked, %d refused, "
-             "%d backoffs, %d calls left in this one\n",
+             "%d backoffs, %d raises, %d frames left in this backoff\n",
              stream.installed ? "on" : "OFF", stream.memory_used_mb, stream.budget_mb,
-             stream.calls, stream.refusals, stream.backoffs, stream.backoff_left);
+             stream.calls, stream.refusals, stream.backoffs, stream.raises,
+             stream.backoff_left);
 
     // What the engine says it is holding, broken down by its own categories.
     // The heap figures above say how much went; this says what took it.

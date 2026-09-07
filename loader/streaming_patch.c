@@ -56,7 +56,7 @@
 
 static volatile int *ms_memory_used;
 static void (*update_memory_used)(void);
-static uint32_t call_count, refusal_count, backoff_count;
+static uint32_t call_count, refusal_count, backoff_count, raise_count;
 // Exposed so the trace can tell "the gate stopped refusing" from "the game
 // stopped asking". A whole session read 160 refusals from start to finish and
 // there was no way to tell which of the two had happened. It was the second.
@@ -104,6 +104,14 @@ static size_t streamer_used(void) {
   return texture_cache_heap_used();
 }
 
+// The most the game may ever hold, whatever it turns out to want. Past this
+// there is not enough arena left to serve it: the heap runs about eleven
+// megabytes of arena above what is live, so a live figure this high is already
+// most of MEMORY_NEWLIB_MB by the time fragmentation is counted.
+static size_t heap_ceiling(void) {
+  return (size_t)(MEMORY_NEWLIB_MB - STREAMING_HEAP_KEEP_FREE_MB) * 1024 * 1024;
+}
+
 // The budget, taken from what the game turns out to need rather than from a
 // number picked in advance. One area's worth is whatever it is holding once it
 // has settled into play; the margin is what it may grow to beyond that before
@@ -120,9 +128,8 @@ static void calibrate(size_t used) {
 
   // And never past what the heap can give, or the gate would be asking for
   // room that does not exist by the time it matters.
-  size_t ceiling = (size_t)(MEMORY_NEWLIB_MB - STREAMING_HEAP_KEEP_FREE_MB) * 1024 * 1024;
-  if (budget > ceiling)
-    budget = ceiling;
+  if (budget > heap_ceiling())
+    budget = heap_ceiling();
 
   traceLog("streaming: settled at %d MB of heap, budget %d MB\n",
            (int)(used / (1024 * 1024)), (int)(budget / (1024 * 1024)));
@@ -201,9 +208,35 @@ static int should_refuse(void) {
   judged_on_frame = frames_swapped;
 
   if (++fruitless >= REFUSALS_WITHOUT_PROGRESS) {
-    // Refusing has stopped helping. Let the game load what it needs.
+    // Refusing has stopped helping. Let the game load what it needs -- and move
+    // the line, rather than standing back up behind it in nine hundred frames'
+    // time to lose the same argument again.
+    //
+    // This is what the last session cost. The budget was taken once, at 1800
+    // frames, from a heap that had settled at 103 MB -- the first area, before
+    // anything demanding had loaded -- and 24 MB of margin made it 127. In play
+    // the game sits at 151. So every call after that was refused: 18764 of
+    // them, each one making the game drop a model and re-stream it, and the
+    // frame rate halved from 24 to 13 at the exact sample where the heap
+    // crossed the line and stayed across it.
+    //
+    // A run of refusals that frees nothing is the game saying this is not
+    // hoarding, it is the working set. Refusing against the working set buys no
+    // memory at all and costs a model churn per call. So take the reading and
+    // raise the budget to it. Growth still meets the gate, because growth is
+    // not a plateau -- and the ceiling does not move, so this can follow the
+    // game up only as far as the heap can actually go.
     fruitless = 0;
     used_at_last_progress = 0;
+    size_t raised = used + (size_t)STREAMING_BUDGET_RAISE_MB * 1024 * 1024;
+    if (raised > heap_ceiling())
+      raised = heap_ceiling();
+    if (raised > budget) {
+      budget = raised;
+      raise_count++;
+      traceLog("streaming: the game settled at %d MB, budget now %d MB\n",
+               (int)(used / (1024 * 1024)), (int)(budget / (1024 * 1024)));
+    }
     backoff_until_frame = (uint32_t)frames_swapped + BACKOFF_FRAMES;
     backoff_count++;
     return 0;
@@ -262,6 +295,7 @@ void streaming_patch_stats(StreamingStats *out) {
   out->calls = (int)call_count;
   out->refusals = (int)refusal_count;
   out->backoffs = (int)backoff_count;
+  out->raises = (int)raise_count;
   out->backoff_left = backoff_until_frame > (uint32_t)frames_swapped
                           ? (int)(backoff_until_frame - (uint32_t)frames_swapped)
                           : 0;

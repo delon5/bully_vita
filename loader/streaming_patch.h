@@ -18,6 +18,7 @@ typedef struct {
   int calls;          // times the game asked, which is the one that was missing
   int refusals;       // times the gate said "no", each of which frees something
   int backoffs;       // times refusing stopped helping and we let it load again
+  int raises;         // ...of which also moved the budget up to what it found
   int backoff_left;   // frames remaining in the current backoff, 0 if not in one
   int installed;
 } StreamingStats;
