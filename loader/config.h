@@ -195,6 +195,15 @@
 // One frame in this many; see the comment at the use.
 #define TEXTURE_BLOCKED_RESCAN_FRAMES 30
 
+// Create this file to have the texture store emptied at startup.
+//
+// The store is kept across runs, so there has to be a way to throw it away
+// without deleting a directory by hand -- after a change to how records are
+// written, or if the card was pulled mid-write often enough to be worth not
+// wondering about. It is not self-clearing: while the file is there, every
+// launch starts from nothing.
+#define TEXTURE_STORE_WIPE_PATH DATA_PATH "/" "wipe_texcache"
+
 // How much texture data the game is allowed to keep resident. The Android
 // build never evicts anything, so this is what keeps it inside what vitaGL can
 // hand out on a Vita (128MB of CDRAM plus whatever is left of main RAM once the

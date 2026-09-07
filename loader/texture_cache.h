@@ -42,6 +42,8 @@ typedef struct {
   int parked_mb; // evicted textures sitting in the newlib heap
   int evicted, restored, failed;
   int spilled; // evictions that had to reach the memory card
+  int reused;  // evictions that cost nothing, the store already holding them
+  int stored;  // textures the store carried in from previous runs
   int starved; // frames it failed to get back under its limits
   int deferred; // evictions it wanted to make and could not, for want of a copy
   int blocked; // consecutive frames it has wanted to free memory and freed none

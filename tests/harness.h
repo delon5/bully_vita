@@ -74,4 +74,12 @@ static void harness_start(size_t driver_memory) {
   texture_cache_init();
 }
 
+// The store outlives a run now, so a block that reasons about what is in it has
+// to say where it is starting from rather than inherit whatever the block
+// before it spilled.
+static void harness_start_empty(size_t driver_memory) {
+  purge_store();
+  harness_start(driver_memory);
+}
+
 #endif

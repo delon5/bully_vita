@@ -134,17 +134,25 @@ int main(void) {
     printf("heap restore : parked textures come back byte for byte OK\n");
   }
 
-  // Nothing in the store survives a run: a file is named for a texture name and
-  // a generation of it, and the next run hands both out to different textures.
-  // Left alone the folder would grow every session.
+  // The store outlives the run, and a texture it already holds costs nothing at
+  // all to evict. This is what the persistent store is for: evicting used to
+  // mean writing a few hundred KB inside a frame, which is why writes are
+  // rationed to emergencies, which is why a session with the card shut evicted
+  // 337 textures and then watched the pools drain to nothing.
   {
     // A driver small enough that the RAM pool genuinely runs out -- smaller
     // than the byte budget, so the budget cannot cap the pressure first. The
     // card is only for that case now: past the heap tier, with memory to spare,
     // a texture stays resident rather than costing a write inside a frame.
-    harness_start(192 * MB);
     const size_t over = ((size_t)TEXTURE_BUDGET_MB + TEXTURE_RAM_CACHE_MB + 96) * MB;
-    for (size_t i = 0; i < over / TEX_BYTES; i++) {
+    const int count = (int)(over / TEX_BYTES);
+    GLuint ids[1536];
+    assert(count <= (int)(sizeof(ids) / sizeof(ids[0])));
+
+    harness_start_empty(192 * MB);
+    assert(store_files == 0 && "this block starts from an empty store");
+
+    for (int i = 0; i < count; i++) {
       tex_upload(0xDE000000u + (unsigned)i, 512, 512, TEX_BYTES);
       drain();
       texture_cache_tick();
@@ -152,10 +160,90 @@ int main(void) {
     frames(TEXTURE_IDLE_FRAMES * 8);
     unsigned spilled = fake_store_files();
     assert(spilled > 0 && "a pool actually running out has to be able to reach the card");
+
+    // A restart, and then the same assets again. Different texture names, same
+    // textures: the store is keyed by what they are, not where they landed.
+    fake_reset(192 * MB);
     texture_cache_init();
-    printf("store purge  : %u files spilled, %u after a restart     OK\n", spilled,
-           fake_store_files());
-    assert(fake_store_files() == 0 && "starting up must clear the store");
+    assert(fake_store_files() == spilled && "the store must survive a restart");
+    assert(store_files == spilled && "and be read back into the index");
+
+    for (int i = 0; i < count; i++) {
+      ids[i] = tex_upload(0xDE000000u + (unsigned)i, 512, 512, TEX_BYTES);
+      drain();
+      texture_cache_tick();
+    }
+    frames(TEXTURE_IDLE_FRAMES * 8);
+    printf("store reuse  : %u spilled, %u evictions free on the next run, %u written  OK\n",
+           spilled, store_reused, card_evicted_count);
+    assert(store_reused >= spilled && "every stored texture must evict for free");
+    // Not zero, and it should not be. Freeing an eviction from its ration means
+    // more of them succeed, so textures that only ever reached the heap tier on
+    // the first run get as far as the card on the second and are written once,
+    // for the first time. The store converges; what must not happen is paying
+    // again for what it already holds.
+    assert(card_evicted_count < spilled / 8 && "but next to nothing may be written again");
+
+    // And a file this run never wrote still restores byte for byte. A sample of
+    // them, with a tick between, because restoring six hundred textures into a
+    // driver this size would run it out of memory on its own.
+    int checked = 0;
+    for (int i = 0; i < count && checked < 16; i++) {
+      if (!textures[ids[i]].evicted)
+        continue;
+      glBindTextureHook(GL_TEXTURE_2D, ids[i]);
+      assert(fake_sampled(ids[i]) == fake_fingerprint_of(0xDE000000u + (unsigned)i) &&
+             "a texture restored from a previous run's file must be the right one");
+      checked++;
+      texture_cache_tick();
+    }
+    assert(checked > 0 && "something had to have been evicted to check this");
+    printf("             : %d restored from files written before the restart  OK\n", checked);
+  }
+
+  // ...and the key has to actually tell textures apart, because the failure it
+  // guards against is silent. A texture whose contents differ must not be
+  // handed a stored file just because it is the same size and shape.
+  {
+    const size_t over = ((size_t)TEXTURE_BUDGET_MB + TEXTURE_RAM_CACHE_MB + 96) * MB;
+    const int count = (int)(over / TEX_BYTES);
+
+    harness_start_empty(192 * MB);
+    for (int i = 0; i < count; i++) {
+      tex_upload(0xAB000000u + (unsigned)i, 512, 512, TEX_BYTES);
+      drain();
+      texture_cache_tick();
+    }
+    frames(TEXTURE_IDLE_FRAMES * 8);
+    unsigned first = fake_store_files();
+    assert(first > 0);
+
+    // Same dimensions, same format, same sizes -- different pixels.
+    fake_reset(192 * MB);
+    texture_cache_init();
+    GLuint ids[1536];
+    for (int i = 0; i < count; i++) {
+      ids[i] = tex_upload(0xCD000000u + (unsigned)i, 512, 512, TEX_BYTES);
+      drain();
+      texture_cache_tick();
+    }
+    frames(TEXTURE_IDLE_FRAMES * 8);
+    printf("key discrim  : %u stored, %u reused, %u written for different pixels  OK\n", first,
+           store_reused, card_evicted_count);
+    assert(store_reused == 0 && "different pixels must never match a stored file");
+    assert(card_evicted_count > 0 && "they have to be written for themselves");
+
+    int checked = 0;
+    for (int i = 0; i < count && checked < 16; i++) {
+      if (!textures[ids[i]].evicted)
+        continue;
+      glBindTextureHook(GL_TEXTURE_2D, ids[i]);
+      assert(fake_sampled(ids[i]) == fake_fingerprint_of(0xCD000000u + (unsigned)i) &&
+             "and each must restore as itself, not as the texture it displaced");
+      checked++;
+      texture_cache_tick();
+    }
+    assert(checked > 0 && "something had to have been evicted to check this");
   }
 
   // A texture still bound to a unit can be drawn without the game ever binding

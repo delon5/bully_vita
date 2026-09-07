@@ -55,13 +55,15 @@
 
 // Stamped into every record so a torn write, or a record left over from an
 // upload the game has since replaced, can never be replayed into a texture.
-#define BACKUP_MAGIC 0x31435442
+// Bumped when the store became persistent and its files became content-named:
+// a record written by an older build means something else entirely, and must
+// not be mistaken for one of these.
+#define BACKUP_MAGIC 0x32435442
 
 typedef struct {
   uint32_t magic;
-  uint32_t id;
-  uint32_t serial; // which generation of this texture name the file belongs to
-  uint32_t bytes; // texture data following this header
+  uint32_t key_lo, key_hi; // the content key, split so the struct has no padding
+  uint32_t bytes;          // texture data following this header
   uint32_t checksum;
 } BackupRecord;
 
@@ -79,7 +81,11 @@ typedef struct {
   uint32_t resident_size; // what size will be again once it is restored
   uint32_t last_frame; // frame counter at the time of the last bind
 
-  uint32_t serial;
+  // What this texture is, rather than where it happened to land. Folded from
+  // the bytes the game uploaded plus the shape it uploaded them as, so the same
+  // asset gets the same key in every run and a store file written last session
+  // is still the right file for it today.
+  uint64_t key;
   uint32_t backup_bytes; // bytes of texture data saved when it was evicted
   uint8_t *ram_copy; // the saved bytes, when they fit in the heap rather than on the card
   int32_t internalformat, format, type;
@@ -104,7 +110,6 @@ static GLuint bound_textures[MAX_TEXTURE_UNITS];
 static int active_unit = 0;
 static uint32_t frame_counter = 1;
 static size_t tracked_bytes = 0;
-static uint32_t upload_serial = 1;
 // The highest texture name the game has actually used. The eviction pass walks
 // this array every frame it wants to reclaim, and walking all 16384 slots means
 // touching two megabytes of struct to look at a few thousand live entries --
@@ -226,17 +231,142 @@ static int is_restorable(const TextureInfo *info) {
 // it this is. Spread over 256 subdirectories, since a single directory holding
 // thousands of entries is slow to open on a memory card.
 //
-// This used to be keyed by a hash of the texture's contents so the store could
-// be reused on a later run. That was worth doing when every upload was written;
-// now that only evicted textures are, there is little to reuse and the hash
+// Named for what the texture is, so the file written for it in one run is the
+// file for it in the next.
+//
+// This was tried once, by hashing the contents, and taken out again: "the hash
 // cost a directory lookup per upload -- which is what made a second run no
-// faster than the first.
-static void texture_path(char *out, size_t out_size, GLuint id, uint32_t serial) {
-  snprintf(out, out_size, "%s/%02x/%u_%u.tex", TEXTURE_CACHE_DIR, (unsigned)(id & 0xff), id, serial);
+// faster than the first". The hash was not the problem. The lookup was: asking
+// the memory card whether a file exists, once per upload, thirty thousand times
+// a session. That is what the index below removes -- one directory walk at
+// startup, and every question after it is answered out of memory.
+//
+// It is worth reopening because of what it does to eviction rather than to
+// startup. Evicting a texture costs a write of a few hundred KB in the middle
+// of a frame, which is why writes are rationed to emergencies, which is why a
+// session with the card shut evicted 337 textures and then watched the pools
+// drain to nothing. A texture already in the store costs nothing to evict: the
+// bytes are on the card, so dropping it is free.
+static void texture_path(char *out, size_t out_size, uint64_t key, uint32_t bytes) {
+  snprintf(out, out_size, "%s/%02x/%08x%08x_%08x.tex", TEXTURE_CACHE_DIR,
+           (unsigned)(key & 0xff), (unsigned)(key >> 32), (unsigned)key, (unsigned)bytes);
 }
 
-static void texture_dir(char *out, size_t out_size, GLuint id) {
-  snprintf(out, out_size, "%s/%02x", TEXTURE_CACHE_DIR, (unsigned)(id & 0xff));
+/*
+ * The content key
+ */
+
+#define KEY_SEED 0xcbf29ce484222325ull
+#define KEY_PRIME 0x100000001b3ull
+
+static uint64_t key_fold(uint64_t h, uint32_t value) {
+  h ^= value;
+  return h * KEY_PRIME;
+}
+
+// A sample of the bytes rather than all of them, because this runs on the
+// render thread while an area is loading and that is the one place a stutter
+// shows. The ends in full and a slice every few KB through the middle covers
+// what actually differs between two textures; the exact size, dimensions and
+// format are folded in alongside, so two assets would have to agree on all of
+// that and on every sampled slice to collide. The record carries the key back
+// and a restore checks it, so a collision would be caught rather than drawn.
+#define KEY_ENDS_BYTES 8192
+#define KEY_STRIDE 8192
+#define KEY_SLICE 128
+
+static uint64_t key_words(uint64_t h, const uint8_t *bytes, uint32_t n) {
+  uint32_t i = 0;
+  for (; i + 4 <= n; i += 4) {
+    uint32_t word;
+    memcpy(&word, bytes + i, sizeof(word)); // the data is not promised aligned
+    h = key_fold(h, word);
+  }
+  for (; i < n; i++)
+    h = key_fold(h, bytes[i]);
+  return h;
+}
+
+static uint64_t key_sample(uint64_t h, const void *data, uint32_t size) {
+  const uint8_t *bytes = data;
+  h = key_fold(h, size);
+  if (size <= 2 * KEY_ENDS_BYTES)
+    return key_words(h, bytes, size);
+
+  h = key_words(h, bytes, KEY_ENDS_BYTES);
+  for (uint32_t at = KEY_ENDS_BYTES; at + KEY_SLICE <= size - KEY_ENDS_BYTES; at += KEY_STRIDE)
+    h = key_words(h, bytes + at, KEY_SLICE);
+  return key_words(h, bytes + size - KEY_ENDS_BYTES, KEY_ENDS_BYTES);
+}
+
+/*
+ * The store index
+ *
+ * Every file the store holds, by key, built once from a directory walk at
+ * startup. Its whole purpose is that "have we already got this texture?" is a
+ * question about memory and never about the card.
+ */
+
+#define STORE_SLOTS 16384 // a power of two, and well past what the cap allows
+#define STORE_MASK (STORE_SLOTS - 1)
+
+typedef struct {
+  uint64_t key;
+  uint32_t bytes;
+} StoreEntry;
+
+static StoreEntry store_index[STORE_SLOTS];
+static uint32_t store_files;
+static uint64_t store_bytes;
+static uint32_t store_reused; // evictions that found the bytes already there
+
+static uint32_t store_slot(uint64_t key) {
+  return (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 50) & STORE_MASK;
+}
+
+// Present, and holding exactly this many bytes. The size is checked as well as
+// the key because it is the one thing a restore cannot recover from getting
+// wrong: it memcpys that many bytes into the buffer vitaGL just allocated.
+static int store_has(uint64_t key, uint32_t bytes) {
+  if (!key)
+    return 0;
+  uint32_t i = store_slot(key);
+  for (uint32_t probe = 0; probe < 32; probe++) {
+    const StoreEntry *e = &store_index[(i + probe) & STORE_MASK];
+    if (!e->key)
+      return 0;
+    if (e->key == key)
+      return e->bytes == bytes;
+  }
+  return 0;
+}
+
+static void store_add(uint64_t key, uint32_t bytes) {
+  if (!key)
+    return;
+  uint32_t i = store_slot(key);
+  for (uint32_t probe = 0; probe < 32; probe++) {
+    StoreEntry *e = &store_index[(i + probe) & STORE_MASK];
+    if (e->key == key) {
+      store_bytes += bytes > e->bytes ? bytes - e->bytes : 0;
+      e->bytes = bytes;
+      return;
+    }
+    if (!e->key) {
+      e->key = key;
+      e->bytes = bytes;
+      store_files++;
+      store_bytes += bytes;
+      return;
+    }
+  }
+  // No room within the probe window. The file is still on the card and still
+  // correct; it simply will not be recognised, and the next eviction of that
+  // texture writes it again over the top.
+}
+
+static void texture_dir(char *out, size_t out_size, uint64_t key) {
+  snprintf(out, out_size, "%s/%02x", TEXTURE_CACHE_DIR, (unsigned)(key & 0xff));
 }
 
 static void backup_release(TextureInfo *info) {
@@ -290,6 +420,70 @@ static void texture_pin(GLuint id) {
 // on. They are copied as bare names, not paths: a directory name here is two
 // hex digits and a file name is under thirty characters, so the buffers stay
 // small enough to sit on a thread stack.
+// Reads the store into the index, and trims it to the cap on the way.
+//
+// One pass over 256 subdirectories at startup, taking the key and the byte
+// count straight out of each file name, so nothing is opened and nothing is
+// stat'd. Anything that does not parse is from an older build or a torn write
+// and goes; anything past the cap goes too, in whatever order the directory
+// hands it over. Losing a file is not a correctness problem -- it means one
+// eviction pays for a write again -- so there is no reason to spend a stat per
+// file working out which is oldest.
+static void scan_store(void) {
+  const uint64_t cap = (uint64_t)TEXTURE_BACKUP_MAX_MB * 1024 * 1024;
+
+  // The subdirectories that exist, listed once, rather than probing all 256 --
+  // this is a memory card and every open costs. Names are copied out of the
+  // listing before any of them is followed, since reading one directory while
+  // another is open is not something to rely on.
+  SceUID top = sceIoDopen(TEXTURE_CACHE_DIR);
+  if (top < 0)
+    return;
+  char subdirs[256][8];
+  int num_subdirs = 0;
+  SceIoDirent listing;
+  while (num_subdirs < 256 && sceIoDread(top, &listing) > 0) {
+    if (listing.d_name[0] == '.' || strlen(listing.d_name) >= sizeof(subdirs[0]))
+      continue;
+    strcpy(subdirs[num_subdirs], listing.d_name);
+    num_subdirs++;
+  }
+  sceIoDclose(top);
+
+  for (int sub = 0; sub < num_subdirs; sub++) {
+    char name[sizeof(subdirs[0])];
+    memcpy(name, subdirs[sub], sizeof(name)); // bounded and terminated on the way in
+    char dir_path[sizeof(TEXTURE_CACHE_DIR) + sizeof(name) + 1];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", TEXTURE_CACHE_DIR, name);
+    SceUID dir = sceIoDopen(dir_path);
+    if (dir < 0)
+      continue;
+
+    SceIoDirent entry;
+    while (sceIoDread(dir, &entry) > 0) {
+      if (entry.d_name[0] == '.')
+        continue;
+
+      unsigned hi = 0, lo = 0, bytes = 0;
+      char tail = 0;
+      int fields = sscanf(entry.d_name, "%8x%8x_%8x.tex%c", &hi, &lo, &bytes, &tail);
+      uint64_t key = ((uint64_t)hi << 32) | lo;
+      int usable = fields == 3 && key && bytes >= TEXTURE_BACKUP_MIN_BYTES &&
+                   bytes <= (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024 &&
+                   store_bytes + bytes <= cap && !store_has(key, bytes);
+      if (usable) {
+        store_add(key, bytes);
+        continue;
+      }
+
+      char victim[sizeof(dir_path) + sizeof(entry.d_name) + 1];
+      snprintf(victim, sizeof(victim), "%s/%s", dir_path, entry.d_name);
+      sceIoRemove(victim);
+    }
+    sceIoDclose(dir);
+  }
+}
+
 static void purge_store(void) {
   SceUID top = sceIoDopen(TEXTURE_CACHE_DIR);
   if (top < 0)
@@ -395,8 +589,19 @@ void texture_cache_init(void) {
     return;
   }
   sceIoMkdir(DATA_PATH, 0777);
-  purge_store();
+  if (sceIoGetstat(TEXTURE_STORE_WIPE_PATH, &stat) >= 0) {
+    traceLog("texture cache: wiping the store, %s is present\n", TEXTURE_STORE_WIPE_PATH);
+    purge_store();
+  }
   sceIoMkdir(TEXTURE_CACHE_DIR, 0777);
+
+  // The store is kept across runs now, so what it already holds has to be read
+  // before anything can decide whether a texture needs writing.
+  memset(store_index, 0, sizeof(store_index));
+  store_files = 0;
+  store_bytes = 0;
+  store_reused = 0;
+  scan_store();
 
   // The scratch buffer is allocated when a texture is first read back from the
   // card, not here. Spilling to the card is an emergency now and a whole
@@ -404,20 +609,23 @@ void texture_cache_init(void) {
   // against the possibility is four megabytes the game could have had -- and it
   // is dying of exactly that.
   backup_ready = 1;
-  traceLog("texture cache: store at %s (%d MB free on ux0), card tier %s\n",
+  traceLog("texture cache: store at %s (%d MB free on ux0), card tier %s, "
+           "%u textures kept from previous runs (%d MB)\n",
            TEXTURE_CACHE_DIR, (int)(card_free / (1024 * 1024)),
-           card_tier_enabled ? "open" : "shut");
+           card_tier_enabled ? "open" : "shut", (unsigned)store_files,
+           (int)(store_bytes / (1024 * 1024)));
 }
 
 void texture_cache_shutdown(void) {
   if (!backup_ready)
     return;
-  // Nothing here outlives the run: a file is named for a texture name and a
-  // generation of it, both of which the next run hands out to different
-  // textures. Clearing it now keeps the card tidy, and init clears it again in
-  // case the game did not get this far.
+  // The store stays. Its files are named for what the textures are rather than
+  // for the slots they happened to occupy, so every one of them is still the
+  // right file for that texture next time the game runs -- and a texture the
+  // store already holds is one the cache can evict for free, which is the
+  // difference between reclaiming occasionally and reclaiming whenever it needs
+  // to. init trims it back to the cap on the way in.
   backup_ready = 0;
-  purge_store();
   free(restore_scratch);
   restore_scratch = NULL;
 }
@@ -447,6 +655,13 @@ static int backup_stage(TextureInfo *info, GLuint id, GLint level, GLsizei width
     info->format = format;
     info->type = type;
     info->compressed_upload = (uint8_t)compressed;
+    // The shape first, then each level's bytes as they arrive. Two textures
+    // would have to agree on the format, every level's dimensions and every
+    // sampled slice of every level to end up with the same key.
+    info->key = key_fold(key_fold(key_fold(key_fold(KEY_SEED, (uint32_t)internalformat),
+                                           (uint32_t)format),
+                                  (uint32_t)type),
+                         (uint32_t)compressed);
   } else if (info->levels != (uint8_t)level) {
     // Levels have to arrive in order and exactly once: restoring walks them
     // from zero, and a gap or a repeat would rebuild a different texture.
@@ -457,6 +672,8 @@ static int backup_stage(TextureInfo *info, GLuint id, GLint level, GLsizei width
   info->level[level].height = (uint16_t)height;
   info->level[level].size = size;
   info->levels++;
+  info->key = key_sample(key_fold(key_fold(info->key, (uint32_t)width), (uint32_t)height),
+                         data, size);
   return 1;
 }
 
@@ -487,6 +704,19 @@ static int backup_capture(TextureInfo *info, GLuint id) {
     return 0;
   if (info->resident_size < TEXTURE_BACKUP_MIN_BYTES)
     return 0; // too small to be worth saving; it simply stays resident
+
+  // Already on the card, from this run or a previous one -- so there is nothing
+  // to do. No bind, no readback, no heap copy, no write.
+  //
+  // First of everything, and before the ration below in particular. A ration
+  // exists to keep a write out of a frame, and there is no write here; leaving
+  // this until after it, which is where it started, meant a free eviction was
+  // refused for the cost of one it was not going to pay.
+  if (store_has(info->key, info->resident_size)) {
+    info->backup_bytes = info->resident_size;
+    store_reused++;
+    return 1;
+  }
 
   // Decided before reading the texture back, so that a frame which has used up
   // its card writes does not pay for a bind and a pointer fetch to find out.
@@ -526,14 +756,14 @@ static int backup_capture(TextureInfo *info, GLuint id) {
   }
 
   char dir[160], path[160];
-  texture_dir(dir, sizeof(dir), id);
+  texture_dir(dir, sizeof(dir), info->key);
   sceIoMkdir(dir, 0777);
-  texture_path(path, sizeof(path), id, info->serial);
+  texture_path(path, sizeof(path), info->key, info->resident_size);
 
   BackupRecord record;
   record.magic = BACKUP_MAGIC;
-  record.id = id;
-  record.serial = info->serial;
+  record.key_lo = (uint32_t)info->key;
+  record.key_hi = (uint32_t)(info->key >> 32);
   record.bytes = info->resident_size;
   record.checksum = checksum(pixels, info->resident_size);
 
@@ -548,6 +778,7 @@ static int backup_capture(TextureInfo *info, GLuint id) {
     return -1;
   }
   info->backup_bytes = info->resident_size;
+  store_add(info->key, info->resident_size);
   card_evicted_count++;
   return 1;
 }
@@ -580,7 +811,7 @@ static int restore_texture(GLuint id) {
   uint32_t saved_bytes = info->backup_bytes;
   if (!saved) {
     char path[160];
-    texture_path(path, sizeof(path), id, info->serial);
+    texture_path(path, sizeof(path), info->key, info->backup_bytes);
     if (!restore_scratch) {
       restore_scratch = malloc((size_t)TEXTURE_BACKUP_MAX_KB * 1024);
       if (!restore_scratch)
@@ -593,8 +824,13 @@ static int restore_texture(GLuint id) {
     BackupRecord record;
     int header = sceIoRead(fd, &record, sizeof(record));
     int got = 0;
-    if (header == (int)sizeof(record) && record.magic == BACKUP_MAGIC && record.id == id &&
-        record.serial == info->serial && record.bytes == info->backup_bytes &&
+    // The key as well as the size, because a file reached across a restart is
+    // only the right file if it is for this texture. Everything else here
+    // guards against a torn or truncated write; this guards against the wrong
+    // texture being drawn, which is the failure that would not announce itself.
+    uint64_t stored_key = ((uint64_t)record.key_hi << 32) | record.key_lo;
+    if (header == (int)sizeof(record) && record.magic == BACKUP_MAGIC &&
+        stored_key == info->key && record.bytes == info->backup_bytes &&
         record.bytes <= (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
       got = sceIoRead(fd, restore_scratch, record.bytes);
     sceIoClose(fd);
@@ -1030,9 +1266,6 @@ static void upload_finished(GLenum target, GLint level, GLsizei width, GLsizei h
     return;
   }
 
-  if (level == 0)
-    info->serial = ++upload_serial;
-
   if (level == 0 || !info->unbacked)
     info->unbacked = !backup_stage(info, id, level, width, height, source_bytes, internalformat,
                                    format, type, compressed, data);
@@ -1112,6 +1345,8 @@ void texture_cache_stats(TextureCacheStats *out) {
   out->restored = (int)restored_count;
   out->failed = (int)restore_failed_count;
   out->spilled = (int)card_evicted_count;
+  out->reused = (int)store_reused;
+  out->stored = (int)store_files;
   out->starved = (int)starved_frames;
   out->deferred = (int)deferred_count;
   out->blocked = (int)blocked_frames;

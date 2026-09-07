@@ -237,14 +237,16 @@ int ProcessEvents(void) {
     if ((size_t)heap.uordblks > heap_peak)
       heap_peak = (size_t)heap.uordblks;
     traceLog("loop: %d | tex %d draw %d | vgl ram %d cdram %d phycont %d MB | heap %d MB | "
-             "cache %d MB parked %d ev %d re %d lost %d spill %d starve %d defer %d block %d\n",
+             "cache %d MB parked %d ev %d re %d lost %d spill %d free %d store %d "
+             "starve %d defer %d block %d\n",
              events, trace_textures, trace_draws,
              (int)(vglMemFree(VGL_MEM_RAM) / (1024 * 1024)),
              (int)(vglMemFree(VGL_MEM_VRAM) / (1024 * 1024)),
              (int)(vglMemFree(VGL_MEM_PHYCONT) / (1024 * 1024)),
              (int)(heap.uordblks / (1024 * 1024)),
              cache.tracked_mb, cache.parked_mb, cache.evicted, cache.restored, cache.failed,
-             cache.spilled, cache.starved, cache.deferred, cache.blocked);
+             cache.spilled, cache.reused, cache.stored, cache.starved, cache.deferred,
+             cache.blocked);
     // Frames actually presented since the last heartbeat, over the wall clock
     // between them. vsync is disabled, so this is what the hardware managed.
     static int last_frames;
