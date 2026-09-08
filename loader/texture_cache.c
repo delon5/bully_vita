@@ -275,6 +275,31 @@ static void texture_path(char *out, size_t out_size, uint64_t key, uint32_t byte
  */
 #define UPLOAD_SAMPLE 64
 static uint32_t upload_samples, upload_count;
+
+/*
+ * Where a restore's time goes
+ *
+ * Restores are what the freeze is made of. Grouped by how many happened in a
+ * heartbeat, the frame rate inside it goes 28.4, 19.4, 19.3, 11.7, 2.3 -- and
+ * two thirds of the heartbeats with fifteen or more restores presented fewer
+ * than five frames. Nothing else in the trace moves like that.
+ *
+ * What is not known is why one costs what it does. The burst at loop 1401600
+ * implies about 230 ms each, and the parts that can be costed from first
+ * principles come nowhere near it: those textures averaged 55 KB, which is
+ * roughly 5 ms of card read, 0.6 ms of checksum and a rounding error of memcpy.
+ * The pools had 24 MB free throughout so the urgent eviction never fired, and
+ * vitaGL logged no allocation failure all session. Two hundred milliseconds per
+ * restore are unaccounted for.
+ *
+ * Every previous gap like this in this port was closed by measuring rather than
+ * by argument, and every attempt to reason one out was wrong. So time all five
+ * parts. There are only a couple of hundred restores in a session, so this
+ * times every one rather than sampling.
+ */
+static uint64_t restore_open_us, restore_read_us, restore_sum_us, restore_replay_us,
+    restore_copy_us;
+static uint32_t restore_from_heap, restore_from_card;
 static uint64_t upload_driver_us; // inside vitaGL, uploading and swizzling
 static uint64_t upload_loader_us; // inside the cache, almost all of it the key
 static uint64_t key_bytes_hashed;
@@ -840,6 +865,7 @@ static void install_placeholder(GLuint id) {
 
 static int restore_texture(GLuint id) {
   TextureInfo *info = &textures[id];
+  uint32_t t_enter = upload_now_us();
 
   // Where the bytes come back from. A heap copy is already in memory we own, so
   // it is used in place; only a texture that had to spill to the card is read
@@ -855,7 +881,10 @@ static int restore_texture(GLuint id) {
         return 0; // no room to read it back; the placeholder stays
     }
 
+    uint32_t t_open = upload_now_us();
     SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    uint32_t t_opened = upload_now_us();
+    restore_open_us += t_opened - t_open;
     if (fd < 0)
       return 0;
     BackupRecord record;
@@ -870,10 +899,14 @@ static int restore_texture(GLuint id) {
         stored_key == info->key && record.bytes == info->backup_bytes &&
         record.bytes <= (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
       got = sceIoRead(fd, restore_scratch, record.bytes);
+    uint32_t t_read = upload_now_us();
+    restore_read_us += t_read - t_opened; // opening is counted on its own above
     sceIoClose(fd);
     if (got != (int)record.bytes)
       return 0;
-    if (checksum(restore_scratch, record.bytes) != record.checksum)
+    int bad = checksum(restore_scratch, record.bytes) != record.checksum;
+    restore_sum_us += upload_now_us() - t_read;
+    if (bad)
       return 0;
     saved = restore_scratch;
     saved_bytes = record.bytes;
@@ -886,6 +919,7 @@ static int restore_texture(GLuint id) {
   // Replay every level the game uploaded, with no pixels. Allocating only the
   // base level would leave a buffer smaller than the mip chain that was
   // captured, and the copy below would run off the end of it.
+  uint32_t t_replay = upload_now_us();
   glBindTexture(GL_TEXTURE_2D, id);
   for (int i = 0; i < info->levels; i++) {
     if (info->compressed_upload)
@@ -896,12 +930,20 @@ static int restore_texture(GLuint id) {
                    info->level[i].height, 0, info->format, info->type, NULL);
   }
 
+  uint32_t t_copy = upload_now_us();
+  restore_replay_us += t_copy - t_replay;
   void *pixels = vglGetTexDataPointer(GL_TEXTURE_2D);
   if (!pixels) {
     install_placeholder(id);
     return 0;
   }
   memcpy(pixels, saved, saved_bytes);
+  restore_copy_us += upload_now_us() - t_copy;
+  if (info->ram_copy)
+    restore_from_heap++;
+  else
+    restore_from_card++;
+  (void)t_enter;
 
   // The heap copy has done its job and is the expensive one to keep around.
   if (info->ram_copy) {
@@ -1428,6 +1470,13 @@ void texture_cache_stats(TextureCacheStats *out) {
   out->upload_driver_ms = (int)(upload_driver_us * UPLOAD_SAMPLE / 1000);
   out->upload_loader_ms = (int)(upload_loader_us * UPLOAD_SAMPLE / 1000);
   out->key_hashed_mb = (int)(key_bytes_hashed / (1024 * 1024));
+  out->restore_open_ms = (int)(restore_open_us / 1000);
+  out->restore_read_ms = (int)(restore_read_us / 1000);
+  out->restore_sum_ms = (int)(restore_sum_us / 1000);
+  out->restore_replay_ms = (int)(restore_replay_us / 1000);
+  out->restore_copy_ms = (int)(restore_copy_us / 1000);
+  out->restore_from_heap = (int)restore_from_heap;
+  out->restore_from_card = (int)restore_from_card;
   out->stored = (int)store_files;
   out->starved = (int)starved_frames;
   out->deferred = (int)deferred_count;

@@ -50,6 +50,11 @@ typedef struct {
   int upload_driver_ms;
   int upload_loader_ms;
   int key_hashed_mb;
+  // A restore split into its parts. Heartbeats with fifteen or more of these
+  // average 2.3 fps against 28.4 with none, and the per-restore cost the trace
+  // implies is an order of magnitude above what the bytes can explain.
+  int restore_open_ms, restore_read_ms, restore_sum_ms, restore_replay_ms, restore_copy_ms;
+  int restore_from_heap, restore_from_card;
   int stored;  // textures the store carried in from previous runs
   int starved; // frames it failed to get back under its limits
   int deferred; // evictions it wanted to make and could not, for want of a copy

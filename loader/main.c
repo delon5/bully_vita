@@ -329,6 +329,11 @@ int ProcessEvents(void) {
     // loader's own work on top of it.
     traceLog("upload: %d ms in the driver, %d ms in the cache, %d MB hashed\n",
              cache.upload_driver_ms, cache.upload_loader_ms, cache.key_hashed_mb);
+    traceLog("restore: %d open, %d read, %d checksum, %d replay, %d copy (ms); "
+             "%d from the heap, %d from the card\n",
+             cache.restore_open_ms, cache.restore_read_ms, cache.restore_sum_ms,
+             cache.restore_replay_ms, cache.restore_copy_ms, cache.restore_from_heap,
+             cache.restore_from_card);
     // ...and the same for the file reads the game does to fill those textures
     // and everything else an area is made of. Scaled up from the sample.
     traceLog("io: %d ms reading, %d ms seeking, %d MB over %u reads, %u seeks, "
