@@ -77,6 +77,16 @@ SceTouchPanelInfo panelInfoFront;
 so_module bully_mod;
 
 void *__wrap_memcpy(void *dest, const void *src, size_t n) {
+  // A sample of the game's memcpy callers, for the profile in game_memory.c.
+  //
+  // The decision comes from the destination pointer, not from a counter. A
+  // counter here would be one shared cache line written by four threads on the
+  // hottest path in the process, which is the shape of the mistake that turned
+  // area loads into a slideshow when the allocation tracer took a lock per
+  // malloc. This is a pure function of an argument already in a register:
+  // roughly one call in 256, and nothing shared is touched on the other 255.
+  if ((((uintptr_t)dest >> 6) & 0xff) == 0)
+    game_memory_note_caller(__builtin_return_address(0));
   return sceClibMemcpy(dest, src, n);
 }
 
@@ -334,6 +344,9 @@ int ProcessEvents(void) {
              cache.restore_open_ms, cache.restore_read_ms, cache.restore_sum_ms,
              cache.restore_replay_ms, cache.restore_copy_ms, cache.restore_from_heap,
              cache.restore_from_card);
+    // Which game code was running since the last heartbeat. During a freeze
+    // this is the only line that can see the 53% nothing else accounts for.
+    game_memory_hot_report();
     // ...and the same for the file reads the game does to fill those textures
     // and everything else an area is made of. Scaled up from the sample.
     traceLog("io: %d ms reading, %d ms seeking, %d MB over %u reads, %u seeks, "
