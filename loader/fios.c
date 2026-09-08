@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <psp2/io/stat.h>
+
 #include "main.h"
 #include "config.h"
 #include "fios.h"
@@ -28,6 +30,33 @@
 // a carefully chosen figure to begin with.
 #define RAMCACHEBLOCKSIZE (32 * 1024)
 #define RAMCACHEBLOCKNUM 512
+
+// ...and a way to prove whether any of it is doing anything.
+//
+// These caches are registered with sceFiosIOFilterAdd, which puts them in front
+// of files opened through the FIOS file API. Nothing in the loader opens a file
+// that way. The game reads through fopen and fread, which the loader resolves
+// to sceLibc's, and sceLibc goes to sceIo -- not through FIOS's filter chain at
+// all. On that reading these two buffers are 32 MB of the game's heap held for
+// a whole session and used by nothing.
+//
+// The measurement agrees: 375 MB arrived in 49894 reads averaging 2.8 ms each,
+// which is 2.7 MB/s off a card that manages fifteen or more. Nothing served out
+// of a RAM cache takes 2.8 ms.
+//
+// But "on that reading" has been wrong three times in this port already, and
+// this is 32 MB. So rather than delete it on an argument, make it testable:
+// with this file present the caches are allocated one block each instead of
+// five hundred and twelve. If the read timings in the trace do not move, they
+// were never in the path and the memory can go to the game.
+static int ram_cache_blocks(void) {
+  SceIoStat stat;
+  if (sceIoGetstat(FIOS_CACHE_DISABLE_PATH, &stat) >= 0) {
+    traceLog("fios: RAM caches cut to one block by %s\n", FIOS_CACHE_DISABLE_PATH);
+    return 1;
+  }
+  return RAMCACHEBLOCKNUM;
+}
 
 static int64_t g_OpStorage[SCE_FIOS_OP_STORAGE_SIZE(64, MAX_PATH_LENGTH) / sizeof(int64_t) + 1];
 static int64_t g_ChunkStorage[SCE_FIOS_CHUNK_STORAGE_SIZE(1024) / sizeof(int64_t) + 1];
@@ -66,30 +95,33 @@ int fios_init(void) {
   if (res < 0)
     return res;
 
-  g_MainRamCacheWorkBuffer = memalign(8, RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE);
+  int blocks = ram_cache_blocks();
+  g_MainRamCacheWorkBuffer = memalign(8, blocks * RAMCACHEBLOCKSIZE);
   if (!g_MainRamCacheWorkBuffer)
     return -1;
 
   g_MainRamCacheContext.pPath = DATA_PATH "/Android/main.obb";
   g_MainRamCacheContext.pWorkBuffer = g_MainRamCacheWorkBuffer;
-  g_MainRamCacheContext.workBufferSize = RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE;
+  g_MainRamCacheContext.workBufferSize = blocks * RAMCACHEBLOCKSIZE;
   g_MainRamCacheContext.blockSize = RAMCACHEBLOCKSIZE;
   res = sceFiosIOFilterAdd(0, sceFiosIOFilterCache, &g_MainRamCacheContext);
   if (res < 0)
     return res;
 
-  g_PatchRamCacheWorkBuffer = memalign(8, RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE);
+  g_PatchRamCacheWorkBuffer = memalign(8, blocks * RAMCACHEBLOCKSIZE);
   if (!g_PatchRamCacheWorkBuffer)
     return -1;
 
   g_PatchRamCacheContext.pPath = DATA_PATH "/Android/patch.obb";
   g_PatchRamCacheContext.pWorkBuffer = g_PatchRamCacheWorkBuffer;
-  g_PatchRamCacheContext.workBufferSize = RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE;
+  g_PatchRamCacheContext.workBufferSize = blocks * RAMCACHEBLOCKSIZE;
   g_PatchRamCacheContext.blockSize = RAMCACHEBLOCKSIZE;
   res = sceFiosIOFilterAdd(1, sceFiosIOFilterCache, &g_PatchRamCacheContext);
   if (res < 0)
     return res;
 
+  traceLog("fios: two RAM caches of %d MB registered over the archives\n",
+           blocks * RAMCACHEBLOCKSIZE / (1024 * 1024));
   return 0;
 }
 

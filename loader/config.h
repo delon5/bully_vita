@@ -223,6 +223,11 @@
 // launch starts from nothing.
 #define TEXTURE_STORE_WIPE_PATH DATA_PATH "/" "wipe_texcache"
 
+// Create this file to cut the FIOS RAM caches to one block each, freeing the
+// 32 MB they hold. See the comment in fios.c: it is a controlled test of
+// whether they are in the path of the game's reads at all.
+#define FIOS_CACHE_DISABLE_PATH DATA_PATH "/" "no_fioscache"
+
 // How much texture data the game is allowed to keep resident. The Android
 // build never evicts anything, so this is what keeps it inside what vitaGL can
 // hand out on a Vita (128MB of CDRAM plus whatever is left of main RAM once the

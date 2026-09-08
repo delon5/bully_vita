@@ -140,9 +140,19 @@ void vgl_file_log(const char *fmt, ...) {
  * misses the cache goes to a memory card, and a memory card is slow enough that
  * a few hundred of them is a freeze.
  */
-#define IO_SAMPLE 32
-static uint32_t io_reads, io_samples;
+// One in eight now, not one in thirty-two. At thirty-two a stalled heartbeat
+// held six samples, and one slow outlier among them scaled to 3556 ms of
+// reading inside a heartbeat that cannot have lasted more than about a second.
+// The session total was sound; the per-heartbeat figures were not.
+#define IO_SAMPLE 8
+static uint32_t io_reads, io_samples, io_seeks, io_sequential;
 static uint64_t io_read_us, io_read_bytes, io_seek_us;
+// Read sizes, in buckets: under 4K, under 16K, under 64K, and the rest. 375 MB
+// arrived in 49894 reads at 2.8 ms each, which is 2.7 MB/s off a card that does
+// fifteen or more -- the shape of per-call latency rather than of bandwidth.
+// Whether coalescing them would help depends entirely on whether they are
+// sequential, and that has never been looked at.
+static uint32_t io_size_buckets[4];
 
 static uint32_t io_now_us(void) {
   SceKernelSysClock now;
@@ -150,7 +160,20 @@ static uint32_t io_now_us(void) {
   return (uint32_t)now;
 }
 
+// Whether this read carried on from where the last one on the same file ended.
+// A run of those is a stream and coalescing it would pay; a file that is seeked
+// around between every read would only waste the bandwidth.
+static FILE *io_last_stream;
+static long io_last_end;
+
 static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
+  size_t want = size * count;
+  io_size_buckets[want < 4096 ? 0 : want < 16384 ? 1 : want < 65536 ? 2 : 3]++;
+
+  long start = sceLibcBridge_ftell(stream);
+  if (stream == io_last_stream && start == io_last_end)
+    io_sequential++;
+
   int timed = ++io_reads % IO_SAMPLE == 0;
   uint32_t t0 = timed ? io_now_us() : 0;
   size_t got = sceLibcBridge_fread(ptr, size, count, stream);
@@ -159,11 +182,14 @@ static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
     io_samples++;
   }
   io_read_bytes += got * size;
+  io_last_stream = stream;
+  io_last_end = start + (long)(got * size);
   return got;
 }
 
 static int traced_fseek(FILE *stream, long int offset, int origin) {
-  int timed = io_reads % IO_SAMPLE == 0;
+  io_seeks++;
+  int timed = io_seeks % IO_SAMPLE == 0;
   uint32_t t0 = timed ? io_now_us() : 0;
   int r = sceLibcBridge_fseek(stream, offset, origin);
   if (timed)
@@ -305,9 +331,12 @@ int ProcessEvents(void) {
              cache.upload_driver_ms, cache.upload_loader_ms, cache.key_hashed_mb);
     // ...and the same for the file reads the game does to fill those textures
     // and everything else an area is made of. Scaled up from the sample.
-    traceLog("io: %d ms reading, %d ms seeking, %d MB over %u reads\n",
+    traceLog("io: %d ms reading, %d ms seeking, %d MB over %u reads, %u seeks, "
+             "%u sequential | sizes <4K %u <16K %u <64K %u more %u\n",
              (int)(io_read_us * IO_SAMPLE / 1000), (int)(io_seek_us * IO_SAMPLE / 1000),
-             (int)(io_read_bytes / (1024 * 1024)), (unsigned)io_reads);
+             (int)(io_read_bytes / (1024 * 1024)), (unsigned)io_reads, (unsigned)io_seeks,
+             (unsigned)io_sequential, io_size_buckets[0], io_size_buckets[1],
+             io_size_buckets[2], io_size_buckets[3]);
     // Frames actually presented since the last heartbeat, over the wall clock
     // between them. vsync is disabled, so this is what the hardware managed.
     static int last_frames;
@@ -317,11 +346,17 @@ int ProcessEvents(void) {
     uint32_t us = (uint32_t)now;
     int drawn = frames_swapped - last_frames;
     int fps = 0;
-    if (last_us && us > last_us)
-      fps = (int)(((uint64_t)drawn * 1000000u) / (us - last_us));
+    // How long this heartbeat actually took. Every millisecond figure in the
+    // lines above is only meaningful against it: "953 ms of reading" is nearly
+    // the whole of a one second heartbeat and a third of a three second one,
+    // and until now there was no way to tell which.
+    uint32_t elapsed_us = last_us && us > last_us ? us - last_us : 0;
+    if (elapsed_us)
+      fps = (int)(((uint64_t)drawn * 1000000u) / elapsed_us);
     last_frames = frames_swapped;
     last_us = us;
-    traceLog("fps: %d over the last %d frames\n", fps, drawn);
+    traceLog("fps: %d over the last %d frames, %d ms since the last heartbeat\n", fps, drawn,
+             (int)(elapsed_us / 1000));
     traceLog("heapinfo: arena %d MB, live %d MB, free-listed %d MB, top %d KB, peak %d MB\n",
              (int)(heap.arena / (1024 * 1024)), (int)(heap.uordblks / (1024 * 1024)),
              (int)(heap.fordblks / (1024 * 1024)), (int)(heap.keepcost / 1024),
