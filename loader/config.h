@@ -157,13 +157,20 @@
 // you are walking into.
 #define TEXTURE_CACHE_IDLE_FRAMES 240
 
-// vitaGL reports "Circular pool overrun on frame 376 (Total of 6532574 bytes)"
-// during the attract mode, which it warns costs performance. The default is
-// 32MB and the game asks for a little over 6MB in a single frame there, so the
-// overrun is transient spikes rather than a steady shortfall; 48MB absorbs them
-// with room to spare and still leaves the heaps well clear of the budget the
-// texture cache works to.
-#define MEMORY_VITAGL_CIRCULAR_POOL_MB 48
+// There was a MEMORY_VITAGL_CIRCULAR_POOL_MB here, set to 48, with a comment
+// saying 48 MB absorbed the overruns "with room to spare". Nothing ever read
+// it: vglSetCircularPoolSize is not called anywhere in the loader, so vitaGL
+// has been running its 32 MB default the whole time and the comment described
+// a build that never existed.
+//
+// Reading it properly, the pool is not spare memory to reclaim -- it is
+// already short. It is split across gxm_display_buffer_count buffers, which is
+// three, so each frame has 10.6 MB of it; and vitaGL only logs the overrun,
+// which reports the overshoot rather than the demand. An overshoot of 6535454
+// bytes against a 10.6 MB allowance means that frame wanted about 17 MB. It
+// comes out of the same RAM the textures allocate from, so raising it costs the
+// texture pool directly, and it has overrun exactly once per session, during
+// the attract movie, never in play. Left at vitaGL's default deliberately.
 
 // Create this file to turn the loader's texture cache off.
 //
