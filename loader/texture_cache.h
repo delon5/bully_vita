@@ -43,6 +43,13 @@ typedef struct {
   int evicted, restored, failed;
   int spilled; // evictions that had to reach the memory card
   int reused;  // evictions that cost nothing, the store already holding them
+  // An area load presents no frames for up to fifteen heartbeats while the game
+  // uploads thousands of textures. These say how that time divides between
+  // vitaGL doing the upload and the loader doing its own bookkeeping on top,
+  // so the question stops being answered by argument.
+  int upload_driver_ms;
+  int upload_loader_ms;
+  int key_hashed_mb;
   int stored;  // textures the store carried in from previous runs
   int starved; // frames it failed to get back under its limits
   int deferred; // evictions it wanted to make and could not, for want of a copy

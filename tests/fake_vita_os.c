@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 int debugPrintf(char *text, ...) { (void)text; return 0; }
@@ -217,4 +218,14 @@ struct mallinfo mallinfo(void) {
   memset(&m, 0, sizeof(m));
   m.uordblks = (int)fake_heap_used;
   return m;
+}
+
+// The upload path times itself on a sample of uploads, so the tests need a
+// clock. Wall time is fine: nothing asserts on the figures, they only have to
+// not be garbage.
+int sceKernelGetProcessTime(SceKernelSysClock *clock) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  *clock = (SceKernelSysClock)ts.tv_sec * 1000000ull + ts.tv_nsec / 1000;
+  return 0;
 }

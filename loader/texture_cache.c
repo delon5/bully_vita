@@ -31,6 +31,7 @@
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include <vitaGL.h>
 
@@ -253,6 +254,38 @@ static void texture_path(char *out, size_t out_size, uint64_t key, uint32_t byte
 }
 
 /*
+ * Where an area load's time actually goes
+ *
+ * A load is fifteen heartbeats with no frame presented at all: draw frozen at
+ * 44453 while tex climbs 10523 -> 14891, four thousand textures uploaded and
+ * not one of them evicted, restored or written -- ev, re, spill and free all
+ * zero throughout, because the tick that would do any of that runs in
+ * swapBuffers and swapBuffers is not being called. The game uploads the area
+ * synchronously and the cache is a bystander.
+ *
+ * That has been true of every build measured, from before the store existed:
+ * the longest stall is 12, 12, 13, 13 and 15 heartbeats across five sessions.
+ * So it is not something recently introduced -- but the loader does add work to
+ * every upload, chiefly hashing the source bytes for the store's content key,
+ * and guessing at how much of a load that is has no place here after this many
+ * rounds of it. Time both sides and let the trace say.
+ *
+ * Sampled, because sceKernelGetProcessTime is a syscall and this path runs
+ * forty thousand times a session.
+ */
+#define UPLOAD_SAMPLE 64
+static uint32_t upload_samples, upload_count;
+static uint64_t upload_driver_us; // inside vitaGL, uploading and swizzling
+static uint64_t upload_loader_us; // inside the cache, almost all of it the key
+static uint64_t key_bytes_hashed;
+
+static uint32_t upload_now_us(void) {
+  SceKernelSysClock now;
+  sceKernelGetProcessTime(&now);
+  return (uint32_t)now;
+}
+
+/*
  * The content key
  */
 
@@ -290,9 +323,12 @@ static uint64_t key_words(uint64_t h, const uint8_t *bytes, uint32_t n) {
 static uint64_t key_sample(uint64_t h, const void *data, uint32_t size) {
   const uint8_t *bytes = data;
   h = key_fold(h, size);
-  if (size <= 2 * KEY_ENDS_BYTES)
+  if (size <= 2 * KEY_ENDS_BYTES) {
+    key_bytes_hashed += size;
     return key_words(h, bytes, size);
+  }
 
+  key_bytes_hashed += 2 * KEY_ENDS_BYTES + (size / KEY_STRIDE) * KEY_SLICE;
   h = key_words(h, bytes, KEY_ENDS_BYTES);
   for (uint32_t at = KEY_ENDS_BYTES; at + KEY_SLICE <= size - KEY_ENDS_BYTES; at += KEY_STRIDE)
     h = key_words(h, bytes + at, KEY_SLICE);
@@ -319,6 +355,7 @@ static StoreEntry store_index[STORE_SLOTS];
 static uint32_t store_files;
 static uint64_t store_bytes;
 static uint32_t store_reused; // evictions that found the bytes already there
+
 
 static uint32_t store_slot(uint64_t key) {
   return (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 50) & STORE_MASK;
@@ -1313,13 +1350,21 @@ void glTexImage2DHook(GLenum target, GLint level, GLint internalformat, GLsizei 
   if (level != 0)
     return;
 
+  int timed = ++upload_count % UPLOAD_SAMPLE == 0;
+  uint32_t t0 = timed ? upload_now_us() : 0;
   glTexImage2D(target, level, internalformat, width, height, border, format, type, data);
+  uint32_t t1 = timed ? upload_now_us() : 0;
 
   uint32_t bpp = bytes_per_pixel(internalformat, type);
   upload_finished(target, level, width, height,
                   (uint32_t)width * (uint32_t)height * bytes_per_pixel(format, type),
                   (uint32_t)((width + 7) & ~7) * (uint32_t)height * bpp,
                   internalformat, format, type, 0, data);
+  if (timed) {
+    upload_driver_us += t1 - t0;
+    upload_loader_us += upload_now_us() - t1;
+    upload_samples++;
+  }
 }
 
 void glCompressedTexImage2DHook(GLenum target, GLint level, GLenum format, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void *data) {
@@ -1330,9 +1375,17 @@ void glCompressedTexImage2DHook(GLenum target, GLint level, GLenum format, GLsiz
   if (!(level == 0 || ((width >= 4 && height >= 4) || (format != 0x8C01 && format != 0x8C02))))
     return;
 
+  int timed = ++upload_count % UPLOAD_SAMPLE == 0;
+  uint32_t t0 = timed ? upload_now_us() : 0;
   glCompressedTexImage2D(target, level, format, width, height, border, imageSize, data);
+  uint32_t t1 = timed ? upload_now_us() : 0;
 
   upload_finished(target, level, width, height, imageSize, imageSize, format, format, 0, 1, data);
+  if (timed) {
+    upload_driver_us += t1 - t0;
+    upload_loader_us += upload_now_us() - t1;
+    upload_samples++;
+  }
 }
 
 void glTexSubImage2DHook(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels) {
@@ -1371,6 +1424,10 @@ void texture_cache_stats(TextureCacheStats *out) {
   out->failed = (int)restore_failed_count;
   out->spilled = (int)card_evicted_count;
   out->reused = (int)store_reused;
+  // Scaled back up from the sample, so these read as whole-session totals.
+  out->upload_driver_ms = (int)(upload_driver_us * UPLOAD_SAMPLE / 1000);
+  out->upload_loader_ms = (int)(upload_loader_us * UPLOAD_SAMPLE / 1000);
+  out->key_hashed_mb = (int)(key_bytes_hashed / (1024 * 1024));
   out->stored = (int)store_files;
   out->starved = (int)starved_frames;
   out->deferred = (int)deferred_count;

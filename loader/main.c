@@ -247,6 +247,13 @@ int ProcessEvents(void) {
              cache.tracked_mb, cache.parked_mb, cache.evicted, cache.restored, cache.failed,
              cache.spilled, cache.reused, cache.stored, cache.starved, cache.deferred,
              cache.blocked);
+    // Where an area load's time goes. The freeze on walking into a new area is
+    // fifteen heartbeats with no frame presented while the game uploads four
+    // thousand textures, and the cache does nothing at all through it. These
+    // two say how much of that is vitaGL doing the upload and how much is the
+    // loader's own work on top of it.
+    traceLog("upload: %d ms in the driver, %d ms in the cache, %d MB hashed\n",
+             cache.upload_driver_ms, cache.upload_loader_ms, cache.key_hashed_mb);
     // Frames actually presented since the last heartbeat, over the wall clock
     // between them. vsync is disabled, so this is what the hardware managed.
     static int last_frames;

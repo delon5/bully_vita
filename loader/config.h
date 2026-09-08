@@ -286,6 +286,7 @@
 // memory does not turn into a visible hitch.
 #define TEXTURE_EVICTIONS_PER_FRAME 64
 
+
 // Evicted textures are held in the newlib heap up to this much, and only spill
 // to the memory card past it. The heap is not GPU-mappable, so a texture parked
 // there has genuinely left the pools vitaGL allocates from, which is the memory
