@@ -122,6 +122,55 @@ void vgl_file_log(const char *fmt, ...) {
 #endif
 }
 
+/*
+ * Where an area load's time actually goes, part two
+ *
+ * Timing the texture path answered its own question and closed it: over a
+ * session, 4363 ms inside vitaGL uploading and 312 ms inside the loader's cache
+ * on top. During a five heartbeat freeze with no frame presented at all, the
+ * whole texture path came to 175 ms. It is not the textures.
+ *
+ * So measure the other half. The game reads its archives through fread, and the
+ * loader put a FIOS RAM cache in front of that and then halved it -- from 1024
+ * blocks to 512, twice over, because the heap was running out and the cache was
+ * the largest single allocation in the process. That was the right call for the
+ * crash and it has never been checked against the stutter it might have bought.
+ *
+ * Same method: sample the calls, time them, and let the trace say. A read that
+ * misses the cache goes to a memory card, and a memory card is slow enough that
+ * a few hundred of them is a freeze.
+ */
+#define IO_SAMPLE 32
+static uint32_t io_reads, io_samples;
+static uint64_t io_read_us, io_read_bytes, io_seek_us;
+
+static uint32_t io_now_us(void) {
+  SceKernelSysClock now;
+  sceKernelGetProcessTime(&now);
+  return (uint32_t)now;
+}
+
+static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
+  int timed = ++io_reads % IO_SAMPLE == 0;
+  uint32_t t0 = timed ? io_now_us() : 0;
+  size_t got = sceLibcBridge_fread(ptr, size, count, stream);
+  if (timed) {
+    io_read_us += io_now_us() - t0;
+    io_samples++;
+  }
+  io_read_bytes += got * size;
+  return got;
+}
+
+static int traced_fseek(FILE *stream, long int offset, int origin) {
+  int timed = io_reads % IO_SAMPLE == 0;
+  uint32_t t0 = timed ? io_now_us() : 0;
+  int r = sceLibcBridge_fseek(stream, offset, origin);
+  if (timed)
+    io_seek_us += io_now_us() - t0;
+  return r;
+}
+
 int traceLog(char *text, ...) {
 #ifdef LOADER_TRACE
   va_list list;
@@ -254,6 +303,11 @@ int ProcessEvents(void) {
     // loader's own work on top of it.
     traceLog("upload: %d ms in the driver, %d ms in the cache, %d MB hashed\n",
              cache.upload_driver_ms, cache.upload_loader_ms, cache.key_hashed_mb);
+    // ...and the same for the file reads the game does to fill those textures
+    // and everything else an area is made of. Scaled up from the sample.
+    traceLog("io: %d ms reading, %d ms seeking, %d MB over %u reads\n",
+             (int)(io_read_us * IO_SAMPLE / 1000), (int)(io_seek_us * IO_SAMPLE / 1000),
+             (int)(io_read_bytes / (1024 * 1024)), (unsigned)io_reads);
     // Frames actually presented since the last heartbeat, over the wall clock
     // between them. vsync is disabled, so this is what the hardware managed.
     static int last_frames;
@@ -804,8 +858,8 @@ static so_default_dynlib default_dynlib[] = {
   { "fprintf", (uintptr_t)&sceLibcBridge_fprintf },
   // { "fputc", (uintptr_t)&sceLibcBridge_fputc },
   // { "fputs", (uintptr_t)&sceLibcBridge_fputs },
-  { "fread", (uintptr_t)&sceLibcBridge_fread },
-  { "fseek", (uintptr_t)&sceLibcBridge_fseek },
+  { "fread", (uintptr_t)&traced_fread },
+  { "fseek", (uintptr_t)&traced_fseek },
   { "ftell", (uintptr_t)&sceLibcBridge_ftell },
   { "fwrite", (uintptr_t)&sceLibcBridge_fwrite },
 
