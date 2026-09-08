@@ -246,6 +246,49 @@ int main(void) {
     assert(checked > 0 && "something had to have been evicted to check this");
   }
 
+  // Reclaiming is bursty, not a trickle. A pool sitting a little under its ideal
+  // is left alone, because chasing it evicts textures the game asks straight
+  // back for -- and every one of those is a read off the memory card on the
+  // drawing thread. A session ran with the RAM pool at 24-25 MB free against a
+  // 24 MB threshold and paid 2434 evictions and 1022 restores for it.
+  {
+    harness_start_empty(0);
+    fake_set_pools(81 * MB, 100 * MB, 26 * MB);
+    texture_cache_tick(); // takes the starting figures
+    assert(pool_start[1] == 100 * MB);
+
+    // Enough resident to have something to evict, and idle enough to qualify.
+    GLuint cold[128];
+    for (int i = 0; i < 128; i++) {
+      cold[i] = tex_upload(0xBB000000u + (unsigned)i, 512, 512, TEX_BYTES);
+      drain();
+    }
+    frames(TEXTURE_IDLE_FRAMES * 2);
+
+    // Between the marks: under the quarter it would like, well above the point
+    // at which it should start doing anything about it.
+    fake_set_pools(81 * MB, 20 * MB, 26 * MB);
+    int before = evicted_count;
+    frames(600);
+    printf("headroom     : %d MB free against a %d MB target, %d evicted over 600 frames  OK\n",
+           20, (int)(pool_start[1] / 100 * TEXTURE_FREE_HEADROOM_PERCENT / MB),
+           evicted_count - before);
+    assert(evicted_count == before && "a pool between the marks must be left alone");
+
+    // Below the low mark, and it has to act -- and act past the low mark rather
+    // than just back over it, or it lands straight back here next frame.
+    fake_set_pools(81 * MB, 10 * MB, 26 * MB);
+    frames(4);
+    assert(evicted_count > before && "a pool below the low mark must be reclaimed");
+    printf("             : %d evicted once it dropped below the low mark  OK\n",
+           evicted_count - before);
+
+    // Hand the pools back healthy, or every block after this one inherits a
+    // driver at its floor and tests a policy it did not mean to.
+    fake_set_pools(81 * MB, 100 * MB, 26 * MB);
+    frames(2);
+  }
+
   // A texture still bound to a unit can be drawn without the game ever binding
   // it again, so there would be no moment at which to restore it.
   GLuint stuck = tex_upload(0x5AFE0001u, 512, 512, TEX_BYTES);

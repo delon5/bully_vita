@@ -1084,12 +1084,37 @@ void texture_cache_tick(void) {
   // first and falls back to RAM, so CDRAM at zero with RAM free is the
   // allocator doing its job, not a shortage -- and reclaiming against it meant
   // evicting continuously through every area load for no gain at all.
+  // Two marks, not one, because a single line is a line the pools sit on.
+  //
+  // The RAM pool starts at 99 MB and the reclaim threshold was a quarter of it,
+  // 24 MB. A whole session ran with 24-25 MB free: permanently within a
+  // megabyte of the line, so every frame found a small deficit, evicted a
+  // little to cover it, and found the same deficit again next frame. 2434
+  // evictions, 1022 of which the game asked for again -- and a restore is a
+  // read of a few hundred KB off the memory card, on this thread, which is
+  // exactly the "laggy when textures are loading" being reported.
+  //
+  // So start reclaiming when a pool falls below the low mark and carry on until
+  // it is back above the high one. In between, leave it alone. The work happens
+  // in bursts with real margin either side rather than as a permanent trickle,
+  // and a pool that simply sits a little under its ideal is left to sit there.
+  static int reclaiming;
   size_t deficit = 0;
+  int below_low = 0;
   for (int pool = 1; pool < VGL_POOLS; pool++) {
-    size_t reserve = pool_start[pool] / 100 * TEXTURE_FREE_HEADROOM_PERCENT;
-    if (free_now[pool] < reserve)
-      deficit += reserve - free_now[pool];
+    size_t high = pool_start[pool] / 100 * TEXTURE_FREE_HEADROOM_PERCENT;
+    size_t low = pool_start[pool] / 100 * TEXTURE_FREE_HEADROOM_LOW_PERCENT;
+    if (free_now[pool] < low)
+      below_low = 1;
+    if (free_now[pool] < high)
+      deficit += high - free_now[pool];
   }
+  if (below_low)
+    reclaiming = 1;
+  else if (!deficit)
+    reclaiming = 0; // back above the high mark everywhere: done until next time
+  if (!reclaiming)
+    deficit = 0;
 
   if (tracked_bytes <= budget && deficit == 0) {
     starved_frames = 0;

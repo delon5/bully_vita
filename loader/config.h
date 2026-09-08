@@ -235,6 +235,13 @@
 // draining that is dangerous, because what lies past it is the newlib heap the
 // game is using.
 #define TEXTURE_FREE_HEADROOM_PERCENT 25
+
+// ...and the mark reclaiming starts at. Reaching for a quarter free only once a
+// pool has actually dropped to this, rather than the moment it slips below the
+// quarter, is what stops the cache trickling evictions forever against a pool
+// that is sitting a megabyte under its ideal. Above the emergency threshold, so
+// the card still opens before this ever becomes a shortage.
+#define TEXTURE_FREE_HEADROOM_LOW_PERCENT 15
 // The point at which a pool counts as actually running out, rather than merely
 // below its target. Only here may reclaiming fall back to the memory card, so
 // this is the floor the cache really defends: above it a texture with nowhere
