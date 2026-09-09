@@ -7,3 +7,8 @@ build/*
 *.out
 *.o
 tests/out/
+
+# Cloned into the working tree by the build, pinned by revision in
+# .github/workflows/build.yml rather than vendored here.
+vitaGL/
+openal-soft/
