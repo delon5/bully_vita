@@ -1268,8 +1268,14 @@ int main(int argc, char *argv[]) {
   so_initialize(&bully_mod);
 
   traceLog("boot: initializers done, starting fios\n");
-  if (fios_init() < 0)
-    fatal_error("Error could not initialize fios.");
+  // With the code, not just the message. The last build died here on a blue
+  // screen that named nothing, and the cause was a work buffer this loader had
+  // sized wrongly rather than anything on the card.
+  int fios_res = fios_init();
+  if (fios_res < 0) {
+    traceLog("boot: fios_init failed with 0x%08x\n", (unsigned)fios_res);
+    fatal_error("Error could not initialize fios (0x%08x).", (unsigned)fios_res);
+  }
 
   traceLog("boot: fios ok, starting texture cache\n");
   texture_cache_init();

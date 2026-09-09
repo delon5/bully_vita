@@ -223,9 +223,9 @@
 // launch starts from nothing.
 #define TEXTURE_STORE_WIPE_PATH DATA_PATH "/" "wipe_texcache"
 
-// Create this file to cut the FIOS RAM caches to one block each, freeing the
-// 32 MB they hold. See the comment in fios.c: it is a controlled test of
-// whether they are in the path of the game's reads at all.
+// Create this file to leave the FIOS RAM caches unregistered, freeing the 32 MB
+// they hold. See the comment in fios.c: it is a controlled test of whether they
+// are in the path of the game's reads at all.
 #define FIOS_CACHE_DISABLE_PATH DATA_PATH "/" "no_fioscache"
 
 // How much texture data the game is allowed to keep resident. The Android

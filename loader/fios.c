@@ -49,13 +49,15 @@
 // with this file present the caches are allocated one block each instead of
 // five hundred and twelve. If the read timings in the trace do not move, they
 // were never in the path and the memory can go to the game.
-static int ram_cache_blocks(void) {
+// Cutting the buffer to a single block did not disable the caches, it made
+// sceFiosIOFilterAdd reject them: FIOS needs room for its own bookkeeping as
+// well as the blocks, so a 32 KB work buffer fails, fios_init returns the
+// error, and the loader dies on "Error could not initialize fios." before the
+// game ever starts. Skipping registration altogether is both the correct "off"
+// and the state actually worth measuring, since it hands the whole 32 MB back.
+static int ram_cache_wanted(void) {
   SceIoStat stat;
-  if (sceIoGetstat(FIOS_CACHE_DISABLE_PATH, &stat) >= 0) {
-    traceLog("fios: RAM caches cut to one block by %s\n", FIOS_CACHE_DISABLE_PATH);
-    return 1;
-  }
-  return RAMCACHEBLOCKNUM;
+  return sceIoGetstat(FIOS_CACHE_DISABLE_PATH, &stat) < 0;
 }
 
 static int64_t g_OpStorage[SCE_FIOS_OP_STORAGE_SIZE(64, MAX_PATH_LENGTH) / sizeof(int64_t) + 1];
@@ -95,33 +97,44 @@ int fios_init(void) {
   if (res < 0)
     return res;
 
-  int blocks = ram_cache_blocks();
-  g_MainRamCacheWorkBuffer = memalign(8, blocks * RAMCACHEBLOCKSIZE);
+  if (!ram_cache_wanted()) {
+    traceLog("fios: RAM caches not registered, %s is present; %d MB left to the game\n",
+             FIOS_CACHE_DISABLE_PATH, 2 * RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE / (1024 * 1024));
+    return 0;
+  }
+
+  const size_t cache_bytes = (size_t)RAMCACHEBLOCKNUM * RAMCACHEBLOCKSIZE;
+
+  g_MainRamCacheWorkBuffer = memalign(8, cache_bytes);
   if (!g_MainRamCacheWorkBuffer)
     return -1;
 
   g_MainRamCacheContext.pPath = DATA_PATH "/Android/main.obb";
   g_MainRamCacheContext.pWorkBuffer = g_MainRamCacheWorkBuffer;
-  g_MainRamCacheContext.workBufferSize = blocks * RAMCACHEBLOCKSIZE;
+  g_MainRamCacheContext.workBufferSize = cache_bytes;
   g_MainRamCacheContext.blockSize = RAMCACHEBLOCKSIZE;
   res = sceFiosIOFilterAdd(0, sceFiosIOFilterCache, &g_MainRamCacheContext);
-  if (res < 0)
+  if (res < 0) {
+    traceLog("fios: the main archive's cache was refused (0x%08x)\n", (unsigned)res);
     return res;
+  }
 
-  g_PatchRamCacheWorkBuffer = memalign(8, blocks * RAMCACHEBLOCKSIZE);
+  g_PatchRamCacheWorkBuffer = memalign(8, cache_bytes);
   if (!g_PatchRamCacheWorkBuffer)
     return -1;
 
   g_PatchRamCacheContext.pPath = DATA_PATH "/Android/patch.obb";
   g_PatchRamCacheContext.pWorkBuffer = g_PatchRamCacheWorkBuffer;
-  g_PatchRamCacheContext.workBufferSize = blocks * RAMCACHEBLOCKSIZE;
+  g_PatchRamCacheContext.workBufferSize = cache_bytes;
   g_PatchRamCacheContext.blockSize = RAMCACHEBLOCKSIZE;
   res = sceFiosIOFilterAdd(1, sceFiosIOFilterCache, &g_PatchRamCacheContext);
-  if (res < 0)
+  if (res < 0) {
+    traceLog("fios: the patch archive's cache was refused (0x%08x)\n", (unsigned)res);
     return res;
+  }
 
   traceLog("fios: two RAM caches of %d MB registered over the archives\n",
-           blocks * RAMCACHEBLOCKSIZE / (1024 * 1024));
+           (int)(cache_bytes / (1024 * 1024)));
   return 0;
 }
 
