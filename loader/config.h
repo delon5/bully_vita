@@ -223,16 +223,31 @@
 // launch starts from nothing.
 #define TEXTURE_STORE_WIPE_PATH DATA_PATH "/" "wipe_texcache"
 
-// Create this file to read straight from the card, with no buffering.
+// Create this file to buffer the game's reads. Off by default, because on this
+// hardware it loses, and the arithmetic says it always will.
 //
-// The read cache is the one part of the loader that can hand the game silently
-// wrong bytes rather than merely a wrong picture, and its first version did
-// exactly that: it shared its buffers between four threads with no ownership,
-// and the game read a string length of 1684633471 out of a buffer being
-// rewritten underneath it. It is thread-owned now and tested for it, but a
-// switch that needs no rebuild is worth having for something with that failure
-// mode.
-#define READ_CACHE_DISABLE_PATH DATA_PATH "/" "no_readcache"
+// Three sessions fit a cost model of  time = reads x latency + bytes / bandwidth
+// to within 3%:
+//
+//                   card reads     MB   seconds   predicted
+//   no cache             24194    280     124.1       126.1
+//   64K, separate read   18553    489     190.7       192.4
+//   8K+, combined read   18168    315     135.6       131.2
+//
+//   latency 1.18 ms per read, transfer 2.87 MB/s
+//
+// A typical 11.6 KB read is 3.95 ms of moving bytes and 1.18 ms of waiting, so
+// 77% of it is bandwidth. Read-ahead trades bytes for round trips, and on a card
+// this slow that is the wrong way round: the best the cache managed was 6026
+// fewer round trips, worth 7.1 s, bought with 35 MB of extra transfer costing
+// 12.2 s. It cannot come out ahead while transfer dominates.
+//
+// The whole premise was wrong. 5.1 ms per read was read as latency, and it is
+// almost entirely transfer. The switch and the code stay because the conclusion
+// is a property of this card rather than of the design -- on a faster card the
+// balance inverts and read-ahead starts paying -- but it is off unless asked
+// for, and the trace reports what it did either way.
+#define READ_CACHE_ENABLE_PATH DATA_PATH "/" "use_readcache"
 
 
 

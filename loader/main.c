@@ -236,8 +236,8 @@ static size_t raw_fread(void *ptr, size_t size, size_t count, FILE *stream) {
 
 static unsigned read_cache_thread_id(void) { return (unsigned)sceKernelGetThreadId(); }
 
-// Off by a file on the card, because this is the one thing in the loader that
-// can hand the game silently wrong bytes, and the first version of it did.
+// On by a file on the card. Off by default: measured, it loses here. See the
+// cost model over READ_CACHE_ENABLE_PATH in config.h.
 static int read_cache_on;
 
 static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
@@ -1320,11 +1320,13 @@ int main(int argc, char *argv[]) {
   static const ReadCacheOps read_cache_ops = { raw_fread, sceLibcBridge_fseek,
                                               sceLibcBridge_ftell, read_cache_thread_id };
   SceIoStat rc_stat;
-  if (sceIoGetstat(READ_CACHE_DISABLE_PATH, &rc_stat) >= 0) {
-    traceLog("readcache: disabled by %s\n", READ_CACHE_DISABLE_PATH);
-  } else {
+  if (sceIoGetstat(READ_CACHE_ENABLE_PATH, &rc_stat) >= 0) {
     read_cache_init(&read_cache_ops);
     read_cache_on = 1;
+    traceLog("readcache: on, asked for by %s\n", READ_CACHE_ENABLE_PATH);
+  } else {
+    traceLog("readcache: off -- reads are bandwidth bound at 2.87 MB/s here, "
+             "so buffering them costs more than it saves\n");
   }
 
   traceLog("boot: initializers done, starting fios\n");
