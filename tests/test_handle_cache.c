@@ -82,7 +82,13 @@ static int host_fclose(FILE *f) {
 
 static int host_fseek(FILE *f, long o, int w) { return fseek(f, o, w); }
 static int host_ferror(FILE *f) { return ferror(f); }
-static int host_exists(const char *path) { return access(path, F_OK) == 0; }
+static volatile int exists_calls;
+static int host_exists(const char *path) {
+  pthread_mutex_lock(&count_lock);
+  exists_calls++;
+  pthread_mutex_unlock(&count_lock);
+  return access(path, F_OK) == 0;
+}
 static const HandleCacheOps HOST = { host_fopen, host_fclose, host_fseek,
                                      host_ferror, host_exists };
 
@@ -274,6 +280,9 @@ static void test_open_failure_gives_the_handles_back(void) {
 static void test_probes_do_not_empty_the_cache(void) {
   handle_cache_init(&HOST, 8);
   snprintf(missing_path, sizeof(missing_path), "out/hc_not_here.bin");
+  pthread_mutex_lock(&count_lock);
+  exists_calls = 0;
+  pthread_mutex_unlock(&count_lock);
 
   for (int n = 0; n < 500; n++) {
     check_whole(n % 4);
@@ -284,11 +293,18 @@ static void test_probes_do_not_empty_the_cache(void) {
 
   HandleCacheStats s;
   handle_cache_stats(&s);
-  assert(s.drains == 0);   // a file that is not there never needs a drain
-  assert(s.absent == 500); // it is recognised as absent instead
-  assert(s.hits > 400);    // and the cache keeps working
-  printf("probes       : 500 opens of a file that is not there cost %u drains, "
-         "%u hits kept  OK\n", s.drains, s.hits);
+  pthread_mutex_lock(&count_lock);
+  int asked = exists_calls;
+  pthread_mutex_unlock(&count_lock);
+
+  assert(s.drains == 0);         // a file that is not there never needs a drain
+  assert(s.absent == 1);         // and the filesystem is asked about it once
+  assert(s.absent_again == 499); // the other 499 are remembered
+  assert(asked == 1);            // really once, not once a heartbeat
+  assert(s.hits > 400);          // and the cache keeps working
+  printf("probes       : 500 opens of a file that is not there cost %u drains "
+         "and %d question to the filesystem, %u hits kept  OK\n",
+         s.drains, asked, s.hits);
   handle_cache_drain();
 }
 
@@ -367,6 +383,49 @@ static void test_an_existing_file_never_fails_to_open(void) {
   printf("never NULL   : 50 opens against a full descriptor table, all served, "
          "cap pulled back to %u  OK\n", s.slots);
   handle_cache_drain();
+}
+
+// Remembering that a path was missing is only as good as the last time the
+// filesystem was asked. This game writes no files, so an absent path stays
+// absent -- but the cache must not depend on that being true, because being
+// wrong about it means handing back a NULL, and the game reads through NULLs.
+static void test_a_file_that_appears_still_opens(void) {
+  char late[256];
+  snprintf(late, sizeof(late), "out/hc_appears.bin");
+  unlink(late);
+
+  handle_cache_init(&HOST, 8);
+  // Probe for it while it does not exist, so the cache files it away as absent.
+  for (int n = 0; n < 20; n++)
+    assert(handle_cache_fopen(late, "rb") == NULL);
+  HandleCacheStats s;
+  handle_cache_stats(&s);
+  assert(s.absent_again == 19);
+
+  // Now it exists, and there are no descriptors left.
+  FILE *w = fopen(late, "wb");
+  assert(w && fwrite(truth[0], 1, 64, w) == 64);
+  fclose(w);
+  for (int i = 0; i < 8; i++)
+    check_whole(i); // fill every slot
+  pthread_mutex_lock(&count_lock);
+  descriptor_ceiling = live_handles;
+  pthread_mutex_unlock(&count_lock);
+
+  FILE *f = handle_cache_fopen(late, "rb");
+  pthread_mutex_lock(&count_lock);
+  descriptor_ceiling = 1 << 30;
+  pthread_mutex_unlock(&count_lock);
+  assert(f); // believed absent, actually there, and it still has to open
+  unsigned char got[64];
+  assert(fread(got, 1, 64, f) == 64);
+  assert(memcmp(got, truth[0], 64) == 0);
+  handle_cache_fclose(f);
+
+  printf("stale absence: a path remembered as missing, then created, still "
+         "opens with the table full  OK\n");
+  handle_cache_drain();
+  unlink(late);
 }
 
 static void test_failed_handle_is_not_parked(void) {
@@ -462,6 +521,7 @@ int main(void) {
   test_probes_do_not_empty_the_cache();
   test_real_exhaustion_keeps_draining();
   test_an_existing_file_never_fails_to_open();
+  test_a_file_that_appears_still_opens();
   test_failed_handle_is_not_parked();
   test_threads();
   test_nothing_leaks();

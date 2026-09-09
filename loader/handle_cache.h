@@ -51,7 +51,8 @@ typedef struct {
   unsigned dropped;   // closes that could not be parked at all
   unsigned drains;    // fopen failed and the cache gave its handles back
   unsigned rescued;   // ...and the open then succeeded, so it really was us
-  unsigned absent;    // an open that failed on a file that is not there
+  unsigned absent;    // an open that failed on a file found not to be there
+  unsigned absent_again; // ...on one already known not to be there, so free
   unsigned slots;     // the cap, which comes down when a rescue says it must
   unsigned held;      // how many are parked right now
 } HandleCacheStats;

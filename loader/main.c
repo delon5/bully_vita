@@ -591,9 +591,10 @@ int ProcessEvents(void) {
       handle_cache_stats(&hc);
       traceLog("handles: %u opens served from a held file, %u went to the card, "
                "%u parked, %u evicted, %u not kept, %u given back of which %u "
-               "rescued an open, %u were not there, holding %u of %u\n",
+               "rescued an open, %u were not there and %u already known not "
+               "to be, holding %u of %u\n",
                hc.hits, hc.misses, hc.parked, hc.evicted, hc.dropped, hc.drains,
-               hc.rescued, hc.absent, hc.held, hc.slots);
+               hc.rescued, hc.absent, hc.absent_again, hc.held, hc.slots);
     }
     traceLog("visit: %u first reading %d KB, %u again reading %d KB, %u over "
              "%d KB, %u untracked | per visit <4K %u <16K %u <64K %u more %u\n",

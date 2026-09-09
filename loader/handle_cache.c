@@ -48,6 +48,15 @@
 // Never hold fewer than this once the cache has been made to back off, or it
 // stops being a cache at all.
 #define HC_MIN_SLOTS 4
+// Paths already found not to exist. Two thirds of this game's opens -- 12111 of
+// 18174 -- are for a file that is not there, and asking the filesystem about
+// each of them cost 42 s, which was more than holding handles saved. Asking
+// once per path instead of once per open is the whole of the fix.
+//
+// Full paths, not hashes. A collision here would mark an existing file absent,
+// and an existing file marked absent is an open that fails without the drain
+// that exists to save it -- which is the crash this cache already caused once.
+#define HC_ABSENT 256
 
 typedef struct {
   FILE *file; // NULL for an empty slot
@@ -62,6 +71,8 @@ typedef struct {
 
 static HandleCacheOps io;
 static Parked parked[HC_SLOTS];
+static char absent[HC_ABSENT][HC_PATH];
+static unsigned absent_next;
 static Live live[HC_LIVE];
 static unsigned hc_slots = HC_SLOTS;
 static unsigned hc_clock;
@@ -83,11 +94,13 @@ static void unlock(void) { __atomic_clear(&table_lock, __ATOMIC_RELEASE); }
 void handle_cache_init(const HandleCacheOps *ops, unsigned slots) {
   io = *ops;
   hc_slots = slots > HC_SLOTS ? HC_SLOTS : (slots ? slots : 1);
-  stats.slots = hc_slots;
   memset(parked, 0, sizeof(parked));
   memset(live, 0, sizeof(live));
+  memset(absent, 0, sizeof(absent));
   hc_clock = 0;
+  absent_next = 0;
   memset(&stats, 0, sizeof(stats));
+  stats.slots = hc_slots; // after the wipe, not before it
 }
 
 // Anything that is not purely reading. "r" and "rb" are kept; everything else
@@ -132,6 +145,23 @@ static int forget_live(FILE *file, char *out) {
     }
   }
   return 0;
+}
+
+// Caller holds the lock. Whether this path has already been found missing.
+static int known_absent(const char *path) {
+  for (unsigned i = 0; i < HC_ABSENT; i++)
+    if (absent[i][0] && strcmp(absent[i], path) == 0)
+      return 1;
+  return 0;
+}
+
+// Caller holds the lock. Round robin: the table is a way of not asking the same
+// question repeatedly, so forgetting the oldest answer costs one stat.
+static void note_absent(const char *path) {
+  if (known_absent(path))
+    return;
+  memcpy(absent[absent_next], path, strlen(path) + 1);
+  absent_next = (absent_next + 1) % HC_ABSENT;
 }
 
 // Takes a handle for this path out of the table, or NULL if none is held.
@@ -220,30 +250,49 @@ FILE *handle_cache_fopen(const char *path, const char *mode) {
     // descriptors, and this cache is holding some of them. That check costs one
     // stat, only ever on the failure path, and it makes the guarantee absolute:
     // the cache is never the reason an existing file fails to open.
-    if (io.exists && !io.exists(path)) {
+    lock();
+    int seen_missing = known_absent(path);
+    unsigned holding = stats.held;
+    unlock();
+
+    // Asking is only worth it the first time. After that the answer is
+    // remembered, because two thirds of this game's opens are probes for files
+    // that are not there and a stat costs about what an open costs.
+    int there = 1;
+    if (seen_missing) {
+      there = 0;
+      lock();
+      stats.absent_again++;
+      unlock();
+    } else if (io.exists && !io.exists(path)) {
+      there = 0;
       lock();
       stats.absent++;
+      note_absent(path);
       unlock();
-    } else {
+    }
+
+    // Drain when the file is there -- then it can only be descriptors -- and
+    // also whenever the cache is holding all it is allowed to, even for a path
+    // believed missing. The belief is only as good as the last time the
+    // filesystem was asked, and being wrong about it is a NULL handed to a game
+    // that does not check.
+    if (holding && (there || holding >= hc_slots)) {
       lock();
-      unsigned holding = stats.held;
-      if (holding)
-        stats.drains++;
+      stats.drains++;
       unlock();
-      if (holding) {
-        handle_cache_drain();
-        f = io.fopen(path, mode);
-        if (f) {
-          // It really was us. That many was too many, so hold fewer -- the
-          // descriptor budget belongs to the game and the only way to learn it
-          // is to be told.
-          lock();
-          stats.rescued++;
-          unsigned fewer = holding - holding / 4;
-          hc_slots = fewer < HC_MIN_SLOTS ? HC_MIN_SLOTS : fewer;
-          stats.slots = hc_slots;
-          unlock();
-        }
+      handle_cache_drain();
+      f = io.fopen(path, mode);
+      if (f) {
+        // It really was us. That many was too many, so hold fewer -- the
+        // descriptor budget belongs to the game and the only way to learn it
+        // is to be told.
+        lock();
+        stats.rescued++;
+        unsigned fewer = holding - holding / 4;
+        hc_slots = fewer < HC_MIN_SLOTS ? HC_MIN_SLOTS : fewer;
+        stats.slots = hc_slots;
+        unlock();
       }
     }
   }
