@@ -257,6 +257,69 @@ static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
   return got;
 }
 
+// Opening files, which nothing here has ever counted. The freeze on walking
+// into a new area allocates 30% of its blocks inside NvFOpen and OS_FileOpen
+// and another 22% inside DecryptText and ReadBuffer::PopString: the game is
+// opening a pile of small files and parsing strings out of them, not streaming
+// textures. 83% of the reads in that window are under 4K and 38% of them follow
+// a seek, which is the shape of many short files rather than one long one.
+//
+// If the cost is in the opens, caching whole small files by path would remove
+// it -- but only if the same files come back, and nothing measured yet says
+// whether they do. So count them: how many, how long, and how many are a path
+// that has already been opened once. Opens are rare enough next to reads to
+// time every one rather than sample.
+#define OPEN_PATHS 8192
+static uint32_t io_opens, io_reopens;
+static uint64_t io_open_us;
+static uint32_t open_path_hash[OPEN_PATHS];
+static uint32_t io_open_distinct;
+
+// FNV-1a over the path. Collisions cost a miscounted reopen and nothing else.
+static uint32_t open_hash(const char *path) {
+  uint32_t h = 2166136261u;
+  while (*path)
+    h = (h ^ (unsigned char)*path++) * 16777619u;
+  return h ? h : 1;
+}
+
+// Linear probe. Once the probe runs out of room the reopen count is no longer
+// a floor or a ceiling, just wrong, so say so in the trace instead of quietly
+// reporting a number nobody can use.
+//
+// Four threads open files and none of this is locked, which costs a miscount
+// when two of them claim the same empty slot at once and is not worth a lock:
+// the counters either side of it are already racy in the same way, and the
+// question here is whether reopens are thousands or tens, not what the exact
+// figure is.
+static uint32_t io_open_unplaced;
+
+static int open_seen_before(const char *path) {
+  uint32_t h = open_hash(path);
+  for (uint32_t i = 0; i < 64; i++) {
+    uint32_t slot = (h + i) & (OPEN_PATHS - 1);
+    if (open_path_hash[slot] == h)
+      return 1;
+    if (!open_path_hash[slot]) {
+      open_path_hash[slot] = h;
+      io_open_distinct++;
+      return 0;
+    }
+  }
+  io_open_unplaced++;
+  return 0;
+}
+
+static FILE *traced_fopen(const char *path, const char *mode) {
+  uint32_t t0 = io_now_us();
+  FILE *f = sceLibcBridge_fopen(path, mode);
+  io_open_us += io_now_us() - t0;
+  io_opens++;
+  if (path && open_seen_before(path))
+    io_reopens++;
+  return f;
+}
+
 static int traced_fclose(FILE *stream) {
   if (read_cache_on)
     read_cache_forget(stream);
@@ -422,6 +485,10 @@ int ProcessEvents(void) {
                (unsigned)io_tid[i],
                io_tid[i] == presenting_thread ? " (presents frames)" : "",
                (int)(io_tid_us[i] * IO_SAMPLE / 1000), (unsigned)io_tid_reads[i]);
+    traceLog("open: %u opens, %d ms, %u of them a path already opened, "
+             "%u distinct, %u unplaced\n", (unsigned)io_opens,
+             (int)(io_open_us / 1000), (unsigned)io_reopens,
+             (unsigned)io_open_distinct, (unsigned)io_open_unplaced);
     traceLog("io: %d ms reading, %d ms seeking, %d MB over %u card reads for %u asked, "
              "%u seeks, %u sequential | sizes <4K %u <16K %u <64K %u more %u\n",
              (int)(io_read_us * IO_SAMPLE / 1000), (int)(io_seek_us * IO_SAMPLE / 1000),
@@ -984,7 +1051,7 @@ static so_default_dynlib default_dynlib[] = {
   // { "fgetc", (uintptr_t)&fgetc },
   // { "fgets", (uintptr_t)&fgets },
 
-  { "fopen", (uintptr_t)&sceLibcBridge_fopen },
+  { "fopen", (uintptr_t)&traced_fopen },
 
   { "fprintf", (uintptr_t)&sceLibcBridge_fprintf },
   // { "fputc", (uintptr_t)&sceLibcBridge_fputc },
@@ -1325,8 +1392,8 @@ int main(int argc, char *argv[]) {
     read_cache_on = 1;
     traceLog("readcache: on, asked for by %s\n", READ_CACHE_ENABLE_PATH);
   } else {
-    traceLog("readcache: off -- reads are bandwidth bound at 2.87 MB/s here, "
-             "so buffering them costs more than it saves\n");
+    traceLog("readcache: off -- the reads it can predict are already buffered\n"
+             "           below fread, and the ones that cost are scattered\n");
   }
 
   traceLog("boot: initializers done, starting fios\n");
