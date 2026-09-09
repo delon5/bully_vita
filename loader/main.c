@@ -321,6 +321,13 @@ static int open_seen_before(const char *path) {
 // hardware without a rebuild.
 static int handle_cache_on;
 
+// Only ever called when an open has already failed, to tell "there is no such
+// file" apart from "there are no descriptors left".
+static int path_exists(const char *path) {
+  SceIoStat st;
+  return path && sceIoGetstat(path, &st) >= 0;
+}
+
 // How big are the files that get opened over and over? Holding the handle
 // stops the open costing anything, but the game still reads the bytes back off
 // the card every time, and a path-keyed cache of whole small files would stop
@@ -329,15 +336,19 @@ static int handle_cache_on;
 // at 176 MB and three sessions running peaked at 90.
 //
 // Measured as the file position at close, which is the bytes consumed for
-// anything read start to finish. A file seeked around in reads higher than it
-// should, so the big archives overstate; they are also the ones no cache would
-// hold, and the buckets below say how much of the total they are.
+// anything read start to finish. It is not that for a file seeked around in,
+// and the first run of this reported 64556 MB over 223 visits -- 290 MB each,
+// which is the offset reached inside the game's big archives rather than
+// anything read. Those are exactly the files a cache of whole small files
+// would never hold, so the totals only count visits below the cap, and the
+// ones above it are counted separately instead of poisoning the sum.
+#define VISIT_CACHEABLE (256 * 1024)
 #define VISIT_TRACKED 256
 static struct {
   FILE *file;
   int again;
 } visits[VISIT_TRACKED];
-static uint32_t visit_first, visit_again, visit_untracked;
+static uint32_t visit_first, visit_again, visit_untracked, visit_too_big;
 static uint64_t visit_first_bytes, visit_again_bytes;
 static uint32_t visit_buckets[4]; // under 4K, 16K, 64K, and the rest
 
@@ -362,7 +373,9 @@ static void visit_close(FILE *f, long consumed) {
       __atomic_store_n(&visits[i].file, NULL, __ATOMIC_RELEASE);
       if (consumed < 0)
         return;
-      if (again) {
+      if (consumed > VISIT_CACHEABLE) {
+        visit_too_big++;
+      } else if (again) {
         visit_again++;
         visit_again_bytes += (uint64_t)consumed;
       } else {
@@ -578,14 +591,15 @@ int ProcessEvents(void) {
       handle_cache_stats(&hc);
       traceLog("handles: %u opens served from a held file, %u went to the card, "
                "%u parked, %u evicted, %u not kept, %u given back of which %u "
-               "rescued an open, %u held now\n",
+               "rescued an open, %u were not there, holding %u of %u\n",
                hc.hits, hc.misses, hc.parked, hc.evicted, hc.dropped, hc.drains,
-               hc.rescued, hc.held);
+               hc.rescued, hc.absent, hc.held, hc.slots);
     }
-    traceLog("visit: %u first reading %d MB, %u again reading %d MB, %u untracked "
-             "| per visit <4K %u <16K %u <64K %u more %u\n",
-             (unsigned)visit_first, (int)(visit_first_bytes / (1024 * 1024)),
-             (unsigned)visit_again, (int)(visit_again_bytes / (1024 * 1024)),
+    traceLog("visit: %u first reading %d KB, %u again reading %d KB, %u over "
+             "%d KB, %u untracked | per visit <4K %u <16K %u <64K %u more %u\n",
+             (unsigned)visit_first, (int)(visit_first_bytes / 1024),
+             (unsigned)visit_again, (int)(visit_again_bytes / 1024),
+             (unsigned)visit_too_big, VISIT_CACHEABLE / 1024,
              (unsigned)visit_untracked, visit_buckets[0], visit_buckets[1],
              visit_buckets[2], visit_buckets[3]);
     traceLog("open: %u opens, %d ms | %u first at %d ms, %u again at %d ms | "
@@ -1492,7 +1506,7 @@ int main(int argc, char *argv[]) {
 
   static const HandleCacheOps handle_cache_ops = {
     sceLibcBridge_fopen, sceLibcBridge_fclose, sceLibcBridge_fseek,
-    sceLibcBridge_ferror
+    sceLibcBridge_ferror, path_exists
   };
   SceIoStat hc_stat;
   if (sceIoGetstat(HANDLE_CACHE_DISABLE_PATH, &hc_stat) >= 0) {

@@ -21,6 +21,12 @@ typedef struct {
   // macro -- the member expands and the file stops compiling for the device
   // while still building fine on a host.
   int (*errored)(FILE *stream);
+  // Whether the path is there at all. An open that fails on a file that does
+  // not exist is nothing to do with this cache; an open that fails on a file
+  // that does exist is descriptors, and this cache is holding some. Without
+  // this the two are indistinguishable, and guessing between them put a NULL
+  // handle into a game that does not check for one.
+  int (*exists)(const char *path);
 } HandleCacheOps;
 
 // slots is how many handles may be held open at once. Clamped to what the
@@ -45,6 +51,8 @@ typedef struct {
   unsigned dropped;   // closes that could not be parked at all
   unsigned drains;    // fopen failed and the cache gave its handles back
   unsigned rescued;   // ...and the open then succeeded, so it really was us
+  unsigned absent;    // an open that failed on a file that is not there
+  unsigned slots;     // the cap, which comes down when a rescue says it must
   unsigned held;      // how many are parked right now
 } HandleCacheStats;
 

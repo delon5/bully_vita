@@ -45,9 +45,9 @@
 // Handles the game has open right now. fclose is given a FILE * and nothing
 // else, so parking one means remembering the path it was opened under.
 #define HC_LIVE 256
-// How many times to drain on a failed open before deciding the failures are
-// not this cache's doing.
-#define DRAINS_TO_LEARN 8
+// Never hold fewer than this once the cache has been made to back off, or it
+// stops being a cache at all.
+#define HC_MIN_SLOTS 4
 
 typedef struct {
   FILE *file; // NULL for an empty slot
@@ -83,6 +83,7 @@ static void unlock(void) { __atomic_clear(&table_lock, __ATOMIC_RELEASE); }
 void handle_cache_init(const HandleCacheOps *ops, unsigned slots) {
   io = *ops;
   hc_slots = slots > HC_SLOTS ? HC_SLOTS : (slots ? slots : 1);
+  stats.slots = hc_slots;
   memset(parked, 0, sizeof(parked));
   memset(live, 0, sizeof(live));
   hc_clock = 0;
@@ -202,33 +203,47 @@ FILE *handle_cache_fopen(const char *path, const char *mode) {
 
   FILE *f = io.fopen(path, mode);
   if (!f) {
-    lock();
-    // Draining is the safety net for running out of descriptors: give every
-    // held handle back and try again, so running out degrades into being slow
-    // rather than into failing to load.
+    // The safety net for running out of descriptors: give every held handle
+    // back and try again, so running out degrades into being slow rather than
+    // into failing to load.
     //
-    // But a NULL from fopen is not proof of that. A game probing for a file
-    // that is not there gets the same answer, and the first version of this
-    // could not tell the difference: it drained on every probe, 5492 times in
-    // a session, and turned 54.5 s of opening files into 86.1 s while serving
-    // 9 opens out of 17898. So drain while it is still plausible -- a few
-    // times to find out, whenever this cache is holding all it can and is
-    // therefore a candidate, and always once draining has actually rescued an
-    // open. If it never rescues one, the failures were never about us and it
-    // stops paying for the answer.
-    int plausible = stats.held &&
-                    (stats.rescued || stats.drains < DRAINS_TO_LEARN ||
-                     stats.held >= hc_slots);
-    if (plausible)
-      stats.drains++;
-    unlock();
-    if (plausible) {
-      handle_cache_drain();
-      f = io.fopen(path, mode);
-      if (f) {
-        lock();
-        stats.rescued++;
-        unlock();
+    // Whether to fire it is not a judgement call, and the two attempts to make
+    // it one both did damage. Draining on every NULL meant draining on every
+    // probe for a file that is not there, 5492 times in a session. Capping
+    // those drains to learn from meant that once the cap was spent the net
+    // stopped catching anything: the cache held 28 descriptors, the game
+    // opened OBJECTS/IDE.DIR, got NULL, and passed it to OS_FileSetPosition,
+    // which read through it. The game does not check.
+    //
+    // So ask instead of guessing. A file that is not there is not this cache's
+    // doing and never needs a drain; a file that is there and will not open is
+    // descriptors, and this cache is holding some of them. That check costs one
+    // stat, only ever on the failure path, and it makes the guarantee absolute:
+    // the cache is never the reason an existing file fails to open.
+    if (io.exists && !io.exists(path)) {
+      lock();
+      stats.absent++;
+      unlock();
+    } else {
+      lock();
+      unsigned holding = stats.held;
+      if (holding)
+        stats.drains++;
+      unlock();
+      if (holding) {
+        handle_cache_drain();
+        f = io.fopen(path, mode);
+        if (f) {
+          // It really was us. That many was too many, so hold fewer -- the
+          // descriptor budget belongs to the game and the only way to learn it
+          // is to be told.
+          lock();
+          stats.rescued++;
+          unsigned fewer = holding - holding / 4;
+          hc_slots = fewer < HC_MIN_SLOTS ? HC_MIN_SLOTS : fewer;
+          stats.slots = hc_slots;
+          unlock();
+        }
       }
     }
   }

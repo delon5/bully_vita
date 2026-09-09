@@ -227,12 +227,12 @@
 // session over only 5288 distinct paths, and the trace counts zero of them
 // opened for writing, so holding readers is the whole of it.
 //
-// 32 is deliberately short of what the working set would take. Descriptors are
-// shared with everything else that opens a file -- the trace log, the texture
-// store -- and starving those to save open time would be a poor trade. The
-// cache gives every handle back and retries if an open ever does fail, so the
-// cost of guessing low is hit rate, not a failure to load. The trace reports
-// how many are held and whether it ever had to give them back.
+// A starting point, not a setting. 32 turned out to be more than this system
+// has: the cache reached 28 held, the game opened OBJECTS/IDE.DIR, the open
+// returned NULL and the game read through the NULL handle without checking it.
+// So the cap now comes down on its own the first time a drain rescues an open,
+// and the trace reports where it settled. Descriptors belong to the game, and
+// being told is the only way to find out how many are spare.
 #define HANDLE_CACHE_SLOTS 32
 
 // Create this file to close files normally again, for comparing the two on

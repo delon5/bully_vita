@@ -35,6 +35,9 @@ static unsigned char truth[FILES][FILE_BYTES];
 // cache actually holds rather than what it says it holds.
 static volatile int real_opens, real_closes, live_handles, peak_live;
 static volatile int fail_next_open;
+// Refuse every open once this many are live, the way a system with no
+// descriptors left does.
+static volatile int descriptor_ceiling = 1 << 30;
 // A path the fake refuses no matter what, the way a probe for a file that is
 // not there is refused. Draining cannot rescue it.
 static char missing_path[256];
@@ -50,6 +53,12 @@ static FILE *host_fopen(const char *path, const char *mode) {
   pthread_mutex_unlock(&count_lock);
 
   if (missing_path[0] && strcmp(path, missing_path) == 0)
+    return NULL;
+
+  pthread_mutex_lock(&count_lock);
+  int at_ceiling = live_handles >= descriptor_ceiling;
+  pthread_mutex_unlock(&count_lock);
+  if (at_ceiling)
     return NULL;
 
   FILE *f = fopen(path, mode);
@@ -73,7 +82,10 @@ static int host_fclose(FILE *f) {
 
 static int host_fseek(FILE *f, long o, int w) { return fseek(f, o, w); }
 static int host_ferror(FILE *f) { return ferror(f); }
-static const HandleCacheOps HOST = { host_fopen, host_fclose, host_fseek, host_ferror };
+static int host_exists(const char *path) { return access(path, F_OK) == 0; }
+static const HandleCacheOps HOST = { host_fopen, host_fclose, host_fseek,
+                                     host_ferror, host_exists };
+
 
 static void make_files(void) {
   for (int i = 0; i < FILES; i++) {
@@ -272,9 +284,9 @@ static void test_probes_do_not_empty_the_cache(void) {
 
   HandleCacheStats s;
   handle_cache_stats(&s);
-  assert(s.rescued == 0);              // draining never once helped
-  assert(s.drains <= DRAINS_TO_LEARN); // so it stopped paying to find out
-  assert(s.hits > 400);                // and the cache kept working
+  assert(s.drains == 0);   // a file that is not there never needs a drain
+  assert(s.absent == 500); // it is recognised as absent instead
+  assert(s.hits > 400);    // and the cache keeps working
   printf("probes       : 500 opens of a file that is not there cost %u drains, "
          "%u hits kept  OK\n", s.drains, s.hits);
   handle_cache_drain();
@@ -300,6 +312,60 @@ static void test_real_exhaustion_keeps_draining(void) {
   assert(s.rescued == s.drains && s.drains == 40);
   printf("exhaustion   : %u failed opens, all %u rescued by a drain  OK\n",
          s.drains, s.rescued);
+  handle_cache_drain();
+}
+
+// The crash. The cache held 28 descriptors, the game opened OBJECTS/IDE.DIR,
+// the open returned NULL because there were none left, and the game passed the
+// NULL to OS_FileSetPosition without checking. A file that exists must never
+// fail to open because this cache is holding handles -- however many probes for
+// absent files came before it, and however long the session has run.
+static void test_an_existing_file_never_fails_to_open(void) {
+  handle_cache_init(&HOST, 32);
+  snprintf(missing_path, sizeof(missing_path), "out/hc_not_here.bin");
+
+  // Fill the cache from the first fourteen paths, with a pile of absent-file
+  // probes mixed in -- the exact sequence that used the old policy's budget up
+  // before the real failure came.
+  for (int n = 0; n < 300; n++) {
+    check_whole(n % 14);
+    assert(handle_cache_fopen(missing_path, "rb") == NULL);
+  }
+  missing_path[0] = 0;
+
+  HandleCacheStats before;
+  handle_cache_stats(&before);
+  assert(before.held > 8); // it really is sitting on descriptors
+
+  // Now there are none left, for every open from here on.
+  pthread_mutex_lock(&count_lock);
+  descriptor_ceiling = live_handles;
+  pthread_mutex_unlock(&count_lock);
+
+  // Ask for the paths it is not holding, so every one of these has to reach
+  // fopen -- and every one of them finds the table full.
+  for (int n = 0; n < 50; n++) {
+    int which = 14 + n % 6;
+    FILE *f = handle_cache_fopen(paths[which], "rb");
+    assert(f); // the file is there, so it has to open, every single time
+    unsigned char got[FILE_BYTES];
+    assert(fread(got, 1, FILE_BYTES, f) == FILE_BYTES);
+    assert(memcmp(got, truth[which], FILE_BYTES) == 0);
+    handle_cache_fclose(f);
+    pthread_mutex_lock(&count_lock);
+    descriptor_ceiling = live_handles + 1;
+    pthread_mutex_unlock(&count_lock);
+  }
+  pthread_mutex_lock(&count_lock);
+  descriptor_ceiling = 1 << 30;
+  pthread_mutex_unlock(&count_lock);
+
+  HandleCacheStats s;
+  handle_cache_stats(&s);
+  assert(s.rescued > 0);
+  assert(s.slots < 32); // and it learned to hold fewer
+  printf("never NULL   : 50 opens against a full descriptor table, all served, "
+         "cap pulled back to %u  OK\n", s.slots);
   handle_cache_drain();
 }
 
@@ -395,6 +461,7 @@ int main(void) {
   test_open_failure_gives_the_handles_back();
   test_probes_do_not_empty_the_cache();
   test_real_exhaustion_keeps_draining();
+  test_an_existing_file_never_fails_to_open();
   test_failed_handle_is_not_parked();
   test_threads();
   test_nothing_leaks();
