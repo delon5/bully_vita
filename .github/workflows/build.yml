@@ -16,13 +16,16 @@ jobs:
       # toolchain and package set for exactly this; the stock hard-float one
       # cannot link these objects at all.
       VITASDK_CHANNEL: nightly-softfp
-      # The revision this port was written and released against. Two things
-      # since then break it outright: glShaderBinary now expects vitaGL's own
-      # serialized shader-cache format rather than a raw GXP, which is what the
-      # .gxp files in gamefiles are; and vglEnableRuntimeShaderCompiler is gone,
-      # so vglInit always loads SceShaccCg and patches it through taiHEN. Do not
-      # bump this without checking both.
-      VITAGL_REV: 4e4f5b6ad0bf43754935250a1707fad67eb4e450
+      # Current vitaGL, not the 2021 revision this port was released against.
+      # The old one renders nothing on hardware where this one works, so the
+      # loader was moved onto the new API and this pin was left behind -- CI has
+      # not built since. Three things differ and the loader already handles all
+      # three: glShaderBinary takes vitaGL's own serialized container rather
+      # than a bare GXP (a GXP with no matrix uniforms needs a four byte
+      # prefix), VGL_MEM_SLOW is now VGL_MEM_PHYCONT, and
+      # vglEnableRuntimeShaderCompiler is gone. Going back below this revision
+      # no longer compiles.
+      VITAGL_REV: cd3791e29ff7f1c0ab349f12c7231f4871ce6a75
       OPENAL_REV: c851a68f0939040a56bf0dd453367c1021264bb9
 
     steps:
@@ -74,11 +77,20 @@ jobs:
             UNPURE_TEXTURES=1 PHYCONT_ON_DEMAND=1 NO_SPLASHSCREEN=1 \
             HAVE_SHADER_CACHE=1 HAVE_TEXTURE_CACHE=1 \
             -j"$(nproc)" install
-          # Fail loudly rather than silently shipping a mixed archive.
-          if arm-vita-eabi-ar t "$VITASDK/arm-vita-eabi/lib/libvitaGL.a" | grep -qx 'buffers.o'; then
-            echo "libvitaGL.a contains objects from another vitaGL revision" >&2
-            exit 1
-          fi
+          # Fail loudly rather than silently shipping a mixed archive. Naming
+          # the objects one revision has and another does not needs updating
+          # every time the pin moves -- and got this backwards once already,
+          # rejecting the pinned revision's own buffers.o. Ask the tree
+          # instead: every member of the archive has to have a source file in
+          # the vitaGL that was just checked out.
+          arm-vita-eabi-ar t "$VITASDK/arm-vita-eabi/lib/libvitaGL.a" |
+            while read -r obj; do
+              found=$(find vitaGL/source -name "${obj%.o}.c" -o -name "${obj%.o}.cpp")
+              if [ -z "$found" ]; then
+                echo "libvitaGL.a holds $obj, which this vitaGL does not build" >&2
+                exit 1
+              fi
+            done
 
       # Runs before the vpk so a logic regression fails fast, and after vitaGL
       # so the tests see the same headers the vpk is built against.
