@@ -641,6 +641,22 @@ int ProcessEvents(void) {
     last_us = us;
     traceLog("fps: %d over the last %d frames, %d ms since the last heartbeat\n", fps, drawn,
              (int)(elapsed_us / 1000));
+    // How often the sticks are actually read from the hardware, next to the
+    // frame rate because that is what it will turn out to be tied to. The
+    // game's axis reads all come off one cached sample taken in
+    // GetGamepadType; nothing else touches the pad. So this rate, not the axis
+    // rate, is what stick responsiveness is made of, and no amount of work on
+    // file I/O moves it.
+    {
+      extern unsigned pad_samples, pad_axis_reads, pad_button_reads;
+      static unsigned last_pad;
+      unsigned took = pad_samples - last_pad;
+      last_pad = pad_samples;
+      traceLog("pad: %u hardware samples, %d a second, %u axis reads, "
+               "%u button reads\n", (unsigned)pad_samples,
+               elapsed_us ? (int)((uint64_t)took * 1000000u / elapsed_us) : 0,
+               (unsigned)pad_axis_reads, (unsigned)pad_button_reads);
+    }
     traceLog("heapinfo: arena %d MB, live %d MB, free-listed %d MB, top %d KB, peak %d MB\n",
              (int)(heap.arena / (1024 * 1024)), (int)(heap.uordblks / (1024 * 1024)),
              (int)(heap.fordblks / (1024 * 1024)), (int)(heap.keepcost / 1024),

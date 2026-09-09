@@ -112,6 +112,14 @@ int GetDeviceLocale(void) {
 static SceCtrlData pad;
 static SceTouchData touch_front, touch_back;
 
+// The pad is read from the hardware here and nowhere else: GetGamepadAxis and
+// GetGamepadButtons below both work off this one cached sample. So how fresh a
+// stick reading is depends entirely on how often the game asks for the type,
+// and nothing has ever counted that. If it is once a frame then the sticks are
+// sampled at the frame rate, which is 6 to 8 a second in a load, and no amount
+// of work on file I/O will make them feel different.
+unsigned pad_samples, pad_axis_reads, pad_button_reads;
+
 // 0, 5, 6: XBOX 360
 // 4: MogaPocket
 // 7: MogaPro
@@ -124,6 +132,7 @@ int GetGamepadType(int port) {
 
   if (sceCtrlPeekBufferPositiveExt2(port == 0 ? 0 : 2, &pad, 1) < 0)
     return -1;
+  pad_samples++;
 
   if (port == 0) {
     sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch_front, 1);
@@ -135,6 +144,7 @@ int GetGamepadType(int port) {
 
 int GetGamepadButtons(int port) {
   int mask = 0;
+  pad_button_reads++;
 
   if (pad.buttons & SCE_CTRL_CROSS)
     mask |= 0x1;
@@ -184,6 +194,7 @@ int GetGamepadButtons(int port) {
 
 float GetGamepadAxis(int port, int axis) {
   float val = 0.0f;
+  pad_axis_reads++;
 
   switch (axis) {
     case 0:
