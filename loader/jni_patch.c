@@ -120,6 +120,25 @@ static SceTouchData touch_front, touch_back;
 // of work on file I/O will make them feel different.
 unsigned pad_samples, pad_axis_reads, pad_button_reads;
 
+// The extremes each stick actually reaches. 635 samples a second says the pad
+// is read often enough; it says nothing about what comes back. A stick that
+// only ever reads 60 to 195 instead of 0 to 255 feels dead at the edges however
+// often it is polled, and that is what a sampling mode other than ANALOG_WIDE,
+// or a deadzone applied somewhere below, would look like. Push each stick to
+// its corners and the trace says whether the loader sees it.
+unsigned char pad_lo[4] = { 255, 255, 255, 255 };
+unsigned char pad_hi[4] = { 0, 0, 0, 0 };
+
+static void pad_note_range(void) {
+  const unsigned char v[4] = { pad.lx, pad.ly, pad.rx, pad.ry };
+  for (int i = 0; i < 4; i++) {
+    if (v[i] < pad_lo[i])
+      pad_lo[i] = v[i];
+    if (v[i] > pad_hi[i])
+      pad_hi[i] = v[i];
+  }
+}
+
 // 0, 5, 6: XBOX 360
 // 4: MogaPocket
 // 7: MogaPro
@@ -133,6 +152,7 @@ int GetGamepadType(int port) {
   if (sceCtrlPeekBufferPositiveExt2(port == 0 ? 0 : 2, &pad, 1) < 0)
     return -1;
   pad_samples++;
+  pad_note_range();
 
   if (port == 0) {
     sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch_front, 1);
