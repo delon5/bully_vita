@@ -14,7 +14,7 @@ CFLAGS := -idirafter $(VITASDK)/arm-vita-eabi/include -I../loader -I. \
           -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -g -O1
 LDFLAGS := -pthread
 
-TESTS := test_budget test_revisit test_regress test_no_backing_store test_alloc_trace
+TESTS := test_budget test_revisit test_regress test_no_backing_store test_alloc_trace test_read_cache
 FAKES := fake_vitagl.c fake_vita_os.c
 
 .PHONY: all check clean
@@ -27,7 +27,7 @@ $(OUT)/test_alloc_trace: test_alloc_trace.c fake_alloc_env.h ../loader/alloc_tra
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -DLOADER_ALLOC_TRACE $< $(LDFLAGS) -o $@
 
-$(OUT)/%: %.c $(FAKES) harness.h fake_vitagl.h ../loader/texture_cache.c ../loader/config.h
+$(OUT)/%: %.c $(FAKES) harness.h fake_vitagl.h ../loader/texture_cache.c ../loader/read_cache.c ../loader/config.h
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) $< $(FAKES) $(LDFLAGS) -o $@
 

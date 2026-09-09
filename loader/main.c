@@ -51,6 +51,7 @@
 #include "dialog.h"
 #include "fios.h"
 #include "game_memory.h"
+#include "read_cache.h"
 #include "so_util.h"
 #include "jni_patch.h"
 #include "movie_patch.h"
@@ -155,7 +156,7 @@ void vgl_file_log(const char *fmt, ...) {
 // reading inside a heartbeat that cannot have lasted more than about a second.
 // The session total was sound; the per-heartbeat figures were not.
 #define IO_SAMPLE 8
-static uint32_t io_reads, io_samples, io_seeks, io_sequential;
+static uint32_t io_reads, io_samples, io_seeks, io_sequential, io_asked;
 static uint64_t io_read_us, io_read_bytes, io_seek_us;
 // Read sizes, in buckets: under 4K, under 16K, under 64K, and the rest. 375 MB
 // arrived in 49894 reads at 2.8 ms each, which is 2.7 MB/s off a card that does
@@ -214,14 +215,12 @@ static void io_note_thread(SceUID tid, uint32_t us) {
   }
 }
 
-static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
-  size_t want = size * count;
-  io_size_buckets[want < 4096 ? 0 : want < 16384 ? 1 : want < 65536 ? 2 : 3]++;
-
-  long start = sceLibcBridge_ftell(stream);
-  if (stream == io_last_stream && start == io_last_end)
-    io_sequential++;
-
+// Every read that actually reaches the card, whether the game asked for it or
+// the cache read ahead. The timing sits here rather than around the cache so
+// that read-ahead is charged for: a scheme that halves the game's waiting by
+// moving three times the bytes is not an improvement, and putting the clock on
+// the outside would have hidden that.
+static size_t raw_fread(void *ptr, size_t size, size_t count, FILE *stream) {
   int timed = ++io_reads % IO_SAMPLE == 0;
   uint32_t t0 = timed ? io_now_us() : 0;
   size_t got = sceLibcBridge_fread(ptr, size, count, stream);
@@ -232,9 +231,30 @@ static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
     io_note_thread(sceKernelGetThreadId(), spent);
   }
   io_read_bytes += got * size;
+  return got;
+}
+
+static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
+  size_t want = size * count;
+  io_size_buckets[want < 4096 ? 0 : want < 16384 ? 1 : want < 65536 ? 2 : 3]++;
+  io_asked++;
+
+  long start = sceLibcBridge_ftell(stream);
+  if (stream == io_last_stream && start == io_last_end)
+    io_sequential++;
+
+  size_t got = read_cache_fread(ptr, size, count, stream);
+
   io_last_stream = stream;
   io_last_end = start + (long)(got * size);
   return got;
+}
+
+static int traced_fclose(FILE *stream) {
+  read_cache_forget(stream);
+  if (stream == io_last_stream)
+    io_last_stream = NULL;
+  return sceLibcBridge_fclose(stream);
 }
 
 static int traced_fseek(FILE *stream, long int offset, int origin) {
@@ -394,12 +414,16 @@ int ProcessEvents(void) {
                (unsigned)io_tid[i],
                io_tid[i] == presenting_thread ? " (presents frames)" : "",
                (int)(io_tid_us[i] * IO_SAMPLE / 1000), (unsigned)io_tid_reads[i]);
-    traceLog("io: %d ms reading, %d ms seeking, %d MB over %u reads, %u seeks, "
-             "%u sequential | sizes <4K %u <16K %u <64K %u more %u\n",
+    traceLog("io: %d ms reading, %d ms seeking, %d MB over %u card reads for %u asked, "
+             "%u seeks, %u sequential | sizes <4K %u <16K %u <64K %u more %u\n",
              (int)(io_read_us * IO_SAMPLE / 1000), (int)(io_seek_us * IO_SAMPLE / 1000),
-             (int)(io_read_bytes / (1024 * 1024)), (unsigned)io_reads, (unsigned)io_seeks,
-             (unsigned)io_sequential, io_size_buckets[0], io_size_buckets[1],
-             io_size_buckets[2], io_size_buckets[3]);
+             (int)(io_read_bytes / (1024 * 1024)), (unsigned)io_reads, (unsigned)io_asked,
+             (unsigned)io_seeks, (unsigned)io_sequential, io_size_buckets[0],
+             io_size_buckets[1], io_size_buckets[2], io_size_buckets[3]);
+    ReadCacheStats rc;
+    read_cache_stats(&rc);
+    traceLog("readcache: %u served from memory, %u went to the card, %u read aheads, %u KB\n",
+             rc.hits, rc.misses, rc.refills, rc.bytes_served_kb);
     // Frames actually presented since the last heartbeat, over the wall clock
     // between them. vsync is disabled, so this is what the hardware managed.
     static int last_frames;
@@ -945,7 +969,7 @@ static so_default_dynlib default_dynlib[] = {
   // { "eglGetProcAddress", (uintptr_t)&eglGetProcAddress },
   // { "eglQueryString", (uintptr_t)&eglQueryString },
 
-  { "fclose", (uintptr_t)&sceLibcBridge_fclose },
+  { "fclose", (uintptr_t)&traced_fclose },
   // { "fdopen", (uintptr_t)&fdopen },
   // { "fflush", (uintptr_t)&fflush },
   // { "fgetc", (uintptr_t)&fgetc },
@@ -1283,6 +1307,10 @@ int main(int argc, char *argv[]) {
 
   traceLog("boot: patched, running .so initializers\n");
   so_initialize(&bully_mod);
+
+  static const ReadCacheOps read_cache_ops = { raw_fread, sceLibcBridge_fseek,
+                                              sceLibcBridge_ftell };
+  read_cache_init(&read_cache_ops);
 
   traceLog("boot: initializers done, starting fios\n");
   // With the code, not just the message. The last build died here on a blue
