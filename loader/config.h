@@ -226,27 +226,34 @@
 // Create this file to buffer the game's reads. Off by default, because on this
 // hardware it loses, and the arithmetic says it always will.
 //
-// Three sessions fit a cost model of  time = reads x latency + bytes / bandwidth
-// to within 3%:
+// The cache works -- it serves the reads it claims to serve -- and it still
+// loses, for a reason that took four traces to see.
 //
-//                   card reads     MB   seconds   predicted
-//   no cache             24194    280     124.1       126.1
-//   64K, separate read   18553    489     190.7       192.4
-//   8K+, combined read   18168    315     135.6       131.2
+//                    asked   card reads   MB    seconds
+//   no cache         24194        24194   280      124.1
+//   64K, separate    21573        18553   489      190.7
+//   8K+, combined    25326        18168   315      135.6
 //
-//   latency 1.18 ms per read, transfer 2.87 MB/s
+// The combined-fetch run took 7158 card reads out of the game's path. Reads in
+// that session averaged 5.1 ms, so that should have been worth half a minute.
+// It was worth nothing: the run lost 11.5 s. Its own counters say why. It
+// fetched 51.3 MB ahead and served 11.9 MB of it, so 39.4 MB was moved for
+// nothing -- and at the ~2.9 MB/s the card sustains, 39.4 MB is 13.7 s, which
+// is the loss almost exactly.
 //
-// A typical 11.6 KB read is 3.95 ms of moving bytes and 1.18 ms of waiting, so
-// 77% of it is bandwidth. Read-ahead trades bytes for round trips, and on a card
-// this slow that is the wrong way round: the best the cache managed was 6026
-// fewer round trips, worth 7.1 s, bought with 35 MB of extra transfer costing
-// 12.2 s. It cannot come out ahead while transfer dominates.
+// So the reads read-ahead removes cost about nothing to begin with. Something
+// under fread already holds sequential bytes; asking for the next 8 KB early
+// only duplicates a buffer that exists, and the duplicate is paid for in real
+// card traffic. The reads that do cost are the other kind. In the two freezes
+// of a later session -- 25.8 s with no frame presented -- the game did
+// 2866 reads for 20 MB: 83% of them under 4 KB, 38% behind a seek, 0.76 MB/s
+// against the 2.61 MB/s it manages while playing. Those are misses in whatever
+// buffer sits below, and they are scattered, so read-ahead cannot see them
+// coming.
 //
-// The whole premise was wrong. 5.1 ms per read was read as latency, and it is
-// almost entirely transfer. The switch and the code stay because the conclusion
-// is a property of this card rather than of the design -- on a faster card the
-// balance inverts and read-ahead starts paying -- but it is off unless asked
-// for, and the trace reports what it did either way.
+// The switch and the code stay, because a faster card changes the arithmetic
+// and the trace reports what the cache did either way. It is off unless asked
+// for.
 #define READ_CACHE_ENABLE_PATH DATA_PATH "/" "use_readcache"
 
 
