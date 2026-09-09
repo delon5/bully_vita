@@ -51,6 +51,7 @@
 #include "dialog.h"
 #include "fios.h"
 #include "game_memory.h"
+#include "handle_cache.h"
 #include "read_cache.h"
 #include "so_util.h"
 #include "jni_patch.h"
@@ -316,11 +317,19 @@ static int open_seen_before(const char *path) {
   return 0;
 }
 
+// On unless a file on the card says otherwise, so the two can be compared on
+// hardware without a rebuild.
+static int handle_cache_on;
+
 static FILE *traced_fopen(const char *path, const char *mode) {
-  // Before the open, so the timing below covers only the open itself.
+  // Before the open, so the timing below covers only the open itself. The
+  // split stays measured the same way with the cache in the path: an open the
+  // cache serves is still a repeat, it just stops costing anything, which is
+  // the whole point and shows up in this counter.
   int again = path && open_seen_before(path);
   uint32_t t0 = io_now_us();
-  FILE *f = sceLibcBridge_fopen(path, mode);
+  FILE *f = handle_cache_on ? handle_cache_fopen(path, mode)
+                            : sceLibcBridge_fopen(path, mode);
   uint32_t spent = io_now_us() - t0;
   io_opens++;
   if (again) {
@@ -341,7 +350,12 @@ static int traced_fclose(FILE *stream) {
     read_cache_forget(stream);
   if (stream == io_last_stream)
     io_last_stream = NULL;
-  return sceLibcBridge_fclose(stream);
+  // The handle may not actually close here -- it gets parked under its path so
+  // the next open of it costs nothing. Both the sequential tracking above and
+  // the read cache are dropped either way, because a parked handle comes back
+  // rewound and neither should carry state across that.
+  return handle_cache_on ? handle_cache_fclose(stream)
+                         : sceLibcBridge_fclose(stream);
 }
 
 static int traced_fseek(FILE *stream, long int offset, int origin) {
@@ -501,6 +515,14 @@ int ProcessEvents(void) {
                (unsigned)io_tid[i],
                io_tid[i] == presenting_thread ? " (presents frames)" : "",
                (int)(io_tid_us[i] * IO_SAMPLE / 1000), (unsigned)io_tid_reads[i]);
+    if (handle_cache_on) {
+      HandleCacheStats hc;
+      handle_cache_stats(&hc);
+      traceLog("handles: %u opens served from a held file, %u went to the card, "
+               "%u parked, %u evicted, %u not kept, %u given back, %u held now\n",
+               hc.hits, hc.misses, hc.parked, hc.evicted, hc.dropped, hc.drains,
+               hc.held);
+    }
     traceLog("open: %u opens, %d ms | %u first at %d ms, %u again at %d ms | "
              "%u distinct, %u for writing, %u unplaced\n", (unsigned)io_opens,
              (int)((io_open_first_us + io_open_again_us) / 1000),
@@ -1402,6 +1424,21 @@ int main(int argc, char *argv[]) {
 
   traceLog("boot: patched, running .so initializers\n");
   so_initialize(&bully_mod);
+
+  static const HandleCacheOps handle_cache_ops = {
+    sceLibcBridge_fopen, sceLibcBridge_fclose, sceLibcBridge_fseek,
+    sceLibcBridge_ferror
+  };
+  SceIoStat hc_stat;
+  if (sceIoGetstat(HANDLE_CACHE_DISABLE_PATH, &hc_stat) >= 0) {
+    traceLog("handles: off, asked for by %s\n", HANDLE_CACHE_DISABLE_PATH);
+  } else {
+    handle_cache_init(&handle_cache_ops, HANDLE_CACHE_SLOTS);
+    handle_cache_on = 1;
+    traceLog("handles: holding up to %d files open instead of reopening them; "
+             "70%% of this game's opens are a path it has opened before and a "
+             "repeat costs what a first one does\n", HANDLE_CACHE_SLOTS);
+  }
 
   static const ReadCacheOps read_cache_ops = { raw_fread, sceLibcBridge_fseek,
                                               sceLibcBridge_ftell, read_cache_thread_id };

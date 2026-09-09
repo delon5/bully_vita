@@ -223,6 +223,22 @@
 // launch starts from nothing.
 #define TEXTURE_STORE_WIPE_PATH DATA_PATH "/" "wipe_texcache"
 
+// How many files to hold open rather than close. The game opens 17667 files a
+// session over only 5288 distinct paths, and the trace counts zero of them
+// opened for writing, so holding readers is the whole of it.
+//
+// 32 is deliberately short of what the working set would take. Descriptors are
+// shared with everything else that opens a file -- the trace log, the texture
+// store -- and starving those to save open time would be a poor trade. The
+// cache gives every handle back and retries if an open ever does fail, so the
+// cost of guessing low is hit rate, not a failure to load. The trace reports
+// how many are held and whether it ever had to give them back.
+#define HANDLE_CACHE_SLOTS 32
+
+// Create this file to close files normally again, for comparing the two on
+// hardware without a rebuild.
+#define HANDLE_CACHE_DISABLE_PATH DATA_PATH "/" "no_handlecache"
+
 // Create this file to buffer the game's reads. Off by default, because on this
 // hardware it loses, and the arithmetic says it always will.
 //
