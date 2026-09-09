@@ -30,6 +30,9 @@ size_t read_cache_fread(void *ptr, size_t size, size_t count, FILE *stream);
 // fopen can hand back the same FILE * for a different file.
 void read_cache_forget(FILE *stream);
 
+// Hands a thread's buffers and tracking entries back to the pool.
+void read_cache_release(unsigned thread);
+
 typedef struct {
   unsigned hits, misses, refills, bytes_served_kb, unowned;
 } ReadCacheStats;

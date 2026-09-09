@@ -292,6 +292,43 @@ int main(void) {
     fclose(f);
   }
 
+  // Opening and closing more files than the tracker holds must not put it out
+  // of action for the rest of the run.
+  //
+  // On hardware the cache served 0 reads out of 24196 and never read ahead
+  // once, while the trace's own counter said 13964 of those reads continued
+  // from the one before. Every host test passed, because none of them churned
+  // through file handles the way a game booting does.
+  {
+    read_cache_init(&HOST);
+    for (int i = 0; i < RC_TRACKED * 3; i++) {
+      FILE *f = fopen(path_a, "rb");
+      assert(f);
+      unsigned char got[256];
+      read_cache_fread(got, 1, 256, f);
+      read_cache_forget(f);
+      fclose(f);
+    }
+
+    // Now stream from a fresh file, which is exactly what the game does once it
+    // is past its start-up churn.
+    FILE *f = fopen(path_a, "rb");
+    unsigned char got[512];
+    for (int i = 0; i < 200; i++) {
+      size_t r = read_cache_fread(got, 1, 512, f);
+      assert(r == 512);
+      assert(memcmp(got, truth + i * 512, 512) == 0);
+    }
+    ReadCacheStats st;
+    read_cache_stats(&st);
+    printf("after churn  : %u hits, %u read aheads on a fresh sequential file  OK\n", st.hits,
+           st.refills);
+    assert(st.refills > 0 && "churning file handles must not disable read-ahead for ever");
+    assert(st.hits > 100 && "and a sequential run must still be served from memory");
+    read_cache_forget(f);
+    fclose(f);
+  }
+
   remove(path_a);
   remove(path_b);
   printf("PASS\n");

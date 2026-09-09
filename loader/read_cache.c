@@ -122,28 +122,60 @@ void read_cache_forget(FILE *stream) {
       seq_file[i] = NULL;
 }
 
+// A thread that will never read again should not hold entries for ever. Nothing
+// calls this yet -- the four reading threads live for the whole session -- but
+// the tables are small enough that a leak in them is what disabled the cache
+// once already.
+void read_cache_release(unsigned thread) {
+  for (int i = 0; i < RC_SLOTS; i++)
+    if (slots[i].owner == thread) {
+      slots[i].file = NULL;
+      __atomic_store_n(&slots[i].owner, 0u, __ATOMIC_RELEASE);
+    }
+  for (int i = 0; i < RC_TRACKED; i++)
+    if (seq_owner[i] == thread) {
+      seq_file[i] = NULL;
+      __atomic_store_n(&seq_owner[i], 0u, __ATOMIC_RELEASE);
+    }
+}
+
 // Whether this read carries on from the last one on the same file and thread,
 // and record where it ends.
 static int continues_a_run(unsigned me, FILE *stream, long from, long to) {
-  int free_slot = -1;
+  int mine = -1, unclaimed = -1;
   for (int i = 0; i < RC_TRACKED; i++) {
-    if (seq_owner[i] == me && seq_file[i] == stream) {
-      int sequential = seq_end[i] == from;
-      seq_end[i] = to;
-      return sequential;
+    if (seq_owner[i] == me) {
+      if (seq_file[i] == stream) {
+        int sequential = seq_end[i] == from;
+        seq_end[i] = to;
+        return sequential;
+      }
+      // Already ours and holding nothing: reuse it directly. Looking only for
+      // entries with no owner at all is what broke this on hardware -- a closed
+      // file left its entry owned but empty, so after sixteen files had been
+      // opened and closed there was nothing left an exchange could claim, and
+      // the cache served 0 of 24196 reads for the rest of the session.
+      if (!seq_file[i] && mine < 0)
+        mine = i;
+    } else if (!seq_owner[i] && unclaimed < 0) {
+      unclaimed = i;
     }
-    if (!seq_file[i] && free_slot < 0)
-      free_slot = i;
   }
-  if (free_slot < 0)
-    return 0; // no room to track this one; never read ahead on a guess
-  unsigned unowned = 0;
-  if (!__atomic_compare_exchange_n(&seq_owner[free_slot], &unowned, me, 0, __ATOMIC_ACQ_REL,
-                                   __ATOMIC_RELAXED))
-    return 0;
-  seq_file[free_slot] = stream;
-  seq_end[free_slot] = to;
-  return 0; // first sighting: nothing to continue yet
+
+  int at = mine;
+  if (at < 0) {
+    if (unclaimed < 0)
+      return 0; // nothing to track this with; never read ahead on a guess
+    unsigned unowned = 0;
+    if (!__atomic_compare_exchange_n(&seq_owner[unclaimed], &unowned, me, 0, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_RELAXED))
+      return 0; // lost the race; the next read will find one
+    at = unclaimed;
+  }
+
+  seq_file[at] = stream;
+  seq_end[at] = to;
+  return 0; // first sighting of this file: nothing to continue yet
 }
 
 static Slot *slot_for(unsigned me, FILE *stream) {

@@ -430,8 +430,9 @@ int ProcessEvents(void) {
              io_size_buckets[1], io_size_buckets[2], io_size_buckets[3]);
     ReadCacheStats rc;
     read_cache_stats(&rc);
-    traceLog("readcache: %u served from memory, %u went to the card, %u read aheads, %u KB\n",
-             rc.hits, rc.misses, rc.refills, rc.bytes_served_kb);
+    traceLog("readcache: %u served from memory, %u went to the card, %u read aheads, %u KB, "
+             "%u reads found no buffer of their own\n",
+             rc.hits, rc.misses, rc.refills, rc.bytes_served_kb, rc.unowned);
     // Frames actually presented since the last heartbeat, over the wall clock
     // between them. vsync is disabled, so this is what the hardware managed.
     static int last_frames;
