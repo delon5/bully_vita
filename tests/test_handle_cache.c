@@ -35,6 +35,9 @@ static unsigned char truth[FILES][FILE_BYTES];
 // cache actually holds rather than what it says it holds.
 static volatile int real_opens, real_closes, live_handles, peak_live;
 static volatile int fail_next_open;
+// A path the fake refuses no matter what, the way a probe for a file that is
+// not there is refused. Draining cannot rescue it.
+static char missing_path[256];
 static pthread_mutex_t count_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static FILE *host_fopen(const char *path, const char *mode) {
@@ -45,6 +48,9 @@ static FILE *host_fopen(const char *path, const char *mode) {
     return NULL;
   }
   pthread_mutex_unlock(&count_lock);
+
+  if (missing_path[0] && strcmp(path, missing_path) == 0)
+    return NULL;
 
   FILE *f = fopen(path, mode);
   if (f) {
@@ -249,6 +255,54 @@ static void test_open_failure_gives_the_handles_back(void) {
   handle_cache_drain();
 }
 
+// What the first version of this got wrong on hardware. The game probes for
+// files that are not there; every probe returned NULL, the cache read that as
+// running out of descriptors, and gave back everything it held. 5492 times in
+// one session, for 9 useful hits.
+static void test_probes_do_not_empty_the_cache(void) {
+  handle_cache_init(&HOST, 8);
+  snprintf(missing_path, sizeof(missing_path), "out/hc_not_here.bin");
+
+  for (int n = 0; n < 500; n++) {
+    check_whole(n % 4);
+    // The probe that is never going to succeed, whatever the cache does.
+    assert(handle_cache_fopen(missing_path, "rb") == NULL);
+  }
+  missing_path[0] = 0;
+
+  HandleCacheStats s;
+  handle_cache_stats(&s);
+  assert(s.rescued == 0);              // draining never once helped
+  assert(s.drains <= DRAINS_TO_LEARN); // so it stopped paying to find out
+  assert(s.hits > 400);                // and the cache kept working
+  printf("probes       : 500 opens of a file that is not there cost %u drains, "
+         "%u hits kept  OK\n", s.drains, s.hits);
+  handle_cache_drain();
+}
+
+// The other half: when draining really does rescue an open, it must keep doing
+// it however many times that takes.
+static void test_real_exhaustion_keeps_draining(void) {
+  handle_cache_init(&HOST, 8);
+  for (int round = 0; round < 40; round++) {
+    for (int i = 0; i < 4; i++)
+      check_whole(i);
+    pthread_mutex_lock(&count_lock);
+    fail_next_open = 1;
+    pthread_mutex_unlock(&count_lock);
+    FILE *f = handle_cache_fopen(paths[10 + (round % 5)], "rb");
+    assert(f); // the drain has to rescue it every time, not just eight times
+    handle_cache_fclose(f);
+  }
+
+  HandleCacheStats s;
+  handle_cache_stats(&s);
+  assert(s.rescued == s.drains && s.drains == 40);
+  printf("exhaustion   : %u failed opens, all %u rescued by a drain  OK\n",
+         s.drains, s.rescued);
+  handle_cache_drain();
+}
+
 static void test_failed_handle_is_not_parked(void) {
   handle_cache_init(&HOST, 8);
   FILE *f = handle_cache_fopen(paths[0], "rb");
@@ -339,6 +393,8 @@ int main(void) {
   test_writes_are_never_cached();
   test_untracked_close_passes_through();
   test_open_failure_gives_the_handles_back();
+  test_probes_do_not_empty_the_cache();
+  test_real_exhaustion_keeps_draining();
   test_failed_handle_is_not_parked();
   test_threads();
   test_nothing_leaks();

@@ -45,6 +45,9 @@
 // Handles the game has open right now. fclose is given a FILE * and nothing
 // else, so parking one means remembering the path it was opened under.
 #define HC_LIVE 256
+// How many times to drain on a failed open before deciding the failures are
+// not this cache's doing.
+#define DRAINS_TO_LEARN 8
 
 typedef struct {
   FILE *file; // NULL for an empty slot
@@ -200,17 +203,33 @@ FILE *handle_cache_fopen(const char *path, const char *mode) {
   FILE *f = io.fopen(path, mode);
   if (!f) {
     lock();
-    unsigned holding = stats.held;
-    unlock();
-    if (holding) {
-      // The likeliest reason an open fails here is that this cache is sitting
-      // on the descriptors. Give them all back and try once more, so running
-      // out degrades into being slow rather than into failing to load.
-      lock();
+    // Draining is the safety net for running out of descriptors: give every
+    // held handle back and try again, so running out degrades into being slow
+    // rather than into failing to load.
+    //
+    // But a NULL from fopen is not proof of that. A game probing for a file
+    // that is not there gets the same answer, and the first version of this
+    // could not tell the difference: it drained on every probe, 5492 times in
+    // a session, and turned 54.5 s of opening files into 86.1 s while serving
+    // 9 opens out of 17898. So drain while it is still plausible -- a few
+    // times to find out, whenever this cache is holding all it can and is
+    // therefore a candidate, and always once draining has actually rescued an
+    // open. If it never rescues one, the failures were never about us and it
+    // stops paying for the answer.
+    int plausible = stats.held &&
+                    (stats.rescued || stats.drains < DRAINS_TO_LEARN ||
+                     stats.held >= hc_slots);
+    if (plausible)
       stats.drains++;
-      unlock();
+    unlock();
+    if (plausible) {
       handle_cache_drain();
       f = io.fopen(path, mode);
+      if (f) {
+        lock();
+        stats.rescued++;
+        unlock();
+      }
     }
   }
 

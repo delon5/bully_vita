@@ -44,6 +44,7 @@ typedef struct {
   unsigned evicted;   // parked handles closed to make room
   unsigned dropped;   // closes that could not be parked at all
   unsigned drains;    // fopen failed and the cache gave its handles back
+  unsigned rescued;   // ...and the open then succeeded, so it really was us
   unsigned held;      // how many are parked right now
 } HandleCacheStats;
 

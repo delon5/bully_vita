@@ -321,6 +321,61 @@ static int open_seen_before(const char *path) {
 // hardware without a rebuild.
 static int handle_cache_on;
 
+// How big are the files that get opened over and over? Holding the handle
+// stops the open costing anything, but the game still reads the bytes back off
+// the card every time, and a path-keyed cache of whole small files would stop
+// that too. What it would cost in memory, and what it would save, is the sum
+// of these -- and there is a lot of memory to spend: the newlib heap is capped
+// at 176 MB and three sessions running peaked at 90.
+//
+// Measured as the file position at close, which is the bytes consumed for
+// anything read start to finish. A file seeked around in reads higher than it
+// should, so the big archives overstate; they are also the ones no cache would
+// hold, and the buckets below say how much of the total they are.
+#define VISIT_TRACKED 256
+static struct {
+  FILE *file;
+  int again;
+} visits[VISIT_TRACKED];
+static uint32_t visit_first, visit_again, visit_untracked;
+static uint64_t visit_first_bytes, visit_again_bytes;
+static uint32_t visit_buckets[4]; // under 4K, 16K, 64K, and the rest
+
+static void visit_open(FILE *f, int again) {
+  for (int i = 0; i < VISIT_TRACKED; i++) {
+    if (!__atomic_load_n(&visits[i].file, __ATOMIC_RELAXED)) {
+      FILE *empty = NULL;
+      if (__atomic_compare_exchange_n(&visits[i].file, &empty, f, 0,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        visits[i].again = again;
+        return;
+      }
+    }
+  }
+  visit_untracked++;
+}
+
+static void visit_close(FILE *f, long consumed) {
+  for (int i = 0; i < VISIT_TRACKED; i++) {
+    if (__atomic_load_n(&visits[i].file, __ATOMIC_RELAXED) == f) {
+      int again = visits[i].again;
+      __atomic_store_n(&visits[i].file, NULL, __ATOMIC_RELEASE);
+      if (consumed < 0)
+        return;
+      if (again) {
+        visit_again++;
+        visit_again_bytes += (uint64_t)consumed;
+      } else {
+        visit_first++;
+        visit_first_bytes += (uint64_t)consumed;
+      }
+      visit_buckets[consumed < 4096 ? 0 : consumed < 16384 ? 1
+                    : consumed < 65536 ? 2 : 3]++;
+      return;
+    }
+  }
+}
+
 static FILE *traced_fopen(const char *path, const char *mode) {
   // Before the open, so the timing below covers only the open itself. The
   // split stays measured the same way with the cache in the path: an open the
@@ -342,10 +397,13 @@ static FILE *traced_fopen(const char *path, const char *mode) {
   // many there are before designing around them.
   if (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')))
     io_opens_writing++;
+  if (f)
+    visit_open(f, again);
   return f;
 }
 
 static int traced_fclose(FILE *stream) {
+  visit_close(stream, sceLibcBridge_ftell(stream));
   if (read_cache_on)
     read_cache_forget(stream);
   if (stream == io_last_stream)
@@ -519,10 +577,17 @@ int ProcessEvents(void) {
       HandleCacheStats hc;
       handle_cache_stats(&hc);
       traceLog("handles: %u opens served from a held file, %u went to the card, "
-               "%u parked, %u evicted, %u not kept, %u given back, %u held now\n",
+               "%u parked, %u evicted, %u not kept, %u given back of which %u "
+               "rescued an open, %u held now\n",
                hc.hits, hc.misses, hc.parked, hc.evicted, hc.dropped, hc.drains,
-               hc.held);
+               hc.rescued, hc.held);
     }
+    traceLog("visit: %u first reading %d MB, %u again reading %d MB, %u untracked "
+             "| per visit <4K %u <16K %u <64K %u more %u\n",
+             (unsigned)visit_first, (int)(visit_first_bytes / (1024 * 1024)),
+             (unsigned)visit_again, (int)(visit_again_bytes / (1024 * 1024)),
+             (unsigned)visit_untracked, visit_buckets[0], visit_buckets[1],
+             visit_buckets[2], visit_buckets[3]);
     traceLog("open: %u opens, %d ms | %u first at %d ms, %u again at %d ms | "
              "%u distinct, %u for writing, %u unplaced\n", (unsigned)io_opens,
              (int)((io_open_first_us + io_open_again_us) / 1000),
