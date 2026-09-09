@@ -176,6 +176,28 @@ static uint32_t io_now_us(void) {
 static FILE *io_last_stream;
 static long io_last_end;
 
+// Reading is 26-31% of wall clock in a load-heavy session, but that only costs
+// frames if it happens on the thread that presents them. The game runs a
+// CDStreamThread; if the reads are there, they overlap with drawing and the
+// figure means much less than it looks. Cheap to settle: bucket the time by
+// thread and mark whichever one calls swapBuffers.
+#define IO_THREADS 8
+static SceUID io_tid[IO_THREADS];
+static uint64_t io_tid_us[IO_THREADS];
+static uint32_t io_tid_reads[IO_THREADS];
+SceUID presenting_thread; // set in jni_patch.c's swapBuffers
+
+static void io_note_thread(SceUID tid, uint32_t us) {
+  for (int i = 0; i < IO_THREADS; i++) {
+    if (io_tid[i] == tid || !io_tid[i]) {
+      io_tid[i] = tid;
+      io_tid_us[i] += us;
+      io_tid_reads[i]++;
+      return;
+    }
+  }
+}
+
 static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
   size_t want = size * count;
   io_size_buckets[want < 4096 ? 0 : want < 16384 ? 1 : want < 65536 ? 2 : 3]++;
@@ -188,8 +210,10 @@ static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
   uint32_t t0 = timed ? io_now_us() : 0;
   size_t got = sceLibcBridge_fread(ptr, size, count, stream);
   if (timed) {
-    io_read_us += io_now_us() - t0;
+    uint32_t spent = io_now_us() - t0;
+    io_read_us += spent;
     io_samples++;
+    io_note_thread(sceKernelGetThreadId(), spent);
   }
   io_read_bytes += got * size;
   io_last_stream = stream;
@@ -349,6 +373,10 @@ int ProcessEvents(void) {
     game_memory_hot_report();
     // ...and the same for the file reads the game does to fill those textures
     // and everything else an area is made of. Scaled up from the sample.
+    for (int i = 0; i < IO_THREADS && io_tid[i]; i++)
+      traceLog("io thread: 0x%08x%s %d ms over %u sampled reads\n", (unsigned)io_tid[i],
+               io_tid[i] == presenting_thread ? " (presents frames)" : "",
+               (int)(io_tid_us[i] * IO_SAMPLE / 1000), (unsigned)io_tid_reads[i]);
     traceLog("io: %d ms reading, %d ms seeking, %d MB over %u reads, %u seeks, "
              "%u sequential | sizes <4K %u <16K %u <64K %u more %u\n",
              (int)(io_read_us * IO_SAMPLE / 1000), (int)(io_seek_us * IO_SAMPLE / 1000),
@@ -1011,7 +1039,13 @@ static so_default_dynlib default_dynlib[] = {
 
   { "memchr", (uintptr_t)&sceClibMemchr },
   { "memcmp", (uintptr_t)&sceClibMemcmp },
-  { "memcpy", (uintptr_t)&sceClibMemcpy },
+  // Through the wrapper, not straight to sceClibMemcpy. It went direct until
+  // now, which meant the "hot copy" half of the profile never saw a single game
+  // call and printed nothing at all -- so the profile reported last time was
+  // entirely allocation sites, not the memcpy sites it was presented as. The
+  // wrapper forwards to sceClibMemcpy and samples one call in 256 off the
+  // destination pointer.
+  { "memcpy", (uintptr_t)&memcpy },
   { "memmove", (uintptr_t)&sceClibMemmove },
   { "memset", (uintptr_t)&sceClibMemset },
 

@@ -6,6 +6,7 @@
  * of the MIT license.  See the LICENSE file for details.
  */
 
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/ctrl.h>
 #include <psp2/touch.h>
@@ -257,7 +258,12 @@ static void trace_frame_contents(int n) {
 }
 #endif
 
+extern SceUID presenting_thread;
+
 int swapBuffers(void) {
+  if (!presenting_thread)
+    presenting_thread = sceKernelGetThreadId();
+
   if (frames_swapped < 3 || frames_swapped == 60 || frames_swapped == 600)
     traceLog("frame: %d presented\n", frames_swapped);
 #ifdef LOADER_TRACE
