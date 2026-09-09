@@ -51,12 +51,29 @@
 // Paths already found not to exist. Two thirds of this game's opens -- 12111 of
 // 18174 -- are for a file that is not there, and asking the filesystem about
 // each of them cost 42 s, which was more than holding handles saved. Asking
-// once per path instead of once per open is the whole of the fix.
+// once per path instead of once per open is the point of this table.
 //
-// Full paths, not hashes. A collision here would mark an existing file absent,
-// and an existing file marked absent is an open that fails without the drain
-// that exists to save it -- which is the crash this cache already caused once.
-#define HC_ABSENT 256
+// The first version of it was a linear scan of 256 entries, under the same lock
+// every fopen and fclose takes, run on 12009 failed opens plus an insert scan
+// on top. That cost 34 s -- most of a stat's worth per probe, on four threads
+// serialised behind it -- and it only held a fifth of the paths it needed, so
+// half the stats were paid anyway. Indexed and sized properly instead: a hash
+// picks the slot, and it gets its own lock so a missing file stops blocking
+// every open and close in the game.
+//
+// The hash picks where to look; the full path decides. A collision that
+// answered on the hash alone would mark an existing file absent, and an
+// existing file marked absent is an open that fails without the drain that
+// exists to save it -- which is the crash this cache already caused once.
+#define HC_ABSENT 4096 // a power of two; 784 KB, against 86 MB of spare heap
+#define HC_ABSENT_PROBES 8
+// How often to ask the filesystem again about a path it already said was
+// missing. Nothing this game does can make a missing file appear -- it opens
+// nothing for writing and imports no rename -- but the whole guarantee here is
+// that an existing file always opens, and resting that on the game never
+// changing is how the last two versions of this went wrong. One stat in 64 is
+// 190 of them a session, and it bounds how stale an answer can be.
+#define HC_ABSENT_RECHECK 64
 
 typedef struct {
   FILE *file; // NULL for an empty slot
@@ -71,8 +88,15 @@ typedef struct {
 
 static HandleCacheOps io;
 static Parked parked[HC_SLOTS];
-static char absent[HC_ABSENT][HC_PATH];
-static unsigned absent_next;
+static struct {
+  unsigned hash; // 0 for an empty slot
+  unsigned seen; // consultations, so one in HC_ABSENT_RECHECK asks again
+  char path[HC_PATH];
+} absent[HC_ABSENT];
+// Its own lock. The park and unpark tables are touched by every open and close;
+// this one is touched only when an open has already failed, and making the two
+// wait for each other was most of what the last version cost.
+static volatile int absent_lock;
 static Live live[HC_LIVE];
 static unsigned hc_slots = HC_SLOTS;
 static unsigned hc_clock;
@@ -98,7 +122,6 @@ void handle_cache_init(const HandleCacheOps *ops, unsigned slots) {
   memset(live, 0, sizeof(live));
   memset(absent, 0, sizeof(absent));
   hc_clock = 0;
-  absent_next = 0;
   memset(&stats, 0, sizeof(stats));
   stats.slots = hc_slots; // after the wipe, not before it
 }
@@ -147,21 +170,71 @@ static int forget_live(FILE *file, char *out) {
   return 0;
 }
 
-// Caller holds the lock. Whether this path has already been found missing.
-static int known_absent(const char *path) {
-  for (unsigned i = 0; i < HC_ABSENT; i++)
-    if (absent[i][0] && strcmp(absent[i], path) == 0)
-      return 1;
-  return 0;
+// FNV-1a, never zero so that zero can mean an empty slot.
+static unsigned absent_hash(const char *path) {
+  unsigned h = 2166136261u;
+  while (*path)
+    h = (h ^ (unsigned char)*path++) * 16777619u;
+  return h ? h : 1;
 }
 
-// Caller holds the lock. Round robin: the table is a way of not asking the same
-// question repeatedly, so forgetting the oldest answer costs one stat.
+// Both of these take the absent lock themselves.
+
+static int known_absent(const char *path) {
+  unsigned h = absent_hash(path);
+  int found = 0;
+  while (__atomic_test_and_set(&absent_lock, __ATOMIC_ACQUIRE))
+    ;
+  for (unsigned i = 0; i < HC_ABSENT_PROBES; i++) {
+    unsigned slot = (h + i) & (HC_ABSENT - 1);
+    if (!absent[slot].hash)
+      break; // an empty slot means the path was never inserted
+    if (absent[slot].hash == h && strcmp(absent[slot].path, path) == 0) {
+      // Say no periodically, so the answer gets checked against the
+      // filesystem again rather than being believed forever.
+      found = (++absent[slot].seen % HC_ABSENT_RECHECK) != 0;
+      break;
+    }
+  }
+  __atomic_clear(&absent_lock, __ATOMIC_RELEASE);
+  return found;
+}
+
+// The filesystem says it is there after all, so stop saying otherwise.
+static void forget_absent(const char *path) {
+  unsigned h = absent_hash(path);
+  while (__atomic_test_and_set(&absent_lock, __ATOMIC_ACQUIRE))
+    ;
+  for (unsigned i = 0; i < HC_ABSENT_PROBES; i++) {
+    unsigned slot = (h + i) & (HC_ABSENT - 1);
+    if (!absent[slot].hash)
+      break;
+    if (absent[slot].hash == h && strcmp(absent[slot].path, path) == 0) {
+      absent[slot].hash = 0;
+      absent[slot].seen = 0;
+      break;
+    }
+  }
+  __atomic_clear(&absent_lock, __ATOMIC_RELEASE);
+}
+
 static void note_absent(const char *path) {
-  if (known_absent(path))
-    return;
-  memcpy(absent[absent_next], path, strlen(path) + 1);
-  absent_next = (absent_next + 1) % HC_ABSENT;
+  unsigned h = absent_hash(path);
+  while (__atomic_test_and_set(&absent_lock, __ATOMIC_ACQUIRE))
+    ;
+  unsigned slot = h & (HC_ABSENT - 1);
+  for (unsigned i = 0; i < HC_ABSENT_PROBES; i++) {
+    unsigned s = (h + i) & (HC_ABSENT - 1);
+    if (!absent[s].hash || (absent[s].hash == h && strcmp(absent[s].path, path) == 0)) {
+      slot = s;
+      break;
+    }
+    // Nowhere free within the probe run: overwrite the first slot. The only
+    // cost of forgetting an answer is being told it again.
+  }
+  absent[slot].hash = h;
+  memcpy(absent[slot].path, path, strlen(path) + 1);
+  __atomic_clear(&absent_lock, __ATOMIC_RELEASE);
 }
 
 // Takes a handle for this path out of the table, or NULL if none is held.
@@ -251,9 +324,9 @@ FILE *handle_cache_fopen(const char *path, const char *mode) {
     // stat, only ever on the failure path, and it makes the guarantee absolute:
     // the cache is never the reason an existing file fails to open.
     lock();
-    int seen_missing = known_absent(path);
     unsigned holding = stats.held;
     unlock();
+    int seen_missing = known_absent(path);
 
     // Asking is only worth it the first time. After that the answer is
     // remembered, because two thirds of this game's opens are probes for files
@@ -264,12 +337,16 @@ FILE *handle_cache_fopen(const char *path, const char *mode) {
       lock();
       stats.absent_again++;
       unlock();
-    } else if (io.exists && !io.exists(path)) {
-      there = 0;
-      lock();
-      stats.absent++;
-      note_absent(path);
-      unlock();
+    } else if (io.exists) {
+      if (io.exists(path)) {
+        forget_absent(path); // it is there, whatever the table said
+      } else {
+        there = 0;
+        note_absent(path);
+        lock();
+        stats.absent++;
+        unlock();
+      }
     }
 
     // Drain when the file is there -- then it can only be descriptors -- and

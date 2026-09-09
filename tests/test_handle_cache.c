@@ -297,13 +297,14 @@ static void test_probes_do_not_empty_the_cache(void) {
   int asked = exists_calls;
   pthread_mutex_unlock(&count_lock);
 
-  assert(s.drains == 0);         // a file that is not there never needs a drain
-  assert(s.absent == 1);         // and the filesystem is asked about it once
-  assert(s.absent_again == 499); // the other 499 are remembered
-  assert(asked == 1);            // really once, not once a heartbeat
+  assert(s.drains == 0); // a file that is not there never needs a drain
+  // Asked once, then again only on the recheck interval that keeps the answer
+  // from being believed forever.
+  assert(asked <= 2 + 500 / HC_ABSENT_RECHECK);
+  assert(s.absent_again >= 480); // so nearly all of them are remembered
   assert(s.hits > 400);          // and the cache keeps working
   printf("probes       : 500 opens of a file that is not there cost %u drains "
-         "and %d question to the filesystem, %u hits kept  OK\n",
+         "and %d questions to the filesystem, %u hits kept  OK\n",
          s.drains, asked, s.hits);
   handle_cache_drain();
 }
@@ -394,7 +395,9 @@ static void test_a_file_that_appears_still_opens(void) {
   snprintf(late, sizeof(late), "out/hc_appears.bin");
   unlink(late);
 
-  handle_cache_init(&HOST, 8);
+  // A cap of 16 filled to 8, so the cache is not holding all it may -- the
+  // check that fires on a full table cannot be what saves this one.
+  handle_cache_init(&HOST, 16);
   // Probe for it while it does not exist, so the cache files it away as absent.
   for (int n = 0; n < 20; n++)
     assert(handle_cache_fopen(late, "rb") == NULL);
@@ -412,7 +415,11 @@ static void test_a_file_that_appears_still_opens(void) {
   descriptor_ceiling = live_handles;
   pthread_mutex_unlock(&count_lock);
 
-  FILE *f = handle_cache_fopen(late, "rb");
+  // Within one recheck interval the cache must ask the filesystem again,
+  // find the file, and open it.
+  FILE *f = NULL;
+  for (int n = 0; n < HC_ABSENT_RECHECK && !f; n++)
+    f = handle_cache_fopen(late, "rb");
   pthread_mutex_lock(&count_lock);
   descriptor_ceiling = 1 << 30;
   pthread_mutex_unlock(&count_lock);
@@ -422,10 +429,98 @@ static void test_a_file_that_appears_still_opens(void) {
   assert(memcmp(got, truth[0], 64) == 0);
   handle_cache_fclose(f);
 
-  printf("stale absence: a path remembered as missing, then created, still "
-         "opens with the table full  OK\n");
+  printf("stale absence: a path remembered as missing, then created, is asked "
+         "about again and opens  OK\n");
   handle_cache_drain();
   unlink(late);
+}
+
+// The table has to be big enough and quick enough to be worth having. The
+// first version held 256 paths in a round robin and scanned all of them on the
+// lock every open and close takes: it forgot four fifths of what it was told,
+// so half the stats were paid twice, and the scanning cost more than the stats
+// it saved. Thousands of distinct missing paths must each be asked about once.
+static void test_many_missing_paths_are_each_asked_once(void) {
+  handle_cache_init(&HOST, 8);
+  pthread_mutex_lock(&count_lock);
+  exists_calls = 0;
+  pthread_mutex_unlock(&count_lock);
+
+  char p[256];
+  for (int pass = 0; pass < 2; pass++) {
+    for (int n = 0; n < 2000; n++) {
+      snprintf(p, sizeof(p), "out/hc_gone_%04d.bin", n);
+      snprintf(missing_path, sizeof(missing_path), "%s", p);
+      assert(handle_cache_fopen(p, "rb") == NULL);
+    }
+  }
+  missing_path[0] = 0;
+
+  pthread_mutex_lock(&count_lock);
+  int asked = exists_calls;
+  pthread_mutex_unlock(&count_lock);
+  HandleCacheStats s;
+  handle_cache_stats(&s);
+  // Once each, give or take the handful a full probe run displaces. A table
+  // that forgets its answers asks again on the second pass, and that is the
+  // whole difference between this being worth having and not.
+  assert(asked <= 2100 + 2 * 2000 / HC_ABSENT_RECHECK);
+  assert(s.absent_again >= 1900);
+
+  // And a table full of absent paths must not make an existing file look
+  // absent -- that is the collision that hands back a NULL.
+  for (int i = 0; i < FILES; i++)
+    check_whole(i);
+  printf("many missing : 4000 opens over 2000 missing paths asked the "
+         "filesystem %d times  OK\n", asked);
+  handle_cache_drain();
+}
+
+// Two paths with the same FNV-1a hash, found by brute force. The table is
+// indexed by that hash, so if the entry it lands on were trusted on the hash
+// alone, the second of these would be reported missing because the first is --
+// and a file wrongly believed missing is an open that fails without the drain
+// that exists to save it. The path has to decide, not the hash.
+#define COLLIDE_A "out/hc_abxwfo.bin"
+#define COLLIDE_B "out/hc_ab0uja.bin"
+
+static void test_a_hash_collision_does_not_hide_a_file(void) {
+  // A cap of 16 filled to 8, so the drain that fires on a full table is not
+  // what saves this: the path compare has to be.
+  handle_cache_init(&HOST, 16);
+  unlink(COLLIDE_A);
+  FILE *w = fopen(COLLIDE_B, "wb");
+  assert(w && fwrite(truth[3], 1, 128, w) == 128);
+  fclose(w);
+
+  // A is missing, so the cache files it under the hash both of them share.
+  snprintf(missing_path, sizeof(missing_path), COLLIDE_A);
+  for (int n = 0; n < 5; n++)
+    assert(handle_cache_fopen(COLLIDE_A, "rb") == NULL);
+  missing_path[0] = 0;
+
+  // B exists. Fill the slots, take every descriptor, and it still has to open:
+  // the only thing standing between it and a NULL is that the table compares
+  // the whole path.
+  for (int i = 0; i < 8; i++)
+    check_whole(i);
+  pthread_mutex_lock(&count_lock);
+  descriptor_ceiling = live_handles;
+  pthread_mutex_unlock(&count_lock);
+  FILE *f = handle_cache_fopen(COLLIDE_B, "rb");
+  pthread_mutex_lock(&count_lock);
+  descriptor_ceiling = 1 << 30;
+  pthread_mutex_unlock(&count_lock);
+  assert(f);
+  unsigned char got[128];
+  assert(fread(got, 1, 128, f) == 128);
+  assert(memcmp(got, truth[3], 128) == 0);
+  handle_cache_fclose(f);
+
+  printf("hash clash   : two paths sharing a hash, the missing one does not "
+         "hide the real one  OK\n");
+  handle_cache_drain();
+  unlink(COLLIDE_B);
 }
 
 static void test_failed_handle_is_not_parked(void) {
@@ -522,6 +617,8 @@ int main(void) {
   test_real_exhaustion_keeps_draining();
   test_an_existing_file_never_fails_to_open();
   test_a_file_that_appears_still_opens();
+  test_many_missing_paths_are_each_asked_once();
+  test_a_hash_collision_does_not_hide_a_file();
   test_failed_handle_is_not_parked();
   test_threads();
   test_nothing_leaks();
