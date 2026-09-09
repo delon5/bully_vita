@@ -185,12 +185,28 @@ static long io_last_end;
 static SceUID io_tid[IO_THREADS];
 static uint64_t io_tid_us[IO_THREADS];
 static uint32_t io_tid_reads[IO_THREADS];
+// The name as well as the id. The first run of this said all the reading
+// happened on threads that do not present frames -- which is only half an
+// answer, because the game can still be sitting blocked waiting for them. Which
+// thread it is decides that: SceFiosIO is the streamer doing its job in the
+// background, GameMain is the game itself stopped dead on a read.
+static char io_tid_name[IO_THREADS][32];
 SceUID presenting_thread; // set in jni_patch.c's swapBuffers
 
 static void io_note_thread(SceUID tid, uint32_t us) {
   for (int i = 0; i < IO_THREADS; i++) {
     if (io_tid[i] == tid || !io_tid[i]) {
-      io_tid[i] = tid;
+      if (!io_tid[i]) {
+        io_tid[i] = tid;
+        // Once per thread, not per read: this walks the kernel's thread table.
+        SceKernelThreadInfo info;
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        if (sceKernelGetThreadInfo(tid, &info) >= 0)
+          snprintf(io_tid_name[i], sizeof(io_tid_name[i]), "%s", info.name);
+        else
+          snprintf(io_tid_name[i], sizeof(io_tid_name[i]), "?");
+      }
       io_tid_us[i] += us;
       io_tid_reads[i]++;
       return;
@@ -374,7 +390,8 @@ int ProcessEvents(void) {
     // ...and the same for the file reads the game does to fill those textures
     // and everything else an area is made of. Scaled up from the sample.
     for (int i = 0; i < IO_THREADS && io_tid[i]; i++)
-      traceLog("io thread: 0x%08x%s %d ms over %u sampled reads\n", (unsigned)io_tid[i],
+      traceLog("io thread: %-20s 0x%08x%s %d ms over %u sampled reads\n", io_tid_name[i],
+               (unsigned)io_tid[i],
                io_tid[i] == presenting_thread ? " (presents frames)" : "",
                (int)(io_tid_us[i] * IO_SAMPLE / 1000), (unsigned)io_tid_reads[i]);
     traceLog("io: %d ms reading, %d ms seeking, %d MB over %u reads, %u seeks, "
