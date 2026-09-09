@@ -230,14 +230,42 @@
 // A starting point, not a setting. 32 turned out to be more than this system
 // has: the cache reached 28 held, the game opened OBJECTS/IDE.DIR, the open
 // returned NULL and the game read through the NULL handle without checking it.
-// So the cap now comes down on its own the first time a drain rescues an open,
-// and the trace reports where it settled. Descriptors belong to the game, and
-// being told is the only way to find out how many are spare.
+// So the cap comes down on its own the first time a drain rescues an open, and
+// the trace reports where it settled. Descriptors belong to the game, and being
+// told is the only way to find out how many are spare.
 #define HANDLE_CACHE_SLOTS 32
 
-// Create this file to close files normally again, for comparing the two on
-// hardware without a rebuild.
-#define HANDLE_CACHE_DISABLE_PATH DATA_PATH "/" "no_handlecache"
+// Create this file to hold the game's files open instead of reopening them.
+// Off by default, because five sessions say it loses here.
+//
+//   build                first ms  ms each   repeat ms  ms each     total
+//   no cache                18478     3.49       36017     2.91     54.5 s
+//   drain thrash            54197    10.10       31874     2.57     86.1 s
+//   stat on failure         61896    11.35        7363     0.58     69.3 s
+//   remember, scan          72547    13.41        5765     0.46     78.3 s
+//   remember, indexed       62390    11.69        5719     0.46     68.1 s
+//
+// The premise held up all the way through. A repeat open costs what a first one
+// costs, nothing under fopen keeps a path warm, and handing back a held handle
+// removes the whole of it: 2.91 ms to 0.46 ms, about 30 s a session, from the
+// first build onwards.
+//
+// What sank it is that two thirds of this game's opens -- around 12000 of
+// 18000 -- are probes for files that are not there, and the cache has to tell
+// those apart from an open that failed because it is holding the descriptors.
+// Get that wrong towards "not there" and the game reads through a NULL handle;
+// get it wrong towards "descriptors" and every probe empties the cache. Asking
+// the filesystem is the only answer that is always right, and a stat costs
+// about what an open costs, so asking 5400 times buys back less than the 30 s.
+// Remembering the answers helped until the table itself cost more than the
+// stats; indexing it properly brought that back, to 13.6 s short of break even.
+//
+// The one thing left untried is asking more cheaply: list a directory once when
+// a path in it turns out to be missing, and answer from that listing instead of
+// per file. The game probes thousands of paths across few directories, so it
+// would trade 5400 stats for tens of listings. Everything here is built for it
+// -- the switch, the tests, the counters -- and it is off until someone does.
+#define HANDLE_CACHE_ENABLE_PATH DATA_PATH "/" "use_handlecache"
 
 // Create this file to buffer the game's reads. Off by default, because on this
 // hardware it loses, and the arithmetic says it always will.

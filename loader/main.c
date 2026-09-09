@@ -1510,14 +1510,15 @@ int main(int argc, char *argv[]) {
     sceLibcBridge_ferror, path_exists
   };
   SceIoStat hc_stat;
-  if (sceIoGetstat(HANDLE_CACHE_DISABLE_PATH, &hc_stat) >= 0) {
-    traceLog("handles: off, asked for by %s\n", HANDLE_CACHE_DISABLE_PATH);
-  } else {
+  if (sceIoGetstat(HANDLE_CACHE_ENABLE_PATH, &hc_stat) >= 0) {
     handle_cache_init(&handle_cache_ops, HANDLE_CACHE_SLOTS);
     handle_cache_on = 1;
-    traceLog("handles: holding up to %d files open instead of reopening them; "
-             "70%% of this game's opens are a path it has opened before and a "
-             "repeat costs what a first one does\n", HANDLE_CACHE_SLOTS);
+    traceLog("handles: on, asked for by %s, holding up to %d files open\n",
+             HANDLE_CACHE_ENABLE_PATH, HANDLE_CACHE_SLOTS);
+  } else {
+    traceLog("handles: off -- holding them saves 30 s of reopening and costs "
+             "more than that\n"
+             "         telling a missing file from a missing descriptor\n");
   }
 
   static const ReadCacheOps read_cache_ops = { raw_fread, sceLibcBridge_fseek,
