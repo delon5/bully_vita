@@ -34,7 +34,7 @@ void read_cache_forget(FILE *stream);
 void read_cache_release(unsigned thread);
 
 typedef struct {
-  unsigned hits, misses, refills, bytes_served_kb, unowned;
+  unsigned hits, misses, refills, bytes_served_kb, unowned, fetched_kb;
 } ReadCacheStats;
 
 void read_cache_stats(ReadCacheStats *out);

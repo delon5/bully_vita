@@ -101,8 +101,8 @@ static void compare(const char *name, int rounds, int max_read, int seek_every) 
 
   ReadCacheStats st;
   read_cache_stats(&st);
-  printf("%-13s: %u hits, %u misses, %u refills, %u KB served  OK\n", name, st.hits, st.misses,
-         st.refills, st.bytes_served_kb);
+  printf("%-13s: %u hits, %u misses, %u aheads, %u KB served for %u KB fetched  OK\n", name,
+         st.hits, st.misses, st.refills, st.bytes_served_kb, st.fetched_kb);
   read_cache_forget(cached);
   fclose(cached);
   fclose(plain);
@@ -325,6 +325,34 @@ int main(void) {
            st.refills);
     assert(st.refills > 0 && "churning file handles must not disable read-ahead for ever");
     assert(st.hits > 100 && "and a sequential run must still be served from memory");
+    read_cache_forget(f);
+    fclose(f);
+  }
+
+  // Read-ahead has to pay for itself. On hardware the fixed 64 KB fetch pulled
+  // 263 MB off the card to serve 19 MB -- 93% waste -- and reading went from
+  // 124 s to 191 s. A short run must not cost much more than it returns.
+  {
+    read_cache_init(&HOST);
+    FILE *f = fopen(path_a, "rb");
+    unsigned char got[4096];
+    // Runs of three 4 KB reads, then a jump: about the shape of the game's own
+    // access, which averages 1.7 hits per read-ahead.
+    for (int i = 0; i < 400; i++) {
+      long at = (long)((i * 39241) % (FILE_BYTES - 40000));
+      assert(fseek(f, at, SEEK_SET) == 0);
+      for (int j = 0; j < 3; j++) {
+        size_t r = read_cache_fread(got, 1, 4096, f);
+        assert(r == 4096);
+        assert(memcmp(got, truth + at + j * 4096, 4096) == 0);
+      }
+    }
+    ReadCacheStats st;
+    read_cache_stats(&st);
+    printf("short runs   : %u KB served for %u KB fetched  OK\n", st.bytes_served_kb,
+           st.fetched_kb);
+    assert(st.fetched_kb < st.bytes_served_kb * 4 &&
+           "a short run must not fetch several times what it serves");
     read_cache_forget(f);
     fclose(f);
   }

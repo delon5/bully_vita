@@ -69,6 +69,18 @@
 // would only move bytes twice.
 #define RC_MAX_SERVED (32 * 1024)
 
+// How much to read ahead, sized to the run the game is actually doing.
+//
+// The first version always fetched the full 64 KB, and on hardware that cost
+// 263 MB of card reads to serve 19 MB: 4211 read aheads, 1.7 hits each, 4.7 KB
+// of every 64 KB used. Reading went from 124 s to 191 s and GameMain's share
+// doubled. The game's sequential runs are about two reads long, so a fixed
+// fetch that big can only ever be waste.
+//
+// Twice the run so far, so a run that keeps going keeps earning more, and one
+// that stops after two reads costs almost nothing.
+#define RC_MIN_AHEAD (8 * 1024)
+
 typedef struct {
   unsigned owner; // the only thread that may touch the rest of this
   FILE *file;
@@ -93,10 +105,12 @@ static Slot slots[RC_SLOTS];
 static unsigned seq_owner[RC_TRACKED];
 static FILE *seq_file[RC_TRACKED];
 static long seq_end[RC_TRACKED];
+static long seq_run[RC_TRACKED]; // bytes read consecutively in the current run
 
 static unsigned rc_clock;
 static ReadCacheOps io;
 static unsigned rc_hits, rc_misses, rc_refills, rc_unowned;
+static size_t rc_fetched; // bytes pulled off the card by read-ahead
 static size_t rc_bytes_served;
 
 void read_cache_init(const ReadCacheOps *ops) {
@@ -105,8 +119,10 @@ void read_cache_init(const ReadCacheOps *ops) {
   memset(seq_owner, 0, sizeof(seq_owner));
   memset(seq_file, 0, sizeof(seq_file));
   memset(seq_end, 0, sizeof(seq_end));
+  memset(seq_run, 0, sizeof(seq_run));
   rc_clock = 0;
   rc_hits = rc_misses = rc_refills = rc_unowned = 0;
+  rc_fetched = 0;
   rc_bytes_served = 0;
 }
 
@@ -141,14 +157,37 @@ void read_cache_release(unsigned thread) {
 
 // Whether this read carries on from the last one on the same file and thread,
 // and record where it ends.
-static int continues_a_run(unsigned me, FILE *stream, long from, long to) {
+static size_t ahead_for(long run) {
+  size_t ahead = (size_t)(run * 2);
+  if (ahead < RC_MIN_AHEAD)
+    ahead = RC_MIN_AHEAD;
+  if (ahead > RC_BUFFER - RC_MAX_SERVED)
+    ahead = RC_BUFFER - RC_MAX_SERVED;
+  return ahead;
+}
+
+// How long the run on this file would be if a read started at `from`, without
+// recording anything. The combined fetch has to know before it reads.
+static long peek_run(unsigned me, FILE *stream, long from) {
+  for (int i = 0; i < RC_TRACKED; i++)
+    if (seq_owner[i] == me && seq_file[i] == stream)
+      return seq_end[i] == from ? seq_run[i] + 1 : 0;
+  return 0;
+}
+
+// Returns how many bytes the current run has covered, or 0 if this read did not
+// continue one. The size of the next read-ahead comes from that.
+static long note_run(unsigned me, FILE *stream, long from, long to) {
   int mine = -1, unclaimed = -1;
   for (int i = 0; i < RC_TRACKED; i++) {
     if (seq_owner[i] == me) {
       if (seq_file[i] == stream) {
-        int sequential = seq_end[i] == from;
+        if (seq_end[i] == from)
+          seq_run[i] += to - from;
+        else
+          seq_run[i] = 0; // the run broke; start counting again
         seq_end[i] = to;
-        return sequential;
+        return seq_run[i];
       }
       // Already ours and holding nothing: reuse it directly. Looking only for
       // entries with no owner at all is what broke this on hardware -- a closed
@@ -175,6 +214,7 @@ static int continues_a_run(unsigned me, FILE *stream, long from, long to) {
 
   seq_file[at] = stream;
   seq_end[at] = to;
+  seq_run[at] = 0;
   return 0; // first sighting of this file: nothing to continue yet
 }
 
@@ -214,35 +254,6 @@ static Slot *slot_to_claim(unsigned me, FILE *stream) {
   return NULL;
 }
 
-// Fill a slot from `at`, and put the file back where it was. Best effort: a
-// short read is fine, a failed one just leaves the slot empty.
-static void refill(unsigned me, FILE *stream, long at) {
-  Slot *s = slot_to_claim(me, stream);
-  if (!s)
-    return;
-  // Disown the contents before touching the buffer. Nothing may match a slot
-  // whose bytes are being replaced -- that is exactly what corrupted the game.
-  s->file = NULL;
-  size_t got = io.fread(s->buffer, 1, RC_BUFFER, stream);
-  if (io.fseek(stream, at, SEEK_SET) != 0) {
-    // Could not restore the position, so the file is no longer where the caller
-    // believes it is. Nothing may be served from this and nothing may be
-    // trusted about the position; drop the slot and let the next read find out
-    // from ftell.
-    s->file = NULL;
-    return;
-  }
-  if (!got) {
-    s->file = NULL;
-    return;
-  }
-  s->file = stream;
-  s->start = at;
-  s->len = got;
-  s->last_used = ++rc_clock;
-  rc_refills++;
-}
-
 size_t read_cache_fread(void *ptr, size_t size, size_t count, FILE *stream) {
   if (!size || !count)
     return 0;
@@ -264,21 +275,54 @@ size_t read_cache_fread(void *ptr, size_t size, size_t count, FILE *stream) {
       s->last_used = ++rc_clock;
       rc_hits++;
       rc_bytes_served += want;
-      continues_a_run(me, stream, cur, cur + (long)want);
+      note_run(me, stream, cur, cur + (long)want);
       return count;
     }
     s->file = NULL;
   }
 
   rc_misses++;
+
+  // A miss in the middle of a run: fetch what the game asked for and what it is
+  // about to ask for in ONE card read, rather than doing the game's read and
+  // then a second read of our own.
+  //
+  // The first version did the two separately, and that is why it lost. A run of
+  // three reads became read, read, fetch, hit -- three trips to the card to
+  // serve three reads, exactly what it cost without a cache, plus the extra
+  // bytes. Combined, the same run is read, read-and-fetch, hit: two trips.
+  long run = peek_run(me, stream, cur);
+  if (run > 0 && want <= RC_MAX_SERVED) {
+    Slot *slot = slot_to_claim(me, stream);
+    if (slot) {
+      size_t ahead = ahead_for(run);
+      slot->file = NULL; // disown before the bytes move
+      size_t fetched = io.fread(slot->buffer, 1, want + ahead, stream);
+      rc_fetched += fetched > want ? fetched - want : 0;
+
+      size_t deliver = fetched < want ? fetched : want;
+      memcpy(ptr, slot->buffer, deliver);
+      // Where a plain fread would have left it: after the bytes it delivered.
+      if (io.fseek(stream, cur + (long)deliver, SEEK_SET) == 0) {
+        if (fetched > deliver) {
+          slot->file = stream;
+          slot->start = cur;
+          slot->len = fetched;
+          slot->last_used = ++rc_clock;
+          rc_refills++;
+        }
+        note_run(me, stream, cur, cur + (long)deliver);
+        return deliver / size;
+      }
+      // The position could not be restored, so nothing here can be trusted.
+      // Fall through and let the plain path do it properly.
+      io.fseek(stream, cur, SEEK_SET);
+    }
+  }
+
   size_t got = io.fread(ptr, size, count, stream);
   long now = io.ftell(stream);
-  int streaming = continues_a_run(me, stream, cur, now);
-  // Read ahead only for a small read that continued a run and got everything it
-  // asked for. A short read is the end of the file, and there is nothing ahead
-  // of it worth holding.
-  if (streaming && got == count && want <= RC_MAX_SERVED && now >= 0)
-    refill(me, stream, now);
+  note_run(me, stream, cur, now);
   return got;
 }
 
@@ -288,4 +332,5 @@ void read_cache_stats(ReadCacheStats *out) {
   out->refills = rc_refills;
   out->bytes_served_kb = (unsigned)(rc_bytes_served / 1024);
   out->unowned = rc_unowned;
+  out->fetched_kb = (unsigned)(rc_fetched / 1024);
 }
