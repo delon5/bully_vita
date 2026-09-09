@@ -270,8 +270,14 @@ static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
 // that has already been opened once. Opens are rare enough next to reads to
 // time every one rather than sample.
 #define OPEN_PATHS 8192
-static uint32_t io_opens, io_reopens;
-static uint64_t io_open_us;
+static uint32_t io_opens, io_reopens, io_opens_writing;
+// Split, because the whole question is whether the repeats are the expensive
+// ones. 70% of opens are a path already opened and an open averages 3.1 ms, so
+// holding the handle instead of closing it looks like 38 s a session -- but
+// that is exactly the arithmetic the read cache got wrong, where the calls it
+// removed turned out to be the cheap ones. One average over both kinds cannot
+// tell the two cases apart, so keep two.
+static uint64_t io_open_first_us, io_open_again_us;
 static uint32_t open_path_hash[OPEN_PATHS];
 static uint32_t io_open_distinct;
 
@@ -311,12 +317,22 @@ static int open_seen_before(const char *path) {
 }
 
 static FILE *traced_fopen(const char *path, const char *mode) {
+  // Before the open, so the timing below covers only the open itself.
+  int again = path && open_seen_before(path);
   uint32_t t0 = io_now_us();
   FILE *f = sceLibcBridge_fopen(path, mode);
-  io_open_us += io_now_us() - t0;
+  uint32_t spent = io_now_us() - t0;
   io_opens++;
-  if (path && open_seen_before(path))
+  if (again) {
     io_reopens++;
+    io_open_again_us += spent;
+  } else {
+    io_open_first_us += spent;
+  }
+  // Anything holding handles open would have to leave these alone, so know how
+  // many there are before designing around them.
+  if (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')))
+    io_opens_writing++;
   return f;
 }
 
@@ -485,10 +501,13 @@ int ProcessEvents(void) {
                (unsigned)io_tid[i],
                io_tid[i] == presenting_thread ? " (presents frames)" : "",
                (int)(io_tid_us[i] * IO_SAMPLE / 1000), (unsigned)io_tid_reads[i]);
-    traceLog("open: %u opens, %d ms, %u of them a path already opened, "
-             "%u distinct, %u unplaced\n", (unsigned)io_opens,
-             (int)(io_open_us / 1000), (unsigned)io_reopens,
-             (unsigned)io_open_distinct, (unsigned)io_open_unplaced);
+    traceLog("open: %u opens, %d ms | %u first at %d ms, %u again at %d ms | "
+             "%u distinct, %u for writing, %u unplaced\n", (unsigned)io_opens,
+             (int)((io_open_first_us + io_open_again_us) / 1000),
+             (unsigned)(io_opens - io_reopens), (int)(io_open_first_us / 1000),
+             (unsigned)io_reopens, (int)(io_open_again_us / 1000),
+             (unsigned)io_open_distinct, (unsigned)io_opens_writing,
+             (unsigned)io_open_unplaced);
     traceLog("io: %d ms reading, %d ms seeking, %d MB over %u card reads for %u asked, "
              "%u seeks, %u sequential | sizes <4K %u <16K %u <64K %u more %u\n",
              (int)(io_read_us * IO_SAMPLE / 1000), (int)(io_seek_us * IO_SAMPLE / 1000),
