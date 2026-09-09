@@ -176,7 +176,7 @@ static int release_reserve(void) {
 
 void *game_malloc(size_t size) {
   void *caller = __builtin_return_address(0);
-  game_memory_note_caller(caller);
+  game_memory_note_allocation(caller);
   void *p = __real_malloc(size);
   if (!p) {
     report_allocation_failure(size, 0, caller);
@@ -217,7 +217,7 @@ void *game_realloc(void *ptr, size_t size) {
 
 void *game_memalign(size_t alignment, size_t size) {
   void *caller = __builtin_return_address(0);
-  game_memory_note_caller(caller);
+  game_memory_note_allocation(caller);
   void *p = __real_memalign(alignment, size);
   if (!p) {
     report_allocation_failure(size, alignment, caller);
@@ -232,45 +232,68 @@ void *game_memalign(size_t alignment, size_t size) {
  * Which game code is running, sampled
  */
 
-#define HOT_SLOTS 512
+// 512 slots with an eight-probe window lost 488081 of 1423716 samples -- 34% --
+// in the first session that used this, which biases the profile toward whichever
+// sites happened to claim a slot first. A game this size has thousands of call
+// sites; give it room.
+#define HOT_SLOTS 4096
 #define HOT_MASK (HOT_SLOTS - 1)
+#define HOT_PROBES 24
 
-static uint32_t hot_offset[HOT_SLOTS];
-static uint32_t hot_count[HOT_SLOTS];
-static uint32_t hot_previous[HOT_SLOTS];
-static uint32_t hot_samples, hot_missed;
+// Two tables, because the two sources mean different things. A memcpy caller is
+// the code doing the work. An allocation caller is one frame too shallow --
+// string8::operator+ calls operator new, so the sample lands in operator new
+// rather than in the string code that asked for it, and operator new came out
+// as the single hottest site in the game. Kept apart, the memcpy list stays
+// readable and the allocation list is understood for what it is.
+typedef struct {
+  uint32_t offset[HOT_SLOTS];
+  uint32_t count[HOT_SLOTS];
+  uint32_t previous[HOT_SLOTS];
+  uint32_t samples, missed;
+} HotTable;
+
+static HotTable hot_copy, hot_alloc;
 
 // Racy on purpose. This is a profile: a lost increment costs one sample out of
 // hundreds of thousands, and a lock on a path this hot is what turned area
 // loads into a slideshow the last time the loader tried to watch allocations.
-void game_memory_note_caller(void *return_address) {
+static void note_into(HotTable *t, void *return_address) {
   uintptr_t ra = (uintptr_t)return_address;
   if (ra < LOAD_ADDRESS)
     return; // the eboot's own copies, not the game's
   uint32_t offset = (uint32_t)(ra - LOAD_ADDRESS) & ~1u;
-  hot_samples++;
+  t->samples++;
 
-  uint32_t i = (offset * 0x9e3779b1u) >> 23;
-  for (uint32_t probe = 0; probe < 8; probe++) {
-    uint32_t *slot = &hot_offset[(i + probe) & HOT_MASK];
-    if (*slot == offset) {
-      hot_count[(i + probe) & HOT_MASK]++;
+  uint32_t i = (offset * 0x9e3779b1u) >> 20;
+  for (uint32_t probe = 0; probe < HOT_PROBES; probe++) {
+    uint32_t at = (i + probe) & HOT_MASK;
+    if (t->offset[at] == offset) {
+      t->count[at]++;
       return;
     }
-    if (!*slot) {
-      *slot = offset;
-      hot_count[(i + probe) & HOT_MASK] = 1;
+    if (!t->offset[at]) {
+      t->offset[at] = offset;
+      t->count[at] = 1;
       return;
     }
   }
-  hot_missed++;
+  t->missed++;
+}
+
+void game_memory_note_caller(void *return_address) {
+  note_into(&hot_copy, return_address);
+}
+
+void game_memory_note_allocation(void *return_address) {
+  note_into(&hot_alloc, return_address);
 }
 
 // The sites that moved since the last heartbeat, biggest first. Deltas rather
 // than totals, so a freeze names what it was spent in rather than what the
 // session has done most of overall.
-void game_memory_hot_report(void) {
-  if (!hot_samples)
+static void hot_report_one(HotTable *t, const char *what) {
+  if (!t->samples)
     return;
 
   char line[420];
@@ -281,9 +304,9 @@ void game_memory_hot_report(void) {
   for (int rank = 0; rank < 5; rank++) {
     uint32_t best = 0, best_slot = 0;
     for (uint32_t i = 0; i < HOT_SLOTS; i++) {
-      if (!hot_offset[i])
+      if (!t->offset[i])
         continue;
-      uint32_t delta = hot_count[i] - hot_previous[i];
+      uint32_t delta = t->count[i] - t->previous[i];
       if (delta <= best)
         continue;
       int already = 0;
@@ -300,16 +323,21 @@ void game_memory_hot_report(void) {
     taken[num_taken++] = best_slot;
     if (n < (int)sizeof(line) - 32)
       n += snprintf(line + n, sizeof(line) - n, " libBully.so+0x%x=%u",
-                    (unsigned)hot_offset[best_slot], (unsigned)best);
+                    (unsigned)t->offset[best_slot], (unsigned)best);
     shown++;
   }
 
   for (uint32_t i = 0; i < HOT_SLOTS; i++)
-    hot_previous[i] = hot_count[i];
+    t->previous[i] = t->count[i];
 
   if (shown)
-    traceLog("hot: %u samples, %u unplaced |%s\n", (unsigned)hot_samples,
-             (unsigned)hot_missed, line);
+    traceLog("hot %s: %u samples, %u unplaced |%s\n", what, (unsigned)t->samples,
+             (unsigned)t->missed, line);
+}
+
+void game_memory_hot_report(void) {
+  hot_report_one(&hot_copy, "copy");
+  hot_report_one(&hot_alloc, "alloc");
 }
 
 /*

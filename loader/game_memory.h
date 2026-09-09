@@ -40,6 +40,7 @@ void *game_memalign(size_t alignment, size_t size);
 // heartbeat names the function a freeze is spent in, which tools/addr2sym.py
 // then demangles.
 void game_memory_note_caller(void *return_address);
+void game_memory_note_allocation(void *return_address);
 void game_memory_hot_report(void);
 
 #endif
