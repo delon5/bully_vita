@@ -13,6 +13,7 @@
  */
 
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,7 +27,8 @@ static char path_a[256], path_b[256];
 static size_t host_fread(void *p, size_t s, size_t n, FILE *f) { return fread(p, s, n, f); }
 static int host_fseek(FILE *f, long o, int w) { return fseek(f, o, w); }
 static long host_ftell(FILE *f) { return ftell(f); }
-static const ReadCacheOps HOST = { host_fread, host_fseek, host_ftell };
+static unsigned host_thread_id(void) { return (unsigned)(uintptr_t)pthread_self(); }
+static const ReadCacheOps HOST = { host_fread, host_fseek, host_ftell, host_thread_id };
 
 // A cheap deterministic generator, so a failure is reproducible.
 static unsigned rng_state = 12345;
@@ -104,6 +106,52 @@ static void compare(const char *name, int rounds, int max_read, int seek_every) 
   read_cache_forget(cached);
   fclose(cached);
   fclose(plain);
+}
+
+// Each thread opens its own handle, reads at positions only it knows, and
+// checks every byte against the file's known contents. A slot leaking between
+// threads shows up immediately as another thread's bytes.
+static void *hammer(void *arg) {
+  int id = (int)(long)arg;
+  FILE *f = fopen(path_a, "rb");
+  assert(f);
+  unsigned char got[1024];
+  unsigned seed = 7919u * (unsigned)(id + 1);
+  long at = (long)(id * 4096);
+
+  for (int i = 0; i < 3000; i++) {
+    seed = seed * 1103515245u + 12345u;
+    size_t want = 64 + (seed >> 9) % 900;
+    // Mostly walking forward, which is what makes the cache serve; occasionally
+    // jumping, which is what makes it refill.
+    if ((seed >> 20) % 8 == 0)
+      at = (long)((seed >> 3) % (FILE_BYTES - 2000));
+    if (at + (long)want >= FILE_BYTES)
+      at = (long)(id * 4096);
+    assert(fseek(f, at, SEEK_SET) == 0);
+
+    size_t r = read_cache_fread(got, 1, want, f);
+    assert(r == want && "a concurrent read must not come up short");
+    assert(memcmp(got, truth + at, want) == 0 &&
+           "a thread must never be handed another thread's bytes");
+    assert(ftell(f) == at + (long)want && "and must leave its own file where fread would");
+    at += (long)want;
+  }
+
+  read_cache_forget(f);
+  fclose(f);
+  return NULL;
+}
+
+// Does enough reading to claim and fill a slot, then leaves it claimed.
+static void *claim_one(void *arg) {
+  FILE *f = (FILE *)arg;
+  unsigned char got[512];
+  for (int i = 0; i < 8; i++) {
+    assert(fseek(f, (long)(i * 512), SEEK_SET) == 0);
+    read_cache_fread(got, 1, 512, f);
+  }
+  return NULL;
 }
 
 int main(void) {
@@ -184,6 +232,64 @@ int main(void) {
       fclose(f[i]);
     }
     printf("more files   : %d files through %d slots, all correct    OK\n", RC_SLOTS + 3, RC_SLOTS);
+  }
+
+  // The case the first version of this file did not cover, and the one that
+  // corrupted the game on launch. Four threads reading concurrently is what the
+  // Vita does -- GameMain, CDStreamThread, Sound and avPlayer all call fread --
+  // and the cache shared its slots between them with no ownership at all, so a
+  // refill overwrote a buffer another thread was still matching against.
+  {
+    read_cache_init(&HOST);
+    // Deliberately more threads than slots, so slots have to be contested.
+    pthread_t workers[RC_SLOTS * 2];
+    for (int i = 0; i < RC_SLOTS * 2; i++)
+      assert(pthread_create(&workers[i], NULL, hammer, (void *)(long)i) == 0);
+    for (int i = 0; i < RC_SLOTS * 2; i++)
+      assert(pthread_join(workers[i], NULL) == 0);
+    ReadCacheStats st;
+    read_cache_stats(&st);
+    printf("concurrent   : %d threads over %d slots, %u hits, %u went uncached, all correct  OK\n",
+           RC_SLOTS * 2, RC_SLOTS, st.hits, st.unowned);
+  }
+
+  // The invariant itself, checked directly rather than by hoping to lose a
+  // race. Winning one is a matter of timing; this is a matter of fact.
+  //
+  // The stress test above passes with or without the ownership fix, because
+  // each thread holds its own FILE * and nothing forces two threads onto one
+  // slot. That is exactly the false comfort that let the corrupting build
+  // reach hardware, so assert the property that makes the corruption
+  // impossible: a slot another thread claimed must be invisible to me.
+  {
+    read_cache_init(&HOST);
+    FILE *f = fopen(path_a, "rb");
+    pthread_t t;
+    struct { FILE *f; } arg = { f };
+    (void)arg;
+    assert(pthread_create(&t, NULL, claim_one, f) == 0);
+    assert(pthread_join(t, NULL) == 0);
+
+    int owned_by_other = 0;
+    for (int i = 0; i < RC_SLOTS; i++)
+      if (slots[i].owner && slots[i].file == f)
+        owned_by_other++;
+    assert(owned_by_other > 0 && "the worker must have buffered something");
+
+    unsigned me = host_thread_id();
+    assert(slot_for(me, f) == NULL && "another thread's slot must be invisible to this one");
+    for (int i = 0; i < RC_SLOTS; i++)
+      if (slots[i].file == f)
+        assert(slots[i].owner != me && "and must never be claimed away from its owner");
+
+    // ...and claiming must never hand me a slot somebody else owns.
+    for (int i = 0; i < 32; i++) {
+      Slot *mine = slot_to_claim(me, f);
+      assert((!mine || mine->owner == me) && "claiming must not steal an owned slot");
+    }
+    printf("ownership    : one thread's buffers are unreachable from another  OK\n");
+    read_cache_forget(f);
+    fclose(f);
   }
 
   remove(path_a);

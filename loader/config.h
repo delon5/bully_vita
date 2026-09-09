@@ -223,6 +223,17 @@
 // launch starts from nothing.
 #define TEXTURE_STORE_WIPE_PATH DATA_PATH "/" "wipe_texcache"
 
+// Create this file to read straight from the card, with no buffering.
+//
+// The read cache is the one part of the loader that can hand the game silently
+// wrong bytes rather than merely a wrong picture, and its first version did
+// exactly that: it shared its buffers between four threads with no ownership,
+// and the game read a string length of 1684633471 out of a buffer being
+// rewritten underneath it. It is thread-owned now and tested for it, but a
+// switch that needs no rebuild is worth having for something with that failure
+// mode.
+#define READ_CACHE_DISABLE_PATH DATA_PATH "/" "no_readcache"
+
 
 
 // How much texture data the game is allowed to keep resident. The Android

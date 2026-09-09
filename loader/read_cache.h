@@ -16,6 +16,9 @@ typedef struct {
   size_t (*fread)(void *ptr, size_t size, size_t count, FILE *stream);
   int (*fseek)(FILE *stream, long offset, int origin);
   long (*ftell)(FILE *stream);
+  // Who is calling. Four threads read concurrently in this game and each gets
+  // its own buffers; see the comment on ownership in read_cache.c.
+  unsigned (*thread_id)(void);
 } ReadCacheOps;
 
 void read_cache_init(const ReadCacheOps *ops);
@@ -28,7 +31,7 @@ size_t read_cache_fread(void *ptr, size_t size, size_t count, FILE *stream);
 void read_cache_forget(FILE *stream);
 
 typedef struct {
-  unsigned hits, misses, refills, bytes_served_kb;
+  unsigned hits, misses, refills, bytes_served_kb, unowned;
 } ReadCacheStats;
 
 void read_cache_stats(ReadCacheStats *out);

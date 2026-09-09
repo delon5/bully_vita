@@ -234,6 +234,12 @@ static size_t raw_fread(void *ptr, size_t size, size_t count, FILE *stream) {
   return got;
 }
 
+static unsigned read_cache_thread_id(void) { return (unsigned)sceKernelGetThreadId(); }
+
+// Off by a file on the card, because this is the one thing in the loader that
+// can hand the game silently wrong bytes, and the first version of it did.
+static int read_cache_on;
+
 static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
   size_t want = size * count;
   io_size_buckets[want < 4096 ? 0 : want < 16384 ? 1 : want < 65536 ? 2 : 3]++;
@@ -243,7 +249,8 @@ static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
   if (stream == io_last_stream && start == io_last_end)
     io_sequential++;
 
-  size_t got = read_cache_fread(ptr, size, count, stream);
+  size_t got = read_cache_on ? read_cache_fread(ptr, size, count, stream)
+                             : raw_fread(ptr, size, count, stream);
 
   io_last_stream = stream;
   io_last_end = start + (long)(got * size);
@@ -251,7 +258,8 @@ static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
 }
 
 static int traced_fclose(FILE *stream) {
-  read_cache_forget(stream);
+  if (read_cache_on)
+    read_cache_forget(stream);
   if (stream == io_last_stream)
     io_last_stream = NULL;
   return sceLibcBridge_fclose(stream);
@@ -1309,8 +1317,14 @@ int main(int argc, char *argv[]) {
   so_initialize(&bully_mod);
 
   static const ReadCacheOps read_cache_ops = { raw_fread, sceLibcBridge_fseek,
-                                              sceLibcBridge_ftell };
-  read_cache_init(&read_cache_ops);
+                                              sceLibcBridge_ftell, read_cache_thread_id };
+  SceIoStat rc_stat;
+  if (sceIoGetstat(READ_CACHE_DISABLE_PATH, &rc_stat) >= 0) {
+    traceLog("readcache: disabled by %s\n", READ_CACHE_DISABLE_PATH);
+  } else {
+    read_cache_init(&read_cache_ops);
+    read_cache_on = 1;
+  }
 
   traceLog("boot: initializers done, starting fios\n");
   // With the code, not just the message. The last build died here on a blue
