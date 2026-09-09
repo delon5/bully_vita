@@ -641,6 +641,35 @@ int ProcessEvents(void) {
     last_us = us;
     traceLog("fps: %d over the last %d frames, %d ms since the last heartbeat\n", fps, drawn,
              (int)(elapsed_us / 1000));
+    // What the frame rate above cannot say. A steady 50 ms frame and one that
+    // alternates 17 and 83 are the same average and nothing alike to play, so
+    // this counts the intervals themselves, in display periods, and how often
+    // one frame differs from the last by more than half a period.
+    {
+      extern void frame_pacing_snapshot(unsigned out[8]);
+      extern unsigned frame_measured, frame_judder, frame_worst_us;
+      extern unsigned long long frame_span_us, frame_swap_us, frame_tick_us;
+      unsigned p[8];
+      frame_pacing_snapshot(p);
+      static unsigned last_measured, last_judder;
+      unsigned n = frame_measured - last_measured;
+      unsigned j = frame_judder - last_judder;
+      last_measured = frame_measured;
+      last_judder = frame_judder;
+      traceLog("pacing: %u frames, %u uneven (%u%% this heartbeat, %u%% all "
+               "session) | worst %u ms | periods 1:%u 2:%u 3:%u 4:%u 5-6:%u "
+               "7-12:%u 13-30:%u more:%u | mean frame %u ms, %u in the display, "
+               "%u in the loader\n",
+               (unsigned)frame_measured, (unsigned)frame_judder,
+               n ? j * 100 / n : 0,
+               frame_measured ? frame_judder * 100 / frame_measured : 0,
+               (unsigned)(frame_worst_us / 1000), p[0], p[1], p[2], p[3], p[4],
+               p[5], p[6], p[7],
+               frame_measured ? (unsigned)(frame_span_us / frame_measured / 1000) : 0,
+               frame_measured ? (unsigned)(frame_swap_us / frame_measured / 1000) : 0,
+               frame_measured ? (unsigned)(frame_tick_us / frame_measured / 1000) : 0);
+      frame_worst_us = 0; // worst since the last heartbeat, not ever
+    }
     // How often the sticks are actually read from the hardware, next to the
     // frame rate because that is what it will turn out to be tied to. The
     // game's axis reads all come off one cached sample taken in

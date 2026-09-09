@@ -6,6 +6,7 @@
  * of the MIT license.  See the LICENSE file for details.
  */
 
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/ctrl.h>
@@ -291,6 +292,68 @@ static void trace_frame_contents(int n) {
 
 extern SceUID presenting_thread;
 
+/* Frame pacing.
+ *
+ * Every frame rate in this trace so far is frames divided by heartbeat, which
+ * is an average over one to three seconds. That can say the game ran at 20 a
+ * second; it cannot tell a steady 50 ms frame from one that alternates 17 and
+ * 83, and those are the same number and completely different to play. So
+ * measure the thing itself: the gap between one frame being presented and the
+ * next.
+ *
+ * Bucketed by display periods rather than round milliseconds, because the
+ * screen only changes every 16.7 ms and a frame that misses one waits for the
+ * next. A run of alternating one-period and two-period frames is the judder
+ * that shows up as stutter at an otherwise respectable average.
+ *
+ * Split three ways as well, so a slow frame can be attributed: time inside
+ * vglSwapBuffers is waiting for the display, time in the two cache ticks is
+ * this loader's own per-frame cost, and whatever is left is the game.
+ */
+static unsigned frame_periods[8]; // 1, 2, 3, 4, 5-6, 7-12, 13-30, more
+unsigned frame_measured, frame_judder, frame_worst_us;
+unsigned long long frame_span_us, frame_swap_us, frame_tick_us;
+
+// The histogram is static so the counting stays cheap; this hands out a copy.
+void frame_pacing_snapshot(unsigned out[8]) {
+  for (int i = 0; i < 8; i++)
+    out[i] = frame_periods[i];
+}
+
+static unsigned frame_now_us(void) {
+  SceKernelSysClock now;
+  sceKernelGetProcessTime(&now);
+  return (unsigned)now;
+}
+
+// One display period is 16667 us. Anything under one and a half of them
+// counts as having hit the period it was aiming at.
+static void frame_note_interval(unsigned us) {
+  static unsigned previous_us;
+  unsigned periods = (us + 8333u) / 16667u;
+  unsigned slot = periods <= 1   ? 0
+                  : periods == 2 ? 1
+                  : periods == 3 ? 2
+                  : periods == 4 ? 3
+                  : periods <= 6 ? 4
+                  : periods <= 12 ? 5
+                  : periods <= 30 ? 6
+                                  : 7;
+  frame_periods[slot]++;
+  frame_measured++;
+  frame_span_us += us;
+  if (us > frame_worst_us)
+    frame_worst_us = us;
+  // Judder is the change between one frame and the next, not the frame time
+  // itself: half a display period is enough to see.
+  if (previous_us) {
+    unsigned d = us > previous_us ? us - previous_us : previous_us - us;
+    if (d > 8333u)
+      frame_judder++;
+  }
+  previous_us = us;
+}
+
 int swapBuffers(void) {
   if (!presenting_thread)
     presenting_thread = sceKernelGetThreadId();
@@ -303,9 +366,21 @@ int swapBuffers(void) {
 #endif
   frames_swapped++;
 
+  // Taken before this frame's work, so the interval spans presenting one frame
+  // to presenting the next -- which is what the player sees.
+  static unsigned last_swap_us;
+  unsigned t0 = frame_now_us();
+  if (last_swap_us && t0 > last_swap_us)
+    frame_note_interval(t0 - last_swap_us);
+  last_swap_us = t0;
+
   texture_cache_tick();
   vertex_cache_tick();
+  unsigned t1 = frame_now_us();
   vglSwapBuffers(GL_FALSE);
+  unsigned t2 = frame_now_us();
+  frame_tick_us += t1 - t0;
+  frame_swap_us += t2 - t1;
   return 1;
 }
 
