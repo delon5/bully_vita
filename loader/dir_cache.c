@@ -3,55 +3,62 @@
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
  *
- * Two thirds of this game's opens -- around 12000 of 18000 a session -- are for
- * files that are not there. The handle cache has to tell those apart from an
- * open that failed because it was holding the descriptors, because getting that
- * wrong in one direction empties the cache on every probe and in the other
- * hands the game a NULL it does not check. Asking the filesystem about the file
- * is the only answer that is always right, and it cost about 43 s a session --
- * more than holding handles saved, which is why the handle cache was switched
- * off.
+ * Two thirds of this game's opens -- 11633 of 17478 a session -- are for files
+ * that are not there, and they cost 28 s between them. The game asks for a
+ * loose copy of an asset in a couple of directories before reading it out of
+ * the archive, and the loose copy is almost never there. Every one of those
+ * questions goes to the card.
  *
- * Ask about the directory instead. The game probes thousands of distinct paths
- * across a handful of directories, so one listing answers for all of them.
+ * Ask about the directory instead. The probes fall in 32 directories, 91% of
+ * them in two, so one listing answers for thousands of them.
  *
  * WHICH WAY THE ERRORS MATTER
  *
- * Saying "it is there" when it is not costs a drain that turns out to be
- * unnecessary: some lost hit rate, nothing more. Saying "it is not there" when
- * it is means the handle cache concludes the failure was not its doing, does
- * not give its descriptors back, and returns the NULL that crashed the game
- * once already. So this may only ever answer "no" from a complete listing.
+ * Saying "it is there" when it is not costs an open that fails, which is what
+ * would have happened anyway. Saying "it is not there" when it is hands the
+ * game a NULL it does not check, and that is the crash this branch already
+ * had once. So every part of this is built so that the second mistake is the
+ * hard one to make:
  *
- * That is also why the names are kept as hashes rather than strings. A
- * collision makes a name that is absent look present -- the harmless direction
- * -- and can never make a present name look absent, because the real name's
- * hash is in the table either way. A directory whose listing does not fit is
- * marked and every question about it goes back to asking one file at a time.
+ *  - "No" only ever comes from a complete listing. A directory that would not
+ *    open, or did not fit, answers "unknown" and the file is opened as before.
+ *  - Names are kept as hashes, folded to one case, because the card does not
+ *    care about case and the game asks both ways. A collision makes an absent
+ *    name look present -- the harmless direction -- and never the reverse,
+ *    since the real name's hash is in the table either way.
+ *  - A listing does not get to say "no" until the card has agreed with it a
+ *    few times: the first opens into each directory go through, and their
+ *    result is checked against what the listing would have said. The first
+ *    time an open succeeds where the listing said absent, that directory is
+ *    marked and never says "no" again. That covers every way a listing can be
+ *    wrong that nobody has thought of. The card has the last word.
+ *  - Anything that writes drops the listing first.
+ *  - One lock around the table, because a slot being relisted by one thread
+ *    while another reads it is a half-cleared table answering "absent".
  */
 
 #include <string.h>
 
 #include "dir_cache.h"
 
-#define DC_DIRS 24        // directories held at once
+#define DC_DIRS 48        // directories held at once
 #define DC_NAMES 4096     // names per directory; a power of two
 #define DC_PATH 160
 #define DC_NAME 128
+#define DC_VERIFY 4       // opens the card must agree with before "no" is trusted
 
 typedef struct {
   unsigned hash; // of the directory path, 0 for an empty slot
   char path[DC_PATH];
   unsigned names[DC_NAMES]; // filename hashes, 0 for an empty slot
   unsigned count;
-  int complete; // the whole listing fitted, so "no" can be trusted
+  int complete;      // the whole listing fitted, so "no" can be trusted
+  int missing;       // the directory itself is not there, so nothing in it is
+  int retired;       // caught saying absent about a file that opened: never again
+  unsigned verified; // opens the card has agreed with the listing about
 } Dir;
 
-// How long the listings take, and what they found. Nine of them held
-// seventeen names between them on hardware, which is not a plausible picture of
-// a game's data tree -- and a listing that is missing names answers "not there"
-// for files that are, which is the direction that hands the game a NULL. Until
-// this is understood the trace has to say what was read and how long it took.
+// How long the listings take, and what they found, for the trace.
 unsigned dir_list_us;
 char dir_last[4][DC_PATH];
 unsigned dir_last_count[4];
@@ -62,6 +69,16 @@ static Dir dirs[DC_DIRS];
 static unsigned dc_next; // round robin when every slot is taken
 static DirCacheStats stats;
 
+static void lock(void) {
+  if (io.lock)
+    io.lock();
+}
+
+static void unlock(void) {
+  if (io.unlock)
+    io.unlock();
+}
+
 void dir_cache_init(const DirCacheOps *ops) {
   io = *ops;
   memset(dirs, 0, sizeof(dirs));
@@ -69,16 +86,27 @@ void dir_cache_init(const DirCacheOps *ops) {
   dc_next = 0;
 }
 
-// FNV-1a, never zero so that zero can mean an empty slot.
+// FNV-1a, never zero so that zero can mean an empty slot. Case is folded
+// because the card's filesystem does not distinguish it and the game asks for
+// "Config" and "config" in the same session: folding can only merge names, so
+// it can only ever make an absent name look present.
 static unsigned hash_of(const char *s, int len) {
   unsigned h = 2166136261u;
-  for (int i = 0; i < len && s[i]; i++)
-    h = (h ^ (unsigned char)s[i]) * 16777619u;
+  for (int i = 0; i < len && s[i]; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c >= 'A' && c <= 'Z')
+      c += 'a' - 'A';
+    h = (h ^ c) * 16777619u;
+  }
   return h ? h : 1;
 }
 
+// Both sides of a name lookup hash the same number of characters as read_dir
+// can hand back, or a name longer than that never matches itself.
+static unsigned name_hash(const char *name) { return hash_of(name, DC_NAME - 1); }
+
 static void add_name(Dir *d, const char *name) {
-  unsigned h = hash_of(name, DC_NAME);
+  unsigned h = name_hash(name);
   for (unsigned i = 0; i < DC_NAMES; i++) {
     unsigned slot = (h + i) & (DC_NAMES - 1);
     if (!d->names[slot]) {
@@ -93,7 +121,7 @@ static void add_name(Dir *d, const char *name) {
 }
 
 static int has_name(const Dir *d, const char *name) {
-  unsigned h = hash_of(name, DC_NAME);
+  unsigned h = name_hash(name);
   for (unsigned i = 0; i < DC_NAMES; i++) {
     unsigned slot = (h + i) & (DC_NAMES - 1);
     if (!d->names[slot])
@@ -104,8 +132,7 @@ static int has_name(const Dir *d, const char *name) {
   return 0;
 }
 
-// Reads the whole directory into a slot. The slot is only marked complete if
-// every name fitted, because a partial listing cannot be used to say no.
+// Reads the whole directory into a slot. Called with the lock held.
 static Dir *list_dir(const char *path, unsigned h) {
   Dir *d = &dirs[dc_next];
   dc_next = (dc_next + 1) % DC_DIRS;
@@ -115,14 +142,33 @@ static Dir *list_dir(const char *path, unsigned h) {
 
   unsigned t0 = io.now_us ? io.now_us() : 0;
   int handle = io.open_dir(path);
-  if (handle < 0)
-    return NULL; // no such directory, or unreadable: fall back to stat
-
-  d->complete = 1;
-  char name[DC_NAME];
-  while (io.read_dir(handle, name, sizeof(name)))
-    add_name(d, name);
-  io.close_dir(handle);
+  if (handle < 0) {
+    // Two different failures wearing one return value, and they call for
+    // opposite answers. If the directory is not there, then nothing in it is,
+    // and that is a complete answer -- the strongest one there is, since no
+    // listing can ever contradict it. On hardware one such directory absorbs
+    // 5791 probes a session on its own.
+    //
+    // If the directory is there but would not open, nothing is known, and the
+    // slot is kept anyway so the failed open is not repeated thousands of
+    // times -- kept incomplete, so it can never be used to say no.
+    if (!io.stat(path)) {
+      d->missing = 1;
+      d->complete = 1;
+      stats.missing++;
+    } else {
+      stats.unreadable++;
+    }
+  } else {
+    d->complete = 1;
+    char name[DC_NAME];
+    while (io.read_dir(handle, name, sizeof(name)))
+      add_name(d, name);
+    io.close_dir(handle);
+    if (!d->complete)
+      stats.overflow++;
+    stats.listed++;
+  }
   if (io.now_us)
     dir_list_us += io.now_us() - t0;
 
@@ -131,52 +177,165 @@ static Dir *list_dir(const char *path, unsigned h) {
   memcpy(dir_last[dir_last_next], path, strlen(path) + 1);
   dir_last_count[dir_last_next] = d->count;
   dir_last_next = (dir_last_next + 1) % 4;
-  stats.listed++;
   stats.entries += d->count;
-  if (!d->complete)
-    stats.overflow++;
   return d;
+}
+
+// Splits path into the directory it is in and the name within it. Returns
+// the directory's length, or 0 if there is no directory part to work with.
+// A device prefix keeps its colon -- "ux0:" is a directory, "ux0" is not.
+static int split(const char *path, char dir[DC_PATH], const char **name) {
+  const char *sep = NULL;
+  for (const char *c = path; *c; c++)
+    if (*c == '/' || *c == ':')
+      sep = c;
+  if (!sep)
+    return 0;
+  int len = (int)(sep - path);
+  if (*sep == ':' || len == 0) // "ux0:name", or "/name" whose directory is "/"
+    len++;
+  if (len >= DC_PATH - 1)
+    return 0;
+  memcpy(dir, path, len);
+  dir[len] = 0;
+  *name = sep + 1;
+  return len;
+}
+
+// The slot holding this directory, or NULL. Called with the lock held.
+static Dir *find_dir(const char *dir, unsigned h) {
+  for (unsigned i = 0; i < DC_DIRS; i++)
+    if (dirs[i].hash == h && strcmp(dirs[i].path, dir) == 0)
+      return &dirs[i];
+  return NULL;
+}
+
+// The slot for the directory path is in, listing it first if need be. Called
+// with the lock held. NULL means there is nothing to answer from.
+static Dir *dir_of(const char *path, const char **name) {
+  char dir[DC_PATH];
+  if (!split(path, dir, name))
+    return NULL;
+  unsigned h = hash_of(dir, DC_PATH);
+  Dir *d = find_dir(dir, h);
+  return d ? d : list_dir(dir, h);
+}
+
+// Whether a listing may be used to say "no". Called with the lock held. One
+// that is not complete never may; one that has been caught out never may
+// again; a complete one may once the card has agreed with it DC_VERIFY times.
+static int may_say_no(const Dir *d) {
+  return d->complete && !d->retired && d->verified >= DC_VERIFY;
+}
+
+int dir_cache_lookup(const char *path) {
+  // Before init there is nothing to answer from and nothing to call. Saying so
+  // is always safe; the caller opens the file as it always did.
+  if (!io.open_dir || !path || !path[0])
+    return DIR_CACHE_UNKNOWN;
+
+  lock();
+  const char *name = NULL;
+  Dir *d = dir_of(path, &name);
+  int answer;
+  if (!d || !d->complete) {
+    stats.unknown++;
+    answer = DIR_CACHE_UNKNOWN;
+  } else if (has_name(d, name)) {
+    stats.answered++;
+    answer = DIR_CACHE_PRESENT;
+  } else if (may_say_no(d)) {
+    stats.answered++;
+    answer = DIR_CACHE_ABSENT;
+  } else {
+    // The listing says no, but it has not earned the right to yet. Open the
+    // file; observe() will hear how that went.
+    stats.unknown++;
+    answer = DIR_CACHE_UNKNOWN;
+  }
+  unlock();
+  return answer;
+}
+
+void dir_cache_observe(const char *path, int existed) {
+  if (!io.open_dir || !path || !path[0])
+    return;
+  lock();
+  char dir[DC_PATH];
+  const char *name = NULL;
+  Dir *d = NULL;
+  if (split(path, dir, &name))
+    d = find_dir(dir, hash_of(dir, DC_PATH)); // never lists: observe only
+  if (d && d->complete) {
+    int listed = has_name(d, name);
+    if (existed && !listed) {
+      // The one thing that must never happen happened, and the card caught it
+      // before the game did. This listing never says no again -- it can still
+      // say yes, which is the harmless direction and still saves nothing but
+      // costs nothing either.
+      if (!d->retired)
+        stats.contradicted++;
+      d->retired = 1;
+    } else if (!existed && listed) {
+      stats.stale++; // harmless direction: the open failed as it would have
+    } else if (!existed && !listed) {
+      d->verified++; // the listing and the card agree
+    }
+  }
+  unlock();
 }
 
 int dir_cache_exists(const char *path) {
   if (!path || !path[0])
     return 0;
 
-  const char *slash = NULL;
-  for (const char *c = path; *c; c++)
-    if (*c == '/' || *c == ':')
-      slash = c;
-  if (!slash || slash - path >= DC_PATH - 1)
-    return io.stat(path); // no directory part to work with
-
-  char dir[DC_PATH];
-  int len = (int)(slash - path);
-  if (len == 0) // a path like "/name": the directory is the root
-    len = 1;
-  memcpy(dir, path, len);
-  dir[len] = 0;
-  const char *name = slash + 1;
-
-  unsigned h = hash_of(dir, DC_PATH);
-  Dir *d = NULL;
-  for (unsigned i = 0; i < DC_DIRS; i++) {
-    if (dirs[i].hash == h && strcmp(dirs[i].path, dir) == 0) {
-      d = &dirs[i];
-      break;
-    }
+  lock();
+  const char *name = NULL;
+  Dir *d = dir_of(path, &name);
+  int answer = -1;
+  if (d && d->complete) {
+    if (has_name(d, name))
+      answer = 1;
+    else if (may_say_no(d))
+      answer = 0;
   }
-  if (!d)
-    d = list_dir(dir, h);
-
-  // Anything short of a complete listing, and the question goes back to the
-  // filesystem one file at a time. This is the whole safety property.
-  if (!d || !d->complete) {
+  if (answer >= 0)
+    stats.answered++;
+  else
     stats.statted++;
-    return io.stat(path);
-  }
+  unlock();
 
-  stats.answered++;
-  return has_name(d, name);
+  // Anything the listing cannot yet say goes to the filesystem one file at a
+  // time, and what it says is fed back so the listing can earn its trust.
+  if (answer < 0) {
+    answer = io.stat(path);
+    dir_cache_observe(path, answer);
+  }
+  return answer;
 }
 
-void dir_cache_stats(DirCacheStats *out) { *out = stats; }
+void dir_cache_forget(const char *path) {
+  if (!io.open_dir || !path || !path[0])
+    return;
+  lock();
+  // Find the slot without listing anything: a directory nobody has listed has
+  // nothing to forget, and listing it here would be a card read caused by a
+  // write, in the middle of the write.
+  char dir[DC_PATH];
+  const char *name = NULL;
+  if (split(path, dir, &name)) {
+    Dir *d = find_dir(dir, hash_of(dir, DC_PATH));
+    if (d) {
+      stats.entries -= d->count;
+      stats.forgotten++;
+      memset(d, 0, sizeof(*d));
+    }
+  }
+  unlock();
+}
+
+void dir_cache_stats(DirCacheStats *out) {
+  lock();
+  *out = stats;
+  unlock();
+}

@@ -357,6 +357,13 @@ static void close_dir(int handle) { sceIoDclose(handle); }
 
 static int path_exists(const char *path) { return dir_cache_exists(path); }
 
+// The dir cache's lock. A real mutex rather than a spin, because a listing
+// happens under it and that is card I/O: a thread spinning through that on
+// the same core as the lister at a higher priority would never let it finish.
+static SceUID dir_cache_mutex;
+static void dir_cache_lock(void) { sceKernelLockMutex(dir_cache_mutex, 1, NULL); }
+static void dir_cache_unlock(void) { sceKernelUnlockMutex(dir_cache_mutex, 1); }
+
 // Two thirds of the opens in a session are for files that are not there:
 // around 11800 of 17500, and every one of them goes to the card. They have
 // never been timed apart from the opens that succeed, so the 60 s the open
@@ -371,6 +378,7 @@ static int path_exists(const char *path) { return dir_cache_exists(path); }
 // handful. This only counts -- nothing is listed here and no answer changes.
 #define MISS_DIRS 64 // a power of two
 static uint32_t io_opens_missing, miss_dirs_used, miss_dirs_unplaced;
+static uint32_t io_opens_skipped; // never reached the card at all
 static uint64_t io_open_missing_us;
 static struct {
   uint32_t hash;
@@ -502,10 +510,44 @@ static FILE *traced_fopen(const char *path, const char *mode) {
   // cache serves is still a repeat, it just stops costing anything, which is
   // the whole point and shows up in this counter.
   int again = path && open_seen_before(path);
+  int writing = mode && (strchr(mode, 'w') || strchr(mode, 'a') ||
+                         strchr(mode, '+'));
+
+  // A write can create the file, so a listing taken before it would go on
+  // saying "not there" about a file that now is. Drop the listing first, and
+  // never answer a write-mode open from one.
+  if (writing)
+    dir_cache_forget(path);
+
+  // The open that never happens.
+  //
+  // 11633 of a session's 17478 opens find nothing and cost 28.4 s between them,
+  // and they fall in 32 directories -- 91% of them in just two. One listing per
+  // directory answers for every probe into it, and answering costs nothing
+  // because it is a table lookup, not a question to the card.
+  //
+  // Only ever skipped on ABSENT, which dir_cache_lookup returns only from a
+  // complete listing of a directory that is there, or from a directory that is
+  // not there at all. UNKNOWN opens the file exactly as before. Getting this
+  // wrong the other way -- claiming absent for a file that exists -- hands the
+  // game a NULL it does not check, which is the crash this branch already had
+  // once, so the cache is built to be unable to say it.
+  if (!writing && path && dir_cache_lookup(path) == DIR_CACHE_ABSENT) {
+    io_opens++;
+    io_opens_skipped++;
+    note_missing(path, 0);
+    return NULL;
+  }
+
   uint32_t t0 = io_now_us();
   FILE *f = handle_cache_on ? handle_cache_fopen(path, mode)
                             : sceLibcBridge_fopen(path, mode);
   uint32_t spent = io_now_us() - t0;
+  // What the card said, checked against what the listing would have said. A
+  // listing only gets to answer "absent" once the card has agreed with it, and
+  // loses that the first time it is caught out.
+  if (!writing)
+    dir_cache_observe(path, f != NULL);
   io_opens++;
   if (again) {
     io_reopens++;
@@ -515,7 +557,7 @@ static FILE *traced_fopen(const char *path, const char *mode) {
   }
   // Anything holding handles open would have to leave these alone, so know how
   // many there are before designing around them.
-  if (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')))
+  if (writing)
     io_opens_writing++;
   if (!f)
     note_missing(path, spent);
@@ -774,22 +816,29 @@ int ProcessEvents(void) {
                "to be, holding %u of %u\n",
                hc.hits, hc.misses, hc.parked, hc.evicted, hc.dropped, hc.drains,
                hc.rescued, hc.absent, hc.absent_again, hc.held, hc.slots);
-      DirCacheStats dc;
-      dir_cache_stats(&dc);
-      extern unsigned dir_list_us;
-      extern char dir_last[4][160];
-      extern unsigned dir_last_count[4];
-      traceLog("dirs: %u listings holding %u names answered %u questions, "
-               "%u still had to ask about one file, %u too big, %d ms listing\n",
-               dc.listed, dc.entries, dc.answered, dc.statted, dc.overflow,
-               (int)(dir_list_us / 1000));
-      for (int i = 0; i < 4; i++)
-        if (dir_last[i][0])
-          traceLog("dir: %s -- %u names\n", dir_last[i], dir_last_count[i]);
     }
-    traceLog("miss: %u opens found nothing, %d ms | %u directories between "
-             "them, %u unplaced\n", (unsigned)io_opens_missing,
-             (int)(io_open_missing_us / 1000), (unsigned)miss_dirs_used,
+    // Whatever the handle cache is doing, the dir cache is in the open path
+    // now. "contradicted" is the number to read first: anything but 0 means a
+    // listing was caught claiming absent for a file that opened, and that
+    // directory has been retired from answering.
+    DirCacheStats dc;
+    dir_cache_stats(&dc);
+    extern unsigned dir_list_us;
+    extern char dir_last[4][160];
+    extern unsigned dir_last_count[4];
+    traceLog("dirs: %u listed, %u not there, %u unreadable, %u names | "
+             "answered %u, unknown %u, statted %u | %u too big, %u forgotten "
+             "| contradicted %u, stale %u | %d ms listing\n",
+             dc.listed, dc.missing, dc.unreadable, dc.entries, dc.answered,
+             dc.unknown, dc.statted, dc.overflow, dc.forgotten,
+             dc.contradicted, dc.stale, (int)(dir_list_us / 1000));
+    for (int i = 0; i < 4; i++)
+      if (dir_last[i][0])
+        traceLog("dir: %s -- %u names\n", dir_last[i], dir_last_count[i]);
+    traceLog("miss: %u opens found nothing, %d ms | %u never reached the card "
+             "| %u directories between them, %u unplaced\n",
+             (unsigned)io_opens_missing, (int)(io_open_missing_us / 1000),
+             (unsigned)io_opens_skipped, (unsigned)miss_dirs_used,
              (unsigned)miss_dirs_unplaced);
     // The busiest few by name, because whether one listing covers them is the
     // whole question and a count alone cannot say. Picked by repeated maximum
@@ -1779,12 +1828,17 @@ int main(int argc, char *argv[]) {
   patch_movie();
   so_flush_caches(&bully_mod);
 
+  // Before any of the game's code runs, because fopen is hooked and the hook
+  // asks this first. An initialiser that opens a file would otherwise call
+  // through an ops table of NULLs.
+  dir_cache_mutex = sceKernelCreateMutex("dir_cache", 0, 0, NULL);
+  static const DirCacheOps dir_cache_ops = { open_dir, read_dir, close_dir,
+                                             stat_one_file, io_now_us,
+                                             dir_cache_lock, dir_cache_unlock };
+  dir_cache_init(&dir_cache_ops);
+
   traceLog("boot: patched, running .so initializers\n");
   so_initialize(&bully_mod);
-
-  static const DirCacheOps dir_cache_ops = { open_dir, read_dir, close_dir,
-                                             stat_one_file, io_now_us };
-  dir_cache_init(&dir_cache_ops);
 
   static const HandleCacheOps handle_cache_ops = {
     sceLibcBridge_fopen, sceLibcBridge_fclose, sceLibcBridge_fseek,
