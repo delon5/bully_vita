@@ -47,6 +47,16 @@ typedef struct {
   int complete; // the whole listing fitted, so "no" can be trusted
 } Dir;
 
+// How long the listings take, and what they found. Nine of them held
+// seventeen names between them on hardware, which is not a plausible picture of
+// a game's data tree -- and a listing that is missing names answers "not there"
+// for files that are, which is the direction that hands the game a NULL. Until
+// this is understood the trace has to say what was read and how long it took.
+unsigned dir_list_us;
+char dir_last[4][DC_PATH];
+unsigned dir_last_count[4];
+static unsigned dir_last_next;
+
 static DirCacheOps io;
 static Dir dirs[DC_DIRS];
 static unsigned dc_next; // round robin when every slot is taken
@@ -103,6 +113,7 @@ static Dir *list_dir(const char *path, unsigned h) {
     stats.entries -= d->count;
   memset(d, 0, sizeof(*d));
 
+  unsigned t0 = io.now_us ? io.now_us() : 0;
   int handle = io.open_dir(path);
   if (handle < 0)
     return NULL; // no such directory, or unreadable: fall back to stat
@@ -112,9 +123,14 @@ static Dir *list_dir(const char *path, unsigned h) {
   while (io.read_dir(handle, name, sizeof(name)))
     add_name(d, name);
   io.close_dir(handle);
+  if (io.now_us)
+    dir_list_us += io.now_us() - t0;
 
   d->hash = h;
   memcpy(d->path, path, strlen(path) + 1);
+  memcpy(dir_last[dir_last_next], path, strlen(path) + 1);
+  dir_last_count[dir_last_next] = d->count;
+  dir_last_next = (dir_last_next + 1) % 4;
   stats.listed++;
   stats.entries += d->count;
   if (!d->complete)

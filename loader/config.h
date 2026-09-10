@@ -235,8 +235,22 @@
 // told is the only way to find out how many are spare.
 #define HANDLE_CACHE_SLOTS 32
 
-// Create this file to close the game's files normally instead of holding them
-// open. On by default again, now that the thing that made it lose is gone.
+// Create this file to hold the game's files open instead of closing them. Off,
+// for the sixth time and now for a reason that is not about the bookkeeping.
+//
+// The directory cache did what it was built for -- nine listings answered 4938
+// questions and only 508 went to a stat -- and the total still lost, 60.7 s
+// against 54.5 s. With the stats gone, what is left has no explanation left to
+// hide behind:
+//
+//   no cache    5379 first opens at  3.49 ms
+//   with cache  5379 first opens at 10.07 ms
+//
+// A first open costs three times as much whenever this is on. That held in all
+// five earlier builds too, at two handles held and at twenty-eight, so it does
+// not scale with how many are kept and it is not a table being scanned. The
+// saving on repeats is real and almost exactly cancelled by it. Until that is
+// understood there is nothing here to tune.
 //
 //   build                first ms  ms each   repeat ms  ms each     total
 //   no cache                18478     3.49       36017     2.91     54.5 s
@@ -257,7 +271,7 @@
 // saving is not. It matters most where it is least visible in a session total:
 // a twenty second freeze does 1752 opens, 1168 of them repeats, which is about
 // 2.9 s of it.
-#define HANDLE_CACHE_DISABLE_PATH DATA_PATH "/" "no_handlecache"
+#define HANDLE_CACHE_ENABLE_PATH DATA_PATH "/" "use_handlecache"
 
 
 // Create this file to buffer the game's reads. Off by default, because on this

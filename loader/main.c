@@ -669,9 +669,16 @@ int ProcessEvents(void) {
                hc.rescued, hc.absent, hc.absent_again, hc.held, hc.slots);
       DirCacheStats dc;
       dir_cache_stats(&dc);
+      extern unsigned dir_list_us;
+      extern char dir_last[4][160];
+      extern unsigned dir_last_count[4];
       traceLog("dirs: %u listings holding %u names answered %u questions, "
-               "%u still had to ask about one file, %u listings too big\n",
-               dc.listed, dc.entries, dc.answered, dc.statted, dc.overflow);
+               "%u still had to ask about one file, %u too big, %d ms listing\n",
+               dc.listed, dc.entries, dc.answered, dc.statted, dc.overflow,
+               (int)(dir_list_us / 1000));
+      for (int i = 0; i < 4; i++)
+        if (dir_last[i][0])
+          traceLog("dir: %s -- %u names\n", dir_last[i], dir_last_count[i]);
     }
     traceLog("visit: %u first reading %d KB, %u again reading %d KB, %u over "
              "%d KB, %u untracked | per visit <4K %u <16K %u <64K %u more %u\n",
@@ -1644,7 +1651,7 @@ int main(int argc, char *argv[]) {
   so_initialize(&bully_mod);
 
   static const DirCacheOps dir_cache_ops = { open_dir, read_dir, close_dir,
-                                             stat_one_file };
+                                             stat_one_file, io_now_us };
   dir_cache_init(&dir_cache_ops);
 
   static const HandleCacheOps handle_cache_ops = {
@@ -1652,14 +1659,15 @@ int main(int argc, char *argv[]) {
     sceLibcBridge_ferror, path_exists
   };
   SceIoStat hc_stat;
-  if (sceIoGetstat(HANDLE_CACHE_DISABLE_PATH, &hc_stat) >= 0) {
-    traceLog("handles: off, asked for by %s\n", HANDLE_CACHE_DISABLE_PATH);
-  } else {
+  if (sceIoGetstat(HANDLE_CACHE_ENABLE_PATH, &hc_stat) >= 0) {
     handle_cache_init(&handle_cache_ops, HANDLE_CACHE_SLOTS);
     handle_cache_on = 1;
-    traceLog("handles: holding up to %d files open; a missing file is now "
-             "recognised from a directory listing rather than a question per "
-             "file, which is what made this lose before\n", HANDLE_CACHE_SLOTS);
+    traceLog("handles: on, asked for by %s\n", HANDLE_CACHE_ENABLE_PATH);
+  } else {
+    traceLog("handles: off -- a first open costs 3.5 ms with this off and 10 ms "
+             "with it on,\n"
+             "         in every build and at every number of handles held, and "
+             "that is not the bookkeeping\n");
   }
 
   static const ReadCacheOps read_cache_ops = { raw_fread, sceLibcBridge_fseek,

@@ -18,6 +18,8 @@ typedef struct {
   void (*close_dir)(int handle);
   // The fallback, and the thing this exists to avoid: one question per file.
   int (*stat)(const char *path);
+  // Optional. Only used to report how long the listings took.
+  unsigned (*now_us)(void);
 } DirCacheOps;
 
 void dir_cache_init(const DirCacheOps *ops);
