@@ -357,6 +357,66 @@ static void close_dir(int handle) { sceIoDclose(handle); }
 
 static int path_exists(const char *path) { return dir_cache_exists(path); }
 
+// Two thirds of the opens in a session are for files that are not there:
+// around 11800 of 17500, and every one of them goes to the card. They have
+// never been timed apart from the opens that succeed, so the 60 s the open
+// counter reports is an average over two things that have nothing to do with
+// each other, which is the mistake the read cache and the handle cache were
+// both built on.
+//
+// Time them apart, and count the directories they fall in. A probe that finds
+// nothing can only be answered from memory if the directory it is in has been
+// listed, so the number of distinct directories is the difference between a
+// listing that answers for thousands of probes and one that answers for a
+// handful. This only counts -- nothing is listed here and no answer changes.
+#define MISS_DIRS 64 // a power of two
+static uint32_t io_opens_missing, miss_dirs_used, miss_dirs_unplaced;
+static uint64_t io_open_missing_us;
+static struct {
+  uint32_t hash;
+  uint32_t probes;
+  char path[96];
+} miss_dirs[MISS_DIRS];
+
+static void note_missing(const char *path, uint32_t spent) {
+  io_opens_missing++;
+  io_open_missing_us += spent;
+  if (!path)
+    return;
+
+  const char *cut = NULL;
+  for (const char *c = path; *c; c++)
+    if (*c == '/' || *c == ':')
+      cut = c;
+  int len = cut ? (int)(cut - path) : 0;
+  if (len <= 0 || len >= (int)sizeof(miss_dirs[0].path)) {
+    miss_dirs_unplaced++;
+    return;
+  }
+
+  uint32_t h = 2166136261u;
+  for (int i = 0; i < len; i++)
+    h = (h ^ (unsigned char)path[i]) * 16777619u;
+  if (!h)
+    h = 1;
+  for (uint32_t i = 0; i < MISS_DIRS; i++) {
+    uint32_t slot = (h + i) & (MISS_DIRS - 1);
+    if (miss_dirs[slot].hash == h) {
+      miss_dirs[slot].probes++;
+      return;
+    }
+    if (!miss_dirs[slot].hash) {
+      miss_dirs[slot].hash = h;
+      miss_dirs[slot].probes = 1;
+      memcpy(miss_dirs[slot].path, path, len);
+      miss_dirs[slot].path[len] = 0;
+      miss_dirs_used++;
+      return;
+    }
+  }
+  miss_dirs_unplaced++; // more than MISS_DIRS directories, which is the answer
+}
+
 // How big are the files that get opened over and over? Holding the handle
 // stops the open costing anything, but the game still reads the bytes back off
 // the card every time, and a path-keyed cache of whole small files would stop
@@ -457,6 +517,8 @@ static FILE *traced_fopen(const char *path, const char *mode) {
   // many there are before designing around them.
   if (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')))
     io_opens_writing++;
+  if (!f)
+    note_missing(path, spent);
   if (f) {
     visit_open(f, again);
     // The first time a path is opened successfully, say what it is and how big.
@@ -724,6 +786,29 @@ int ProcessEvents(void) {
       for (int i = 0; i < 4; i++)
         if (dir_last[i][0])
           traceLog("dir: %s -- %u names\n", dir_last[i], dir_last_count[i]);
+    }
+    traceLog("miss: %u opens found nothing, %d ms | %u directories between "
+             "them, %u unplaced\n", (unsigned)io_opens_missing,
+             (int)(io_open_missing_us / 1000), (unsigned)miss_dirs_used,
+             (unsigned)miss_dirs_unplaced);
+    // The busiest few by name, because whether one listing covers them is the
+    // whole question and a count alone cannot say. Picked by repeated maximum
+    // rather than by sorting, and marked off in a bitmap rather than by zeroing
+    // the counter, so the totals above stay the totals.
+    uint64_t already_shown = 0;
+    for (int shown = 0; shown < 6; shown++) {
+      int best = -1;
+      for (int i = 0; i < MISS_DIRS; i++) {
+        if (!miss_dirs[i].probes || (already_shown >> i) & 1)
+          continue;
+        if (best < 0 || miss_dirs[i].probes > miss_dirs[best].probes)
+          best = i;
+      }
+      if (best < 0)
+        break;
+      already_shown |= (uint64_t)1 << best;
+      traceLog("miss dir: %u probes  %s\n", miss_dirs[best].probes,
+               miss_dirs[best].path);
     }
     traceLog("files: %u distinct opened, %d MB between them\n",
              (unsigned)opened_files, (int)(opened_bytes / (1024 * 1024)));
