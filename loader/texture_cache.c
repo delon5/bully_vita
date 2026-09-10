@@ -171,12 +171,40 @@ static unsigned tick_now_us(void) {
   return (unsigned)now;
 }
 
+// The last reading, and whether the cache is actively trying to free memory.
+// Both are read by pool_sample_interval below and by the tick itself.
+static size_t free_now[VGL_POOLS];
+static int reclaiming;
+
 static void vitagl_free_per_pool(size_t out[VGL_POOLS]) {
   unsigned t0 = tick_now_us();
   for (int pool = 0; pool < VGL_POOLS; pool++)
     out[pool] = vglMemFree((vglMemType)pool);
   tick_pool_us += tick_now_us() - t0;
   tick_pool_calls++;
+}
+
+// Frames to wait before asking vitaGL about the pools again. The margin is the
+// distance from the tightest pool to the mark that starts reclaiming; divide it
+// by what a frame can plausibly take out of a pool and that is how long the
+// last answer stays good for. While actually reclaiming, ask every frame: the
+// numbers are being acted on, and a stale one evicts against the wrong figure.
+static unsigned pool_sample_interval(void) {
+  if (!pool_start[1] || reclaiming)
+    return 1;
+
+  size_t margin = (size_t)-1;
+  for (int pool = 1; pool < VGL_POOLS; pool++) {
+    size_t low = pool_start[pool] / 100 * TEXTURE_FREE_HEADROOM_LOW_PERCENT;
+    size_t clear = free_now[pool] > low ? free_now[pool] - low : 0;
+    if (clear < margin)
+      margin = clear;
+  }
+
+  unsigned frames = (unsigned)(margin / (TEXTURE_POOL_MB_PER_FRAME * 1024 * 1024));
+  if (frames < 1)
+    frames = 1;
+  return frames > TEXTURE_POOL_SAMPLE_FRAMES ? TEXTURE_POOL_SAMPLE_FRAMES : frames;
 }
 
 
@@ -1157,8 +1185,24 @@ void texture_cache_tick(void) {
 
   const size_t budget = (size_t)TEXTURE_BUDGET_MB * 1024 * 1024;
 
-  size_t free_now[VGL_POOLS];
-  vitagl_free_per_pool(free_now);
+  // vglMemFree walks vitaGL's own free lists, and it was measured at 8062 us
+  // across the five pools -- per call, not per frame, so the figure is not an
+  // artefact of how often it runs. Running it every frame was 8 ms of every 33
+  // ms frame: a quarter of the game's frame time, and by far the largest thing
+  // this loader cost the game.
+  //
+  // How often it is worth asking depends on how close the answer is to
+  // mattering. A pool twenty megabytes clear of the mark it reacts at cannot
+  // reach it in one frame, so asking every frame learns nothing; a pool sitting
+  // on the mark has to be watched every frame or the reaction comes late, and a
+  // pool that runs dry is the crash this whole cache exists to prevent. So the
+  // interval is the margin divided by what a frame can plausibly consume --
+  // full rate when it is close, a fifteenth of the rate when it is not.
+  static uint32_t pool_sampled;
+  if (!pool_sampled || frame_counter - pool_sampled >= pool_sample_interval()) {
+    vitagl_free_per_pool(free_now);
+    pool_sampled = frame_counter;
+  }
   if (!pool_start[1]) { // the RAM pool is never zero once vitaGL is up
     vitagl_free_per_pool(pool_start);
     // Logged once, because every later judgement is made against these and a
@@ -1196,7 +1240,6 @@ void texture_cache_tick(void) {
   // it is back above the high one. In between, leave it alone. The work happens
   // in bursts with real margin either side rather than as a permanent trickle,
   // and a pool that simply sits a little under its ideal is left to sit there.
-  static int reclaiming;
   size_t deficit = 0;
   int below_low = 0;
   for (int pool = 1; pool < VGL_POOLS; pool++) {

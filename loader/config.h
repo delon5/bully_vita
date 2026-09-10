@@ -320,6 +320,22 @@
 // difference between playable and 1-5 frames a second. It is the RAM pool
 // draining that is dangerous, because what lies past it is the newlib heap the
 // game is using.
+// The longest the cache will go without asking vitaGL how much of each pool is
+// free, and how fast it assumes a pool can drain while it is not asking.
+//
+// vglMemFree walks vitaGL's own free lists: measured at 8062 us for the five
+// pools, per call. Once a frame made it 8 ms of every 33 ms frame -- a quarter
+// of the game's frame time, and by far the largest thing this loader cost.
+//
+// It cannot simply be sampled less often, though: a pool that runs dry is the
+// crash this cache exists to prevent, and a test that drops a pool below the
+// mark and expects it reclaimed within four frames failed when this was a flat
+// fifteen. So the interval is the distance to the mark divided by the megabytes
+// a frame can plausibly take, which is full rate near the line and a fifteenth
+// of it when a pool is twenty megabytes clear -- where it normally sits.
+#define TEXTURE_POOL_SAMPLE_FRAMES 15
+#define TEXTURE_POOL_MB_PER_FRAME 2
+
 #define TEXTURE_FREE_HEADROOM_PERCENT 25
 
 // ...and the mark reclaiming starts at. Reaching for a quarter free only once a
