@@ -740,17 +740,19 @@ int ProcessEvents(void) {
     // file I/O moves it.
     {
       extern unsigned pad_samples, pad_axis_reads, pad_button_reads;
-      extern unsigned char pad_lo[4], pad_hi[4];
+      extern unsigned char pad_lo[2][4], pad_hi[2][4];
       static unsigned last_pad;
       unsigned took = pad_samples - last_pad;
       last_pad = pad_samples;
       traceLog("pad: %u hardware samples, %d a second, %u axis reads, "
-               "%u button reads | reached lx %u-%u ly %u-%u rx %u-%u ry %u-%u\n",
+               "%u button reads | port 0 reached lx %u-%u ly %u-%u rx %u-%u "
+               "ry %u-%u | port 1 lx %u-%u ly %u-%u\n",
                (unsigned)pad_samples,
                elapsed_us ? (int)((uint64_t)took * 1000000u / elapsed_us) : 0,
                (unsigned)pad_axis_reads, (unsigned)pad_button_reads,
-               pad_lo[0], pad_hi[0], pad_lo[1], pad_hi[1],
-               pad_lo[2], pad_hi[2], pad_lo[3], pad_hi[3]);
+               pad_lo[0][0], pad_hi[0][0], pad_lo[0][1], pad_hi[0][1],
+               pad_lo[0][2], pad_hi[0][2], pad_lo[0][3], pad_hi[0][3],
+               pad_lo[1][0], pad_hi[1][0], pad_lo[1][1], pad_hi[1][1]);
     }
     traceLog("heapinfo: arena %d MB, live %d MB, free-listed %d MB, top %d KB, peak %d MB\n",
              (int)(heap.arena / (1024 * 1024)), (int)(heap.uordblks / (1024 * 1024)),

@@ -320,6 +320,15 @@
 // difference between playable and 1-5 frames a second. It is the RAM pool
 // draining that is dangerous, because what lies past it is the newlib heap the
 // game is using.
+// How much of the stick's travel does nothing.
+//
+// The port shipped with a quarter of it dead and the value clipped rather than
+// rescaled, so the stick did nothing at all until it was 25% over and then
+// jumped to 0.25. This is enough to cover the drift a worn Vita stick has and
+// no more, and what is left of the travel is stretched back over the full range
+// so that a small push gives a small number.
+#define PAD_DEADZONE 0.12f
+
 // A frame gap longer than this is a stall rather than a slow frame, and the
 // trace prints what changed during it. Four display periods: past anything the
 // game hits while running normally, so the line only appears for the tail that

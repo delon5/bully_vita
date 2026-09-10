@@ -110,7 +110,17 @@ int GetDeviceLocale(void) {
   return 0; // english
 }
 
-static SceCtrlData pad;
+// One buffer per port, not one shared between them.
+//
+// GetGamepadType(0) reads the Vita's own controls; GetGamepadType(1) reads
+// port 2, where an external controller would be. Both used to peek into the
+// same SceCtrlData, and GetGamepadAxis ignored its port argument entirely and
+// read whatever was left there. The pad line counts two hardware samples per
+// pass of the game's loop, so the second peek succeeds even with nothing
+// plugged in -- meaning the real reading was being overwritten by an empty one
+// every pass, and which of the two the game saw depended on the order it
+// happened to call them in.
+static SceCtrlData pad[2];
 static SceTouchData touch_front, touch_back;
 
 // The pad is read from the hardware here and nowhere else: GetGamepadAxis and
@@ -127,16 +137,17 @@ unsigned pad_samples, pad_axis_reads, pad_button_reads;
 // often it is polled, and that is what a sampling mode other than ANALOG_WIDE,
 // or a deadzone applied somewhere below, would look like. Push each stick to
 // its corners and the trace says whether the loader sees it.
-unsigned char pad_lo[4] = { 255, 255, 255, 255 };
-unsigned char pad_hi[4] = { 0, 0, 0, 0 };
+unsigned char pad_lo[2][4] = { { 255, 255, 255, 255 }, { 255, 255, 255, 255 } };
+unsigned char pad_hi[2][4];
 
-static void pad_note_range(void) {
-  const unsigned char v[4] = { pad.lx, pad.ly, pad.rx, pad.ry };
+static void pad_note_range(int port) {
+  const unsigned char v[4] = { pad[port].lx, pad[port].ly, pad[port].rx,
+                               pad[port].ry };
   for (int i = 0; i < 4; i++) {
-    if (v[i] < pad_lo[i])
-      pad_lo[i] = v[i];
-    if (v[i] > pad_hi[i])
-      pad_hi[i] = v[i];
+    if (v[i] < pad_lo[port][i])
+      pad_lo[port][i] = v[i];
+    if (v[i] > pad_hi[port][i])
+      pad_hi[port][i] = v[i];
   }
 }
 
@@ -150,10 +161,10 @@ int GetGamepadType(int port) {
   if (port != 0 && port != 1)
     return -1;
 
-  if (sceCtrlPeekBufferPositiveExt2(port == 0 ? 0 : 2, &pad, 1) < 0)
+  if (sceCtrlPeekBufferPositiveExt2(port == 0 ? 0 : 2, &pad[port], 1) < 0)
     return -1;
   pad_samples++;
-  pad_note_range();
+  pad_note_range(port);
 
   if (port == 0) {
     sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch_front, 1);
@@ -166,34 +177,37 @@ int GetGamepadType(int port) {
 int GetGamepadButtons(int port) {
   int mask = 0;
   pad_button_reads++;
+  if (port != 0 && port != 1)
+    return 0;
+  const SceCtrlData *p = &pad[port];
 
-  if (pad.buttons & SCE_CTRL_CROSS)
+  if (p->buttons & SCE_CTRL_CROSS)
     mask |= 0x1;
-  if (pad.buttons & SCE_CTRL_CIRCLE)
+  if (p->buttons & SCE_CTRL_CIRCLE)
     mask |= 0x2;
-  if (pad.buttons & SCE_CTRL_SQUARE)
+  if (p->buttons & SCE_CTRL_SQUARE)
     mask |= 0x4;
-  if (pad.buttons & SCE_CTRL_TRIANGLE)
+  if (p->buttons & SCE_CTRL_TRIANGLE)
     mask |= 0x8;
-  if (pad.buttons & SCE_CTRL_START)
+  if (p->buttons & SCE_CTRL_START)
     mask |= 0x10;
-  if (pad.buttons & SCE_CTRL_SELECT)
+  if (p->buttons & SCE_CTRL_SELECT)
     mask |= 0x20;
-  if (pad.buttons & SCE_CTRL_L1)
+  if (p->buttons & SCE_CTRL_L1)
     mask |= 0x40;
-  if (pad.buttons & SCE_CTRL_R1)
+  if (p->buttons & SCE_CTRL_R1)
     mask |= 0x80;
-  if (pad.buttons & SCE_CTRL_UP)
+  if (p->buttons & SCE_CTRL_UP)
     mask |= 0x100;
-  if (pad.buttons & SCE_CTRL_DOWN)
+  if (p->buttons & SCE_CTRL_DOWN)
     mask |= 0x200;
-  if (pad.buttons & SCE_CTRL_LEFT)
+  if (p->buttons & SCE_CTRL_LEFT)
     mask |= 0x400;
-  if (pad.buttons & SCE_CTRL_RIGHT)
+  if (p->buttons & SCE_CTRL_RIGHT)
     mask |= 0x800;
-  if (pad.buttons & SCE_CTRL_L3)
+  if (p->buttons & SCE_CTRL_L3)
     mask |= 0x1000;
-  if (pad.buttons & SCE_CTRL_R3)
+  if (p->buttons & SCE_CTRL_R3)
     mask |= 0x2000;
 
   if (port == 0) {
@@ -213,53 +227,66 @@ int GetGamepadButtons(int port) {
   return mask;
 }
 
+// A stick reading with the dead zone taken out of it, rather than clipped
+// against it.
+//
+// The original was "return the value if it is past a quarter, otherwise zero".
+// That does two things at once: it ignores the first 25% of stick travel, which
+// is a very large dead area, and then the moment the stick crosses it the value
+// jumps straight from 0 to 0.25. A stick that does nothing and then lurches is
+// what an unresponsive one feels like.
+//
+// Taking the dead zone out instead means the value leaves zero smoothly and
+// still reaches 1 at full travel, so small movements are small rather than
+// absent.
+static float stick(float v) {
+  float mag = v < 0.0f ? -v : v;
+  if (mag <= PAD_DEADZONE)
+    return 0.0f;
+  float scaled = (mag - PAD_DEADZONE) / (1.0f - PAD_DEADZONE);
+  if (scaled > 1.0f)
+    scaled = 1.0f;
+  return v < 0.0f ? -scaled : scaled;
+}
+
 float GetGamepadAxis(int port, int axis) {
-  float val = 0.0f;
   pad_axis_reads++;
+  if (port != 0 && port != 1)
+    return 0.0f;
+  const SceCtrlData *p = &pad[port];
 
   switch (axis) {
     case 0:
-      val = ((float)pad.lx - 128.0f) / 128.0f;
-      break;
+      return stick(((float)p->lx - 128.0f) / 128.0f);
     case 1:
-      val = ((float)pad.ly - 128.0f) / 128.0f;
-      break;
+      return stick(((float)p->ly - 128.0f) / 128.0f);
     case 2:
-      val = ((float)pad.rx - 128.0f) / 128.0f;
-      break;
+      return stick(((float)p->rx - 128.0f) / 128.0f);
     case 3:
-      val = ((float)pad.ry - 128.0f) / 128.0f;
-      break;
+      return stick(((float)p->ry - 128.0f) / 128.0f);
     case 4: // L2
     case 5: // R2
-    {
-      if (axis == 4 && pad.buttons & SCE_CTRL_L2) {
-        val = 1.0f;
-        break;
-      } else if (axis == 5 && pad.buttons & SCE_CTRL_R2) {
-        val = 1.0f;
-        break;
-      }
-
+      // Held either as a real trigger or as a corner of the front touch panel.
+      // No dead zone applies: these are already all or nothing.
+      if (axis == 4 && (p->buttons & SCE_CTRL_L2))
+        return 1.0f;
+      if (axis == 5 && (p->buttons & SCE_CTRL_R2))
+        return 1.0f;
       if (port == 0) {
         for (int i = 0; i < touch_front.reportNum; i++) {
           if (touch_front.report[i].y < (panelInfoFront.minAaY + panelInfoFront.maxAaY) / 2) {
             if (touch_front.report[i].x < (panelInfoFront.minAaX + panelInfoFront.maxAaX) / 2) {
-              if (touch_front.report[i].x >= TOUCH_X_MARGIN)
-                if (axis == 4) val = 1.0f;
+              if (touch_front.report[i].x >= TOUCH_X_MARGIN && axis == 4)
+                return 1.0f;
             } else {
-              if (touch_front.report[i].x < (panelInfoFront.maxAaX - TOUCH_X_MARGIN))
-                if (axis == 5) val = 1.0f;
+              if (touch_front.report[i].x < (panelInfoFront.maxAaX - TOUCH_X_MARGIN) && axis == 5)
+                return 1.0f;
             }
           }
         }
       }
-    }
+      return 0.0f;
   }
-
-  if (fabsf(val) > 0.25f)
-    return val;
-
   return 0.0f;
 }
 
