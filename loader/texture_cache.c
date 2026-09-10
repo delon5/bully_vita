@@ -158,9 +158,25 @@ static uint32_t deferred_count;
 //
 // Keeping them apart rather than summing them is the point. They are not
 // interchangeable, and a total hides a pool that has run dry.
+// Where the per-frame cost goes. The pacing line says 8 ms of every frame is
+// spent inside this tick and the vertex one, which at a 33 ms frame is a
+// quarter of it -- so it is worth knowing which part, per call, rather than
+// guessing. mallinfo is the suspect: newlib walks the whole free list to build
+// it and this uses one field of the result.
+unsigned tick_heap_us, tick_heap_calls, tick_pool_us, tick_pool_calls;
+
+static unsigned tick_now_us(void) {
+  SceKernelSysClock now;
+  sceKernelGetProcessTime(&now);
+  return (unsigned)now;
+}
+
 static void vitagl_free_per_pool(size_t out[VGL_POOLS]) {
+  unsigned t0 = tick_now_us();
   for (int pool = 0; pool < VGL_POOLS; pool++)
     out[pool] = vglMemFree((vglMemType)pool);
+  tick_pool_us += tick_now_us() - t0;
+  tick_pool_calls++;
 }
 
 
@@ -198,7 +214,10 @@ static int heap_tight;
 static size_t heap_used_bytes;
 
 static void sample_heap(void) {
+  unsigned t0 = tick_now_us();
   struct mallinfo info = mallinfo();
+  tick_heap_us += tick_now_us() - t0;
+  tick_heap_calls++;
   size_t limit = (size_t)(MEMORY_NEWLIB_MB - TEXTURE_HEAP_KEEP_FREE_MB) * 1024 * 1024;
   heap_used_bytes = (size_t)info.uordblks;
   heap_tight = heap_used_bytes > limit;

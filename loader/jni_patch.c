@@ -313,6 +313,7 @@ extern SceUID presenting_thread;
 static unsigned frame_periods[8]; // 1, 2, 3, 4, 5-6, 7-12, 13-30, more
 unsigned frame_measured, frame_judder, frame_worst_us;
 unsigned long long frame_span_us, frame_swap_us, frame_tick_us;
+unsigned long long frame_texture_tick_us, frame_vertex_tick_us;
 
 // The histogram is static so the counting stays cheap; this hands out a copy.
 void frame_pacing_snapshot(unsigned out[8]) {
@@ -375,8 +376,11 @@ int swapBuffers(void) {
   last_swap_us = t0;
 
   texture_cache_tick();
+  unsigned tmid = frame_now_us();
   vertex_cache_tick();
   unsigned t1 = frame_now_us();
+  frame_texture_tick_us += tmid - t0;
+  frame_vertex_tick_us += t1 - tmid;
   vglSwapBuffers(GL_FALSE);
   unsigned t2 = frame_now_us();
   frame_tick_us += t1 - t0;

@@ -668,6 +668,16 @@ int ProcessEvents(void) {
                frame_measured ? (unsigned)(frame_span_us / frame_measured / 1000) : 0,
                frame_measured ? (unsigned)(frame_swap_us / frame_measured / 1000) : 0,
                frame_measured ? (unsigned)(frame_tick_us / frame_measured / 1000) : 0);
+      // And which part of the loader's share it is, per call so that changing
+      // how often something is sampled cannot flatter it.
+      extern unsigned long long frame_texture_tick_us, frame_vertex_tick_us;
+      extern unsigned tick_heap_us, tick_heap_calls, tick_pool_us, tick_pool_calls;
+      traceLog("tick: texture %u us a frame, vertex %u us a frame | mallinfo "
+               "%u calls at %u us, vglMemFree %u calls at %u us\n",
+               frame_measured ? (unsigned)(frame_texture_tick_us / frame_measured) : 0,
+               frame_measured ? (unsigned)(frame_vertex_tick_us / frame_measured) : 0,
+               tick_heap_calls, tick_heap_calls ? tick_heap_us / tick_heap_calls : 0,
+               tick_pool_calls, tick_pool_calls ? tick_pool_us / tick_pool_calls : 0);
       frame_worst_us = 0; // worst since the last heartbeat, not ever
     }
     // How often the sticks are actually read from the hardware, next to the
