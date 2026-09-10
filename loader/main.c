@@ -439,6 +439,38 @@ static int traced_fseek(FILE *stream, long int offset, int origin) {
   return r;
 }
 
+// What a stalled frame was made of, logged as it happens rather than averaged
+// into a heartbeat.
+//
+// Cutting the loader's per-frame cost from 8.2 ms to 0.9 ms changed nothing a
+// player would notice, and the pacing line says why: 94% of frames land on
+// exactly two display periods, so the frame had 33 ms of budget and the 8 ms
+// fitted inside it. What is left is entirely the tail -- nine intervals a
+// session where nothing is presented for half a second or more, the worst of
+// them twenty seconds, adding up to about forty seconds of a three minute
+// stretch of play.
+//
+// Averages cannot say what those are. A heartbeat holding one twenty second
+// stall reports the same read and open totals whether they happened during the
+// stall or around it. So when a frame takes longer than a threshold, print what
+// changed since the previous frame: this is one event, and the numbers in it
+// belong to it alone.
+void trace_stalled_frame(unsigned ms) {
+  static uint32_t was_reads, was_opens;
+  static uint64_t was_bytes;
+  TextureCacheStats cache;
+  texture_cache_stats(&cache);
+  traceLog("stall: %u ms with no frame | %u reads, %u KB, %u opens since the "
+           "frame before | %u textures tracked, %u evicted, %u restored\n",
+           ms, (unsigned)(io_reads - was_reads),
+           (unsigned)((io_read_bytes - was_bytes) / 1024),
+           (unsigned)(io_opens - was_opens), cache.tracked_mb, cache.evicted,
+           cache.restored);
+  was_reads = io_reads;
+  was_bytes = io_read_bytes;
+  was_opens = io_opens;
+}
+
 int traceLog(char *text, ...) {
 #ifdef LOADER_TRACE
   va_list list;

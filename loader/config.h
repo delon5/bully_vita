@@ -320,6 +320,12 @@
 // difference between playable and 1-5 frames a second. It is the RAM pool
 // draining that is dangerous, because what lies past it is the newlib heap the
 // game is using.
+// A frame gap longer than this is a stall rather than a slow frame, and the
+// trace prints what changed during it. Four display periods: past anything the
+// game hits while running normally, so the line only appears for the tail that
+// is left once the per-frame costs are gone.
+#define FRAME_STALL_MS 100
+
 // The longest the cache will go without asking vitaGL how much of each pool is
 // free, and how fast it assumes a pool can drain while it is not asking.
 //
