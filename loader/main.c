@@ -461,23 +461,34 @@ static int traced_fseek(FILE *stream, long int offset, int origin) {
 // session it came to every read and every open the game made, which is how it
 // was caught. The snapshot has to happen on every frame for the difference to
 // mean the stall; only the printing is conditional.
-static uint32_t frame_was_reads, frame_was_opens;
-static uint64_t frame_was_bytes;
+static uint32_t frame_was_reads, frame_was_opens, frame_was_reopens;
+static uint64_t frame_was_bytes, frame_was_read_us, frame_was_open_us;
 
 void trace_frame_io(unsigned ms, int stalled) {
+  uint64_t open_us = io_open_first_us + io_open_again_us;
   if (stalled) {
     TextureCacheStats cache;
     texture_cache_stats(&cache);
-    traceLog("stall: %u ms with no frame | %u reads, %u KB, %u opens in it | "
-             "%u textures tracked, %u evicted, %u restored\n",
+    uint32_t opens = io_opens - frame_was_opens;
+    uint32_t again = io_reopens - frame_was_reopens;
+    // Times, not counts multiplied by a session average: a stall is exactly
+    // where the average is least likely to hold. The read figure carries the
+    // one-in-eight sampling the io line uses, which over a couple of thousand
+    // reads is a few hundred samples and good enough to attribute a stall.
+    traceLog("stall: %u ms with no frame | %u reads, %u KB, %d ms | %u opens, "
+             "%u of them repeats, %d ms | %u textures, %u evicted, %u restored\n",
              ms, (unsigned)(io_reads - frame_was_reads),
              (unsigned)((io_read_bytes - frame_was_bytes) / 1024),
-             (unsigned)(io_opens - frame_was_opens), cache.tracked_mb,
+             (int)((io_read_us - frame_was_read_us) * IO_SAMPLE / 1000), opens,
+             again, (int)((open_us - frame_was_open_us) / 1000), cache.tracked_mb,
              cache.evicted, cache.restored);
   }
   frame_was_reads = io_reads;
   frame_was_bytes = io_read_bytes;
   frame_was_opens = io_opens;
+  frame_was_reopens = io_reopens;
+  frame_was_read_us = io_read_us;
+  frame_was_open_us = open_us;
 }
 
 int traceLog(char *text, ...) {
