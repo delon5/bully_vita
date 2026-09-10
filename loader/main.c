@@ -278,6 +278,10 @@ static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
 // time every one rather than sample.
 #define OPEN_PATHS 8192
 static uint32_t io_opens, io_reopens, io_opens_writing;
+// Every distinct file the game opens, and what they come to. The answer to
+// whether spare memory can hold the lot.
+static uint32_t opened_files;
+static uint64_t opened_bytes;
 // Split, because the whole question is whether the repeats are the expensive
 // ones. 70% of opens are a path already opened and an open averages 3.1 ms, so
 // holding the handle instead of closing it looks like 38 s a session -- but
@@ -453,8 +457,26 @@ static FILE *traced_fopen(const char *path, const char *mode) {
   // many there are before designing around them.
   if (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')))
     io_opens_writing++;
-  if (f)
+  if (f) {
     visit_open(f, again);
+    // The first time a path is opened successfully, say what it is and how big.
+    //
+    // Thirty. That is how many distinct files the game actually opens in a
+    // session, against eleven thousand opens of paths that are not there, and
+    // between them those thirty account for 126 MB of the 248 MB read. Whether
+    // the idle 86 MB of heap can hold them is the whole question, and their
+    // sizes have never been looked at. Two seeks each, thirty times.
+    if (!again) {
+      long here = sceLibcBridge_ftell(f);
+      if (sceLibcBridge_fseek(f, 0, SEEK_END) == 0) {
+        long size = sceLibcBridge_ftell(f);
+        sceLibcBridge_fseek(f, here, SEEK_SET);
+        opened_bytes += size > 0 ? (uint64_t)size : 0;
+        opened_files++;
+        traceLog("file: %ld KB  %s\n", size / 1024, path);
+      }
+    }
+  }
   return f;
 }
 
@@ -703,6 +725,8 @@ int ProcessEvents(void) {
         if (dir_last[i][0])
           traceLog("dir: %s -- %u names\n", dir_last[i], dir_last_count[i]);
     }
+    traceLog("files: %u distinct opened, %d MB between them\n",
+             (unsigned)opened_files, (int)(opened_bytes / (1024 * 1024)));
     traceLog("visit: %u first read %d KB, %u again read %d KB, %u over "
              "%d KB, %u untracked | per visit <4K %u <16K %u <64K %u more %u\n",
              (unsigned)visit_first, (int)(visit_first_bytes / 1024),
