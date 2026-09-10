@@ -445,30 +445,39 @@ static int traced_fseek(FILE *stream, long int offset, int origin) {
 // Cutting the loader's per-frame cost from 8.2 ms to 0.9 ms changed nothing a
 // player would notice, and the pacing line says why: 94% of frames land on
 // exactly two display periods, so the frame had 33 ms of budget and the 8 ms
-// fitted inside it. What is left is entirely the tail -- nine intervals a
-// session where nothing is presented for half a second or more, the worst of
-// them twenty seconds, adding up to about forty seconds of a three minute
-// stretch of play.
+// fitted inside it. What is left is entirely the tail -- sixty-odd intervals a
+// session that present nothing for over a tenth of a second, the worst of them
+// twenty seconds, coming to about fifty of the three hundred seconds a session
+// lasts.
 //
 // Averages cannot say what those are. A heartbeat holding one twenty second
 // stall reports the same read and open totals whether they happened during the
-// stall or around it. So when a frame takes longer than a threshold, print what
-// changed since the previous frame: this is one event, and the numbers in it
-// belong to it alone.
-void trace_stalled_frame(unsigned ms) {
-  static uint32_t was_reads, was_opens;
-  static uint64_t was_bytes;
-  TextureCacheStats cache;
-  texture_cache_stats(&cache);
-  traceLog("stall: %u ms with no frame | %u reads, %u KB, %u opens since the "
-           "frame before | %u textures tracked, %u evicted, %u restored\n",
-           ms, (unsigned)(io_reads - was_reads),
-           (unsigned)((io_read_bytes - was_bytes) / 1024),
-           (unsigned)(io_opens - was_opens), cache.tracked_mb, cache.evicted,
-           cache.restored);
-  was_reads = io_reads;
-  was_bytes = io_read_bytes;
-  was_opens = io_opens;
+// stall or around it.
+//
+// The first version of this could not say either, and looked like it could.
+// It only sampled the counters when it logged, so every line reported
+// everything since the previous stall -- all the ordinary frames in between
+// included -- under a heading that said "since the frame before". Summed over a
+// session it came to every read and every open the game made, which is how it
+// was caught. The snapshot has to happen on every frame for the difference to
+// mean the stall; only the printing is conditional.
+static uint32_t frame_was_reads, frame_was_opens;
+static uint64_t frame_was_bytes;
+
+void trace_frame_io(unsigned ms, int stalled) {
+  if (stalled) {
+    TextureCacheStats cache;
+    texture_cache_stats(&cache);
+    traceLog("stall: %u ms with no frame | %u reads, %u KB, %u opens in it | "
+             "%u textures tracked, %u evicted, %u restored\n",
+             ms, (unsigned)(io_reads - frame_was_reads),
+             (unsigned)((io_read_bytes - frame_was_bytes) / 1024),
+             (unsigned)(io_opens - frame_was_opens), cache.tracked_mb,
+             cache.evicted, cache.restored);
+  }
+  frame_was_reads = io_reads;
+  frame_was_bytes = io_read_bytes;
+  frame_was_opens = io_opens;
 }
 
 int traceLog(char *text, ...) {

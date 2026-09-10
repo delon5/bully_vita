@@ -329,14 +329,14 @@ static unsigned frame_now_us(void) {
 
 // One display period is 16667 us. Anything under one and a half of them
 // counts as having hit the period it was aiming at.
-extern void trace_stalled_frame(unsigned ms);
+extern void trace_frame_io(unsigned ms, int stalled);
 
 static void frame_note_interval(unsigned us) {
   static unsigned previous_us;
-  // Long enough that it is a stall rather than a busy frame, and rare enough
-  // that logging one costs nothing: about fifty a session.
-  if (us > FRAME_STALL_MS * 1000u)
-    trace_stalled_frame(us / 1000u);
+  // Called every frame so that the difference it takes covers this frame and
+  // not everything back to the last stall; it prints only when the frame was
+  // long enough to be a stall rather than a busy frame.
+  trace_frame_io(us / 1000u, us > FRAME_STALL_MS * 1000u);
   unsigned periods = (us + 8333u) / 16667u;
   unsigned slot = periods <= 1   ? 0
                   : periods == 2 ? 1
