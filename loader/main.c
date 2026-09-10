@@ -242,6 +242,10 @@ static unsigned read_cache_thread_id(void) { return (unsigned)sceKernelGetThread
 // cost model over READ_CACHE_ENABLE_PATH in config.h.
 static int read_cache_on;
 
+// Defined with the rest of the visit accounting further down; declared here
+// because the read hook is above it.
+static void visit_read(FILE *f, size_t bytes);
+
 static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
   size_t want = size * count;
   io_size_buckets[want < 4096 ? 0 : want < 16384 ? 1 : want < 65536 ? 2 : 3]++;
@@ -256,6 +260,7 @@ static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
 
   io_last_stream = stream;
   io_last_end = start + (long)(got * size);
+  visit_read(stream, got * size);
   return got;
 }
 
@@ -367,6 +372,7 @@ static int path_exists(const char *path) { return dir_cache_exists(path); }
 static struct {
   FILE *file;
   int again;
+  uint64_t bytes;
 } visits[VISIT_TRACKED];
 static uint32_t visit_first, visit_again, visit_untracked, visit_too_big;
 static uint64_t visit_first_bytes, visit_again_bytes;
@@ -379,11 +385,26 @@ static void visit_open(FILE *f, int again) {
       if (__atomic_compare_exchange_n(&visits[i].file, &empty, f, 0,
                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
         visits[i].again = again;
+        visits[i].bytes = 0;
         return;
       }
     }
   }
   visit_untracked++;
+}
+
+// Bytes actually read, rather than the file position at close. The position
+// was what the first version of this used, and inside the game's big archives
+// it is the offset seeked to rather than anything read -- it reported 64556 MB
+// over 223 visits. Counting the reads themselves is the only way to answer
+// what a cache of file contents would have to hold and would save.
+static void visit_read(FILE *f, size_t bytes) {
+  for (int i = 0; i < VISIT_TRACKED; i++) {
+    if (__atomic_load_n(&visits[i].file, __ATOMIC_RELAXED) == f) {
+      visits[i].bytes += bytes;
+      return;
+    }
+  }
 }
 
 static void visit_close(FILE *f, long consumed) {
@@ -393,15 +414,17 @@ static void visit_close(FILE *f, long consumed) {
       __atomic_store_n(&visits[i].file, NULL, __ATOMIC_RELEASE);
       if (consumed < 0)
         return;
-      if (consumed > VISIT_CACHEABLE) {
+      uint64_t bytes = visits[i].bytes;
+      if (bytes > VISIT_CACHEABLE) {
         visit_too_big++;
       } else if (again) {
         visit_again++;
-        visit_again_bytes += (uint64_t)consumed;
+        visit_again_bytes += bytes;
       } else {
         visit_first++;
-        visit_first_bytes += (uint64_t)consumed;
+        visit_first_bytes += bytes;
       }
+      consumed = (long)bytes;
       visit_buckets[consumed < 4096 ? 0 : consumed < 16384 ? 1
                     : consumed < 65536 ? 2 : 3]++;
       return;
@@ -680,7 +703,7 @@ int ProcessEvents(void) {
         if (dir_last[i][0])
           traceLog("dir: %s -- %u names\n", dir_last[i], dir_last_count[i]);
     }
-    traceLog("visit: %u first reading %d KB, %u again reading %d KB, %u over "
+    traceLog("visit: %u first read %d KB, %u again read %d KB, %u over "
              "%d KB, %u untracked | per visit <4K %u <16K %u <64K %u more %u\n",
              (unsigned)visit_first, (int)(visit_first_bytes / 1024),
              (unsigned)visit_again, (int)(visit_again_bytes / 1024),
@@ -1695,7 +1718,12 @@ int main(int argc, char *argv[]) {
   traceLog("boot: fios ok, starting texture cache\n");
   texture_cache_init();
 
-  traceLog("boot: texture cache done, initialising vitaGL\n");
+  {
+    extern unsigned store_scan_us, store_scan_dirs;
+    traceLog("boot: texture cache done in %d ms, %u store directories read, "
+             "initialising vitaGL\n",
+             (int)(store_scan_us / 1000), store_scan_dirs);
+  }
   // The game ships GLSL and this hands it to vitaGL's runtime compiler, which
   // caches the compiled result on the card. The precompiled .gxp route this
   // port used instead only works with the 2021 vitaGL: current versions read a

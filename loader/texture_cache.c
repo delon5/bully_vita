@@ -538,7 +538,15 @@ static void texture_pin(GLuint id) {
 // hands it over. Losing a file is not a correctness problem -- it means one
 // eviction pays for a write again -- so there is no reason to spend a stat per
 // file working out which is oldest.
+// How long this takes, because nothing has ever timed it and it is a candidate
+// for the ninety-five seconds before the first frame. It reads every filename
+// in the store -- 1761 of them in recent sessions -- off a memory card whose
+// directory operations are not cheap, to build an index that those same
+// sessions then used exactly zero times, because nothing was ever evicted.
+unsigned store_scan_us, store_scan_dirs;
+
 static void scan_store(void) {
+  unsigned scan_t0 = tick_now_us();
   const uint64_t cap = (uint64_t)TEXTURE_BACKUP_MAX_MB * 1024 * 1024;
 
   // The subdirectories that exist, listed once, rather than probing all 256 --
@@ -557,6 +565,7 @@ static void scan_store(void) {
     strcpy(subdirs[num_subdirs], listing.d_name);
     num_subdirs++;
   }
+  store_scan_dirs = (unsigned)num_subdirs;
   sceIoDclose(top);
 
   for (int sub = 0; sub < num_subdirs; sub++) {
@@ -591,6 +600,7 @@ static void scan_store(void) {
     }
     sceIoDclose(dir);
   }
+  store_scan_us = tick_now_us() - scan_t0;
 }
 
 static void purge_store(void) {
