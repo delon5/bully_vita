@@ -13,7 +13,6 @@
 // without a trace is a guess, and guessing is what cost this port a day: the
 // eviction rule that never once fired was invisible until a heartbeat printed
 // "cdram 0 ... ev 0". Turn it off once a session survives.
-#define LOADER_TRACE
 // Accounts for every allocation the game makes and reports the largest holders
 // with the trace.
 //
@@ -82,11 +81,6 @@
 //
 // Set to 0 to turn the reserve off.
 #define MEMORY_RESCUE_RESERVE_MB 4
-
-// How much a memory category has to move between two heartbeats before the
-// trace mentions it. Small enough to catch a slow climb, large enough that the
-// line is not every category every time.
-#define GAME_MEMORY_DELTA_KB 64
 
 // How much of the newlib heap to keep clear of the game's streamer.
 //
@@ -223,125 +217,6 @@
 // launch starts from nothing.
 #define TEXTURE_STORE_WIPE_PATH DATA_PATH "/" "wipe_texcache"
 
-// How many files to hold open rather than close. The game opens 17667 files a
-// session over only 5288 distinct paths, and the trace counts zero of them
-// opened for writing, so holding readers is the whole of it.
-//
-// A starting point, not a setting. 32 turned out to be more than this system
-// has: the cache reached 28 held, the game opened OBJECTS/IDE.DIR, the open
-// returned NULL and the game read through the NULL handle without checking it.
-// So the cap comes down on its own the first time a drain rescues an open, and
-// the trace reports where it settled. Descriptors belong to the game, and being
-// told is the only way to find out how many are spare.
-#define HANDLE_CACHE_SLOTS 32
-
-// Create this file to hold the game's files open instead of closing them. Off,
-// for the sixth time and now for a reason that is not about the bookkeeping.
-//
-// The directory cache did what it was built for -- nine listings answered 4938
-// questions and only 508 went to a stat -- and the total still lost, 60.7 s
-// against 54.5 s. With the stats gone, what is left has no explanation left to
-// hide behind:
-//
-//   no cache    5379 first opens at  3.49 ms
-//   with cache  5379 first opens at 10.07 ms
-//
-// A first open costs three times as much whenever this is on. That held in all
-// five earlier builds too, at two handles held and at twenty-eight, so it does
-// not scale with how many are kept and it is not a table being scanned. The
-// saving on repeats is real and almost exactly cancelled by it. Until that is
-// understood there is nothing here to tune.
-//
-//   build                first ms  ms each   repeat ms  ms each     total
-//   no cache                18478     3.49       36017     2.91     54.5 s
-//   drain thrash            54197    10.10       31874     2.57     86.1 s
-//   stat on failure         61896    11.35        7363     0.58     69.3 s
-//   remember, scan          72547    13.41        5765     0.46     78.3 s
-//   remember, indexed       62390    11.69        5719     0.46     68.1 s
-//
-// Holding handles always worked: a repeat open costs what a first one costs,
-// and handing back a held handle removes the whole of it, 2.91 ms to 0.46 ms.
-// What lost was the price of knowing when a failed open was this cache's own
-// doing. Two thirds of the game's opens are probes for files that are not
-// there, and asking the filesystem about each one cost more than the 30 s the
-// handles saved.
-//
-// The directory cache answers that question from one listing per directory
-// instead of one question per file, so the cost that sank this is gone and the
-// saving is not. It matters most where it is least visible in a session total:
-// a twenty second freeze does 1752 opens, 1168 of them repeats, which is about
-// 2.9 s of it.
-#define HANDLE_CACHE_ENABLE_PATH DATA_PATH "/" "use_handlecache"
-
-
-// Create this file to buffer the game's reads. Off by default, because on this
-// hardware it loses, and the arithmetic says it always will.
-//
-// The cache works -- it serves the reads it claims to serve -- and it still
-// loses, for a reason that took four traces to see.
-//
-//                    asked   card reads   MB    seconds
-//   no cache         24194        24194   280      124.1
-//   64K, separate    21573        18553   489      190.7
-//   8K+, combined    25326        18168   315      135.6
-//
-// The combined-fetch run took 7158 card reads out of the game's path. Reads in
-// that session averaged 5.1 ms, so that should have been worth half a minute.
-// It was worth nothing: the run lost 11.5 s. Its own counters say why. It
-// fetched 51.3 MB ahead and served 11.9 MB of it, so 39.4 MB was moved for
-// nothing -- and at the ~2.9 MB/s the card sustains, 39.4 MB is 13.7 s, which
-// is the loss almost exactly.
-//
-// So the reads read-ahead removes cost about nothing to begin with. Something
-// under fread already holds sequential bytes; asking for the next 8 KB early
-// only duplicates a buffer that exists, and the duplicate is paid for in real
-// card traffic. The reads that do cost are the other kind. In the two freezes
-// of a later session -- 25.8 s with no frame presented -- the game did
-// 2866 reads for 20 MB: 83% of them under 4 KB, 38% behind a seek, 0.76 MB/s
-// against the 2.61 MB/s it manages while playing. Those are misses in whatever
-// buffer sits below, and they are scattered, so read-ahead cannot see them
-// coming.
-//
-// The switch and the code stay, because a faster card changes the arithmetic
-// and the trace reports what the cache did either way. It is off unless asked
-// for.
-#define READ_CACHE_ENABLE_PATH DATA_PATH "/" "use_readcache"
-
-
-
-// How much texture data the game is allowed to keep resident. The Android
-// build never evicts anything, so this is what keeps it inside what vitaGL can
-// hand out on a Vita (128MB of CDRAM plus whatever is left of main RAM once the
-// game heap above has been carved out).
-// Reclaim to keep this much of vitaGL's memory free, as a percentage of what it
-// had when the game started drawing. A byte budget cannot work on its own: it
-// only counts textures this cache tracks, while framebuffers, vertex buffers,
-// shader programs, render targets and untracked textures come out of the same
-// pools. Free memory counts all of it.
-//
-// Measured against the RAM and phycont pools, not CDRAM. CDRAM running to zero
-// is normal and not a problem: vitaGL allocates from it first and falls back to
-// RAM, so an empty CDRAM alongside 75 MB of free RAM is the allocator working
-// as designed. Treating it as pressure made the cache evict continuously
-// against a shortage that did not exist, and on hardware that was the
-// difference between playable and 1-5 frames a second. It is the RAM pool
-// draining that is dangerous, because what lies past it is the newlib heap the
-// game is using.
-// How much of the stick's travel does nothing.
-//
-// The port shipped with a quarter of it dead and the value clipped rather than
-// rescaled, so the stick did nothing at all until it was 25% over and then
-// jumped to 0.25. This is enough to cover the drift a worn Vita stick has and
-// no more, and what is left of the travel is stretched back over the full range
-// so that a small push gives a small number.
-#define PAD_DEADZONE 0.12f
-
-// A frame gap longer than this is a stall rather than a slow frame, and the
-// trace prints what changed during it. Four display periods: past anything the
-// game hits while running normally, so the line only appears for the tail that
-// is left once the per-frame costs are gone.
-#define FRAME_STALL_MS 100
-
 // The longest the cache will go without asking vitaGL how much of each pool is
 // free, and how fast it assumes a pool can drain while it is not asking.
 //
@@ -402,7 +277,6 @@
 // Upper bound on how many textures a single frame may evict, so that reclaiming
 // memory does not turn into a visible hitch.
 #define TEXTURE_EVICTIONS_PER_FRAME 64
-
 
 // Evicted textures are held in the newlib heap up to this much, and only spill
 // to the memory card past it. The heap is not GPU-mappable, so a texture parked
@@ -471,8 +345,6 @@
 #define DATA_PATH "ux0:data/Bully"
 #define SO_PATH DATA_PATH "/" "libBully.so"
 #define CONFIG_PATH DATA_PATH "/" "config.txt"
-#define GLSL_PATH DATA_PATH "/" "glsl"
-#define GXP_PATH DATA_PATH "/" "gxp"
 
 #define SCREEN_W 960
 #define SCREEN_H 544

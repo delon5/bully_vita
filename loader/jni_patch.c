@@ -6,14 +6,11 @@
  * of the MIT license.  See the LICENSE file for details.
  */
 
-#include <psp2/kernel/processmgr.h>
-#include <psp2/kernel/threadmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/ctrl.h>
 #include <psp2/touch.h>
 #include <vitaGL.h>
 
-#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -21,8 +18,6 @@
 #include "main.h"
 #include "config.h"
 #include "so_util.h"
-#include "texture_cache.h"
-#include "vertex_cache.h"
 
 enum MethodIDs {
   UNKNOWN = 0,
@@ -71,26 +66,6 @@ static NameToMethodID name_to_method_ids[] = {
   { "GetGamepadAxis", GET_GAMEPAD_AXIS },
 };
 
-#ifdef LOADER_TRACE
-// Each JNI entry point the game reaches is logged once, so a trace shows how
-// far startup got without drowning the file in per-frame lines.
-static void trace_jni_once(int methodID) {
-  static uint32_t seen;
-  if (methodID <= 0 || methodID >= 32 || (seen & (1u << methodID)))
-    return;
-  seen |= 1u << methodID;
-  for (int i = 0; i < (int)(sizeof(name_to_method_ids) / sizeof(name_to_method_ids[0])); i++) {
-    if (name_to_method_ids[i].id == (enum MethodIDs)methodID) {
-      traceLog("jni: first call to %s\n", name_to_method_ids[i].name);
-      return;
-    }
-  }
-  traceLog("jni: first call to method %d\n", methodID);
-}
-#else
-#define trace_jni_once(id) ((void)0)
-#endif
-
 static char fake_vm[0x1000];
 static char fake_env[0x1000];
 static void *natives;
@@ -110,46 +85,8 @@ int GetDeviceLocale(void) {
   return 0; // english
 }
 
-// One buffer per port, not one shared between them.
-//
-// GetGamepadType(0) reads the Vita's own controls; GetGamepadType(1) reads
-// port 2, where an external controller would be. Both used to peek into the
-// same SceCtrlData, and GetGamepadAxis ignored its port argument entirely and
-// read whatever was left there. The pad line counts two hardware samples per
-// pass of the game's loop, so the second peek succeeds even with nothing
-// plugged in -- meaning the real reading was being overwritten by an empty one
-// every pass, and which of the two the game saw depended on the order it
-// happened to call them in.
-static SceCtrlData pad[2];
+static SceCtrlData pad;
 static SceTouchData touch_front, touch_back;
-
-// The pad is read from the hardware here and nowhere else: GetGamepadAxis and
-// GetGamepadButtons below both work off this one cached sample. So how fresh a
-// stick reading is depends entirely on how often the game asks for the type,
-// and nothing has ever counted that. If it is once a frame then the sticks are
-// sampled at the frame rate, which is 6 to 8 a second in a load, and no amount
-// of work on file I/O will make them feel different.
-unsigned pad_samples, pad_axis_reads, pad_button_reads;
-
-// The extremes each stick actually reaches. 635 samples a second says the pad
-// is read often enough; it says nothing about what comes back. A stick that
-// only ever reads 60 to 195 instead of 0 to 255 feels dead at the edges however
-// often it is polled, and that is what a sampling mode other than ANALOG_WIDE,
-// or a deadzone applied somewhere below, would look like. Push each stick to
-// its corners and the trace says whether the loader sees it.
-unsigned char pad_lo[2][4] = { { 255, 255, 255, 255 }, { 255, 255, 255, 255 } };
-unsigned char pad_hi[2][4];
-
-static void pad_note_range(int port) {
-  const unsigned char v[4] = { pad[port].lx, pad[port].ly, pad[port].rx,
-                               pad[port].ry };
-  for (int i = 0; i < 4; i++) {
-    if (v[i] < pad_lo[port][i])
-      pad_lo[port][i] = v[i];
-    if (v[i] > pad_hi[port][i])
-      pad_hi[port][i] = v[i];
-  }
-}
 
 // 0, 5, 6: XBOX 360
 // 4: MogaPocket
@@ -161,10 +98,8 @@ int GetGamepadType(int port) {
   if (port != 0 && port != 1)
     return -1;
 
-  if (sceCtrlPeekBufferPositiveExt2(port == 0 ? 0 : 2, &pad[port], 1) < 0)
+  if (sceCtrlPeekBufferPositiveExt2(port == 0 ? 0 : 2, &pad, 1) < 0)
     return -1;
-  pad_samples++;
-  pad_note_range(port);
 
   if (port == 0) {
     sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch_front, 1);
@@ -176,38 +111,34 @@ int GetGamepadType(int port) {
 
 int GetGamepadButtons(int port) {
   int mask = 0;
-  pad_button_reads++;
-  if (port != 0 && port != 1)
-    return 0;
-  const SceCtrlData *p = &pad[port];
 
-  if (p->buttons & SCE_CTRL_CROSS)
+  if (pad.buttons & SCE_CTRL_CROSS)
     mask |= 0x1;
-  if (p->buttons & SCE_CTRL_CIRCLE)
+  if (pad.buttons & SCE_CTRL_CIRCLE)
     mask |= 0x2;
-  if (p->buttons & SCE_CTRL_SQUARE)
+  if (pad.buttons & SCE_CTRL_SQUARE)
     mask |= 0x4;
-  if (p->buttons & SCE_CTRL_TRIANGLE)
+  if (pad.buttons & SCE_CTRL_TRIANGLE)
     mask |= 0x8;
-  if (p->buttons & SCE_CTRL_START)
+  if (pad.buttons & SCE_CTRL_START)
     mask |= 0x10;
-  if (p->buttons & SCE_CTRL_SELECT)
+  if (pad.buttons & SCE_CTRL_SELECT)
     mask |= 0x20;
-  if (p->buttons & SCE_CTRL_L1)
+  if (pad.buttons & SCE_CTRL_L1)
     mask |= 0x40;
-  if (p->buttons & SCE_CTRL_R1)
+  if (pad.buttons & SCE_CTRL_R1)
     mask |= 0x80;
-  if (p->buttons & SCE_CTRL_UP)
+  if (pad.buttons & SCE_CTRL_UP)
     mask |= 0x100;
-  if (p->buttons & SCE_CTRL_DOWN)
+  if (pad.buttons & SCE_CTRL_DOWN)
     mask |= 0x200;
-  if (p->buttons & SCE_CTRL_LEFT)
+  if (pad.buttons & SCE_CTRL_LEFT)
     mask |= 0x400;
-  if (p->buttons & SCE_CTRL_RIGHT)
+  if (pad.buttons & SCE_CTRL_RIGHT)
     mask |= 0x800;
-  if (p->buttons & SCE_CTRL_L3)
+  if (pad.buttons & SCE_CTRL_L3)
     mask |= 0x1000;
-  if (p->buttons & SCE_CTRL_R3)
+  if (pad.buttons & SCE_CTRL_R3)
     mask |= 0x2000;
 
   if (port == 0) {
@@ -227,202 +158,61 @@ int GetGamepadButtons(int port) {
   return mask;
 }
 
-// A stick reading with the dead zone taken out of it, rather than clipped
-// against it.
-//
-// The original was "return the value if it is past a quarter, otherwise zero".
-// That does two things at once: it ignores the first 25% of stick travel, which
-// is a very large dead area, and then the moment the stick crosses it the value
-// jumps straight from 0 to 0.25. A stick that does nothing and then lurches is
-// what an unresponsive one feels like.
-//
-// Taking the dead zone out instead means the value leaves zero smoothly and
-// still reaches 1 at full travel, so small movements are small rather than
-// absent.
-static float stick(float v) {
-  float mag = v < 0.0f ? -v : v;
-  if (mag <= PAD_DEADZONE)
-    return 0.0f;
-  float scaled = (mag - PAD_DEADZONE) / (1.0f - PAD_DEADZONE);
-  if (scaled > 1.0f)
-    scaled = 1.0f;
-  return v < 0.0f ? -scaled : scaled;
-}
-
 float GetGamepadAxis(int port, int axis) {
-  pad_axis_reads++;
-  if (port != 0 && port != 1)
-    return 0.0f;
-  const SceCtrlData *p = &pad[port];
+  float val = 0.0f;
 
   switch (axis) {
     case 0:
-      return stick(((float)p->lx - 128.0f) / 128.0f);
+      val = ((float)pad.lx - 128.0f) / 128.0f;
+      break;
     case 1:
-      return stick(((float)p->ly - 128.0f) / 128.0f);
+      val = ((float)pad.ly - 128.0f) / 128.0f;
+      break;
     case 2:
-      return stick(((float)p->rx - 128.0f) / 128.0f);
+      val = ((float)pad.rx - 128.0f) / 128.0f;
+      break;
     case 3:
-      return stick(((float)p->ry - 128.0f) / 128.0f);
+      val = ((float)pad.ry - 128.0f) / 128.0f;
+      break;
     case 4: // L2
     case 5: // R2
-      // Held either as a real trigger or as a corner of the front touch panel.
-      // No dead zone applies: these are already all or nothing.
-      if (axis == 4 && (p->buttons & SCE_CTRL_L2))
-        return 1.0f;
-      if (axis == 5 && (p->buttons & SCE_CTRL_R2))
-        return 1.0f;
+    {
+      if (axis == 4 && pad.buttons & SCE_CTRL_L2) {
+        val = 1.0f;
+        break;
+      } else if (axis == 5 && pad.buttons & SCE_CTRL_R2) {
+        val = 1.0f;
+        break;
+      }
+
       if (port == 0) {
         for (int i = 0; i < touch_front.reportNum; i++) {
           if (touch_front.report[i].y < (panelInfoFront.minAaY + panelInfoFront.maxAaY) / 2) {
             if (touch_front.report[i].x < (panelInfoFront.minAaX + panelInfoFront.maxAaX) / 2) {
-              if (touch_front.report[i].x >= TOUCH_X_MARGIN && axis == 4)
-                return 1.0f;
+              if (touch_front.report[i].x >= TOUCH_X_MARGIN)
+                if (axis == 4) val = 1.0f;
             } else {
-              if (touch_front.report[i].x < (panelInfoFront.maxAaX - TOUCH_X_MARGIN) && axis == 5)
-                return 1.0f;
+              if (touch_front.report[i].x < (panelInfoFront.maxAaX - TOUCH_X_MARGIN))
+                if (axis == 5) val = 1.0f;
             }
           }
         }
       }
-      return 0.0f;
+    }
   }
+
+  if (fabsf(val) > 0.25f)
+    return val;
+
   return 0.0f;
 }
 
-// Presented frames. Read by the trace heartbeat to work out the real frame
-// rate, which is worth measuring rather than assuming: vsync is off, so
-// whatever the game reaches is what the hardware can do, not a cap.
-int frames_swapped;
-
-#ifdef LOADER_TRACE
-// vitaGL skips the display queue entirely while a framebuffer object is bound,
-// so a game that leaves one bound at swap time renders perfectly and shows
-// nothing. Read the frame back too: content in the surface with a black panel
-// is a presentation fault, a black surface is the game drawing nothing.
-extern void *in_use_framebuffer;
-
-static void trace_frame_contents(int n) {
-  uint32_t px[64];
-  int lit = 0;
-  for (int y = 0; y < 8; y++) {
-    glReadPixels(0, y * (SCREEN_H / 8), 8, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    for (int i = 0; i < 8; i++)
-      if ((px[i] & 0x00ffffff) != 0)
-        lit++;
-  }
-  glReadPixels(SCREEN_W / 2, SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-  traceLog("frame: %d readback centre 0x%08x, %d/64 lit, fbo bound %p\n",
-           n, px[0], lit, in_use_framebuffer);
-}
-#endif
-
-extern SceUID presenting_thread;
-
-/* Frame pacing.
- *
- * Every frame rate in this trace so far is frames divided by heartbeat, which
- * is an average over one to three seconds. That can say the game ran at 20 a
- * second; it cannot tell a steady 50 ms frame from one that alternates 17 and
- * 83, and those are the same number and completely different to play. So
- * measure the thing itself: the gap between one frame being presented and the
- * next.
- *
- * Bucketed by display periods rather than round milliseconds, because the
- * screen only changes every 16.7 ms and a frame that misses one waits for the
- * next. A run of alternating one-period and two-period frames is the judder
- * that shows up as stutter at an otherwise respectable average.
- *
- * Split three ways as well, so a slow frame can be attributed: time inside
- * vglSwapBuffers is waiting for the display, time in the two cache ticks is
- * this loader's own per-frame cost, and whatever is left is the game.
- */
-static unsigned frame_periods[8]; // 1, 2, 3, 4, 5-6, 7-12, 13-30, more
-unsigned frame_measured, frame_judder, frame_worst_us;
-unsigned long long frame_span_us, frame_swap_us, frame_tick_us;
-unsigned long long frame_texture_tick_us, frame_vertex_tick_us;
-
-// The histogram is static so the counting stays cheap; this hands out a copy.
-void frame_pacing_snapshot(unsigned out[8]) {
-  for (int i = 0; i < 8; i++)
-    out[i] = frame_periods[i];
-}
-
-static unsigned frame_now_us(void) {
-  SceKernelSysClock now;
-  sceKernelGetProcessTime(&now);
-  return (unsigned)now;
-}
-
-// One display period is 16667 us. Anything under one and a half of them
-// counts as having hit the period it was aiming at.
-extern void trace_frame_io(unsigned ms, int stalled);
-
-static void frame_note_interval(unsigned us) {
-  static unsigned previous_us;
-  // Called every frame so that the difference it takes covers this frame and
-  // not everything back to the last stall; it prints only when the frame was
-  // long enough to be a stall rather than a busy frame.
-  trace_frame_io(us / 1000u, us > FRAME_STALL_MS * 1000u);
-  unsigned periods = (us + 8333u) / 16667u;
-  unsigned slot = periods <= 1   ? 0
-                  : periods == 2 ? 1
-                  : periods == 3 ? 2
-                  : periods == 4 ? 3
-                  : periods <= 6 ? 4
-                  : periods <= 12 ? 5
-                  : periods <= 30 ? 6
-                                  : 7;
-  frame_periods[slot]++;
-  frame_measured++;
-  frame_span_us += us;
-  if (us > frame_worst_us)
-    frame_worst_us = us;
-  // Judder is the change between one frame and the next, not the frame time
-  // itself: half a display period is enough to see.
-  if (previous_us) {
-    unsigned d = us > previous_us ? us - previous_us : previous_us - us;
-    if (d > 8333u)
-      frame_judder++;
-  }
-  previous_us = us;
-}
-
 int swapBuffers(void) {
-  if (!presenting_thread)
-    presenting_thread = sceKernelGetThreadId();
-
-  if (frames_swapped < 3 || frames_swapped == 60 || frames_swapped == 600)
-    traceLog("frame: %d presented\n", frames_swapped);
-#ifdef LOADER_TRACE
-  if (frames_swapped < 3 || frames_swapped == 60 || frames_swapped == 600)
-    trace_frame_contents(frames_swapped);
-#endif
-  frames_swapped++;
-
-  // Taken before this frame's work, so the interval spans presenting one frame
-  // to presenting the next -- which is what the player sees.
-  static unsigned last_swap_us;
-  unsigned t0 = frame_now_us();
-  if (last_swap_us && t0 > last_swap_us)
-    frame_note_interval(t0 - last_swap_us);
-  last_swap_us = t0;
-
-  texture_cache_tick();
-  unsigned tmid = frame_now_us();
-  vertex_cache_tick();
-  unsigned t1 = frame_now_us();
-  frame_texture_tick_us += tmid - t0;
-  frame_vertex_tick_us += t1 - tmid;
   vglSwapBuffers(GL_FALSE);
-  unsigned t2 = frame_now_us();
-  frame_tick_us += t1 - t0;
-  frame_swap_us += t2 - t1;
   return 1;
 }
 
 int InitEGLAndGLES2(void) {
-  traceLog("game: InitEGLAndGLES2\n");
   vglWaitVblankStart(GL_FALSE);
   return 1;
 }
@@ -461,7 +251,6 @@ int DeleteFile(char *file) {
 }
 
 int CallBooleanMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
-  trace_jni_once(methodID);
   switch (methodID) {
     case INIT_EGL_AND_GLES2:
       return InitEGLAndGLES2();
@@ -481,7 +270,6 @@ int CallBooleanMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 }
 
 float CallFloatMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
-  trace_jni_once(methodID);
   switch (methodID) {
     case GET_GAMEPAD_AXIS:
       return GetGamepadAxis(args[0], args[1]);
@@ -493,7 +281,6 @@ float CallFloatMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 }
 
 int CallIntMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
-  trace_jni_once(methodID);
   switch (methodID) {
     case GET_GAMEPAD_TYPE:
       return GetGamepadType(args[0]);
@@ -513,7 +300,6 @@ int CallIntMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 }
 
 void *CallObjectMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
-  trace_jni_once(methodID);
   switch (methodID) {
     case GET_APP_LOCAL_VALUE:
       return getAppLocalValue((char *)args[0]);
@@ -525,7 +311,6 @@ void *CallObjectMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 }
 
 void CallVoidMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
-  trace_jni_once(methodID);
   return;
 }
 

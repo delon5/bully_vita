@@ -11,7 +11,6 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
-#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/appmgr.h>
 #include <psp2/apputil.h>
@@ -19,11 +18,7 @@
 #include <psp2/power.h>
 #include <psp2/rtc.h>
 #include <psp2/touch.h>
-#include <psp2/display.h>
-#include <psp2/gxm.h>
 #include <kubridge.h>
-
-#include <vitashark.h>
 #include <vitashark.h>
 #include <vitaGL.h>
 
@@ -50,20 +45,14 @@
 #include "config.h"
 #include "dialog.h"
 #include "fios.h"
-#include "game_memory.h"
-#include "dir_cache.h"
-#include "handle_cache.h"
-#include "read_cache.h"
 #include "so_util.h"
 #include "jni_patch.h"
 #include "movie_patch.h"
 #include "openal_patch.h"
-#include "alloc_trace.h"
-#include "streaming_patch.h"
-#include "vertex_cache.h"
-#include "texture_cache.h"
 
-#include "sha1.h"
+#include "streaming_patch.h"
+#include "texture_cache.h"
+#include "vertex_cache.h"
 
 #include "libc_bridge.h"
 
@@ -80,16 +69,6 @@ SceTouchPanelInfo panelInfoFront;
 so_module bully_mod;
 
 void *__wrap_memcpy(void *dest, const void *src, size_t n) {
-  // A sample of the game's memcpy callers, for the profile in game_memory.c.
-  //
-  // The decision comes from the destination pointer, not from a counter. A
-  // counter here would be one shared cache line written by four threads on the
-  // hottest path in the process, which is the shape of the mistake that turned
-  // area loads into a slideshow when the allocation tracer took a lock per
-  // malloc. This is a pure function of an argument already in a register:
-  // roughly one call in 256, and nothing shared is touched on the other 255.
-  if ((((uintptr_t)dest >> 6) & 0xff) == 0)
-    game_memory_note_caller(__builtin_return_address(0));
   return sceClibMemcpy(dest, src, n);
 }
 
@@ -111,565 +90,6 @@ int debugPrintf(char *text, ...) {
   va_end(list);
 
   SceUID fd = sceIoOpen("ux0:data/bully_log.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-  if (fd >= 0) {
-    sceIoWrite(fd, string, strlen(string));
-    sceIoClose(fd);
-  }
-#endif
-  return 0;
-}
-
-// vitaGL calls this for every error it reports when built with LOG_ERRORS.
-// Its own vgl_log is sceClibPrintf, which goes to a debug console that is not
-// attached on a retail Vita, so point it at the trace file instead.
-void vgl_file_log(const char *fmt, ...) {
-#ifdef LOADER_TRACE
-  va_list list;
-  char string[512];
-
-  va_start(list, fmt);
-  vsnprintf(string, sizeof(string), fmt, list);
-  va_end(list);
-
-  traceLog("vgl: %s", string);
-#endif
-}
-
-/*
- * Where an area load's time actually goes, part two
- *
- * Timing the texture path answered its own question and closed it: over a
- * session, 4363 ms inside vitaGL uploading and 312 ms inside the loader's cache
- * on top. During a five heartbeat freeze with no frame presented at all, the
- * whole texture path came to 175 ms. It is not the textures.
- *
- * So measure the other half. The game reads its archives through fread, and the
- * loader put a FIOS RAM cache in front of that and then halved it -- from 1024
- * blocks to 512, twice over, because the heap was running out and the cache was
- * the largest single allocation in the process. That was the right call for the
- * crash and it has never been checked against the stutter it might have bought.
- *
- * Same method: sample the calls, time them, and let the trace say. A read that
- * misses the cache goes to a memory card, and a memory card is slow enough that
- * a few hundred of them is a freeze.
- */
-// One in eight now, not one in thirty-two. At thirty-two a stalled heartbeat
-// held six samples, and one slow outlier among them scaled to 3556 ms of
-// reading inside a heartbeat that cannot have lasted more than about a second.
-// The session total was sound; the per-heartbeat figures were not.
-#define IO_SAMPLE 8
-static uint32_t io_reads, io_samples, io_seeks, io_sequential, io_asked;
-static uint64_t io_read_us, io_read_bytes, io_seek_us;
-// Read sizes, in buckets: under 4K, under 16K, under 64K, and the rest. 375 MB
-// arrived in 49894 reads at 2.8 ms each, which is 2.7 MB/s off a card that does
-// fifteen or more -- the shape of per-call latency rather than of bandwidth.
-// Whether coalescing them would help depends entirely on whether they are
-// sequential, and that has never been looked at.
-static uint32_t io_size_buckets[4];
-
-static uint32_t io_now_us(void) {
-  SceKernelSysClock now;
-  sceKernelGetProcessTime(&now);
-  return (uint32_t)now;
-}
-
-// Whether this read carried on from where the last one on the same file ended.
-// A run of those is a stream and coalescing it would pay; a file that is seeked
-// around between every read would only waste the bandwidth.
-static FILE *io_last_stream;
-static long io_last_end;
-
-// Reading is 26-31% of wall clock in a load-heavy session, but that only costs
-// frames if it happens on the thread that presents them. The game runs a
-// CDStreamThread; if the reads are there, they overlap with drawing and the
-// figure means much less than it looks. Cheap to settle: bucket the time by
-// thread and mark whichever one calls swapBuffers.
-#define IO_THREADS 8
-static SceUID io_tid[IO_THREADS];
-static uint64_t io_tid_us[IO_THREADS];
-static uint32_t io_tid_reads[IO_THREADS];
-// The name as well as the id. The first run of this said all the reading
-// happened on threads that do not present frames -- which is only half an
-// answer, because the game can still be sitting blocked waiting for them. Which
-// thread it is decides that: SceFiosIO is the streamer doing its job in the
-// background, GameMain is the game itself stopped dead on a read.
-static char io_tid_name[IO_THREADS][32];
-SceUID presenting_thread; // set in jni_patch.c's swapBuffers
-
-static void io_note_thread(SceUID tid, uint32_t us) {
-  for (int i = 0; i < IO_THREADS; i++) {
-    if (io_tid[i] == tid || !io_tid[i]) {
-      if (!io_tid[i]) {
-        io_tid[i] = tid;
-        // Once per thread, not per read: this walks the kernel's thread table.
-        SceKernelThreadInfo info;
-        memset(&info, 0, sizeof(info));
-        info.size = sizeof(info);
-        if (sceKernelGetThreadInfo(tid, &info) >= 0)
-          snprintf(io_tid_name[i], sizeof(io_tid_name[i]), "%s", info.name);
-        else
-          snprintf(io_tid_name[i], sizeof(io_tid_name[i]), "?");
-      }
-      io_tid_us[i] += us;
-      io_tid_reads[i]++;
-      return;
-    }
-  }
-}
-
-// Every read that actually reaches the card, whether the game asked for it or
-// the cache read ahead. The timing sits here rather than around the cache so
-// that read-ahead is charged for: a scheme that halves the game's waiting by
-// moving three times the bytes is not an improvement, and putting the clock on
-// the outside would have hidden that.
-static size_t raw_fread(void *ptr, size_t size, size_t count, FILE *stream) {
-  int timed = ++io_reads % IO_SAMPLE == 0;
-  uint32_t t0 = timed ? io_now_us() : 0;
-  size_t got = sceLibcBridge_fread(ptr, size, count, stream);
-  if (timed) {
-    uint32_t spent = io_now_us() - t0;
-    io_read_us += spent;
-    io_samples++;
-    io_note_thread(sceKernelGetThreadId(), spent);
-  }
-  io_read_bytes += got * size;
-  return got;
-}
-
-static unsigned read_cache_thread_id(void) { return (unsigned)sceKernelGetThreadId(); }
-
-// On by a file on the card. Off by default: measured, it loses here. See the
-// cost model over READ_CACHE_ENABLE_PATH in config.h.
-static int read_cache_on;
-
-// Defined with the rest of the visit accounting further down; declared here
-// because the read hook is above it.
-static void visit_read(FILE *f, size_t bytes);
-
-static size_t traced_fread(void *ptr, size_t size, size_t count, FILE *stream) {
-  size_t want = size * count;
-  io_size_buckets[want < 4096 ? 0 : want < 16384 ? 1 : want < 65536 ? 2 : 3]++;
-  io_asked++;
-
-  long start = sceLibcBridge_ftell(stream);
-  if (stream == io_last_stream && start == io_last_end)
-    io_sequential++;
-
-  size_t got = read_cache_on ? read_cache_fread(ptr, size, count, stream)
-                             : raw_fread(ptr, size, count, stream);
-
-  io_last_stream = stream;
-  io_last_end = start + (long)(got * size);
-  visit_read(stream, got * size);
-  return got;
-}
-
-// Opening files, which nothing here has ever counted. The freeze on walking
-// into a new area allocates 30% of its blocks inside NvFOpen and OS_FileOpen
-// and another 22% inside DecryptText and ReadBuffer::PopString: the game is
-// opening a pile of small files and parsing strings out of them, not streaming
-// textures. 83% of the reads in that window are under 4K and 38% of them follow
-// a seek, which is the shape of many short files rather than one long one.
-//
-// If the cost is in the opens, caching whole small files by path would remove
-// it -- but only if the same files come back, and nothing measured yet says
-// whether they do. So count them: how many, how long, and how many are a path
-// that has already been opened once. Opens are rare enough next to reads to
-// time every one rather than sample.
-#define OPEN_PATHS 8192
-static uint32_t io_opens, io_reopens, io_opens_writing;
-// Every distinct file the game opens, and what they come to. The answer to
-// whether spare memory can hold the lot.
-static uint32_t opened_files;
-static uint64_t opened_bytes;
-// Split, because the whole question is whether the repeats are the expensive
-// ones. 70% of opens are a path already opened and an open averages 3.1 ms, so
-// holding the handle instead of closing it looks like 38 s a session -- but
-// that is exactly the arithmetic the read cache got wrong, where the calls it
-// removed turned out to be the cheap ones. One average over both kinds cannot
-// tell the two cases apart, so keep two.
-static uint64_t io_open_first_us, io_open_again_us;
-static uint32_t open_path_hash[OPEN_PATHS];
-static uint32_t io_open_distinct;
-
-// FNV-1a over the path. Collisions cost a miscounted reopen and nothing else.
-static uint32_t open_hash(const char *path) {
-  uint32_t h = 2166136261u;
-  while (*path)
-    h = (h ^ (unsigned char)*path++) * 16777619u;
-  return h ? h : 1;
-}
-
-// Linear probe. Once the probe runs out of room the reopen count is no longer
-// a floor or a ceiling, just wrong, so say so in the trace instead of quietly
-// reporting a number nobody can use.
-//
-// Four threads open files and none of this is locked, which costs a miscount
-// when two of them claim the same empty slot at once and is not worth a lock:
-// the counters either side of it are already racy in the same way, and the
-// question here is whether reopens are thousands or tens, not what the exact
-// figure is.
-static uint32_t io_open_unplaced;
-
-static int open_seen_before(const char *path) {
-  uint32_t h = open_hash(path);
-  for (uint32_t i = 0; i < 64; i++) {
-    uint32_t slot = (h + i) & (OPEN_PATHS - 1);
-    if (open_path_hash[slot] == h)
-      return 1;
-    if (!open_path_hash[slot]) {
-      open_path_hash[slot] = h;
-      io_open_distinct++;
-      return 0;
-    }
-  }
-  io_open_unplaced++;
-  return 0;
-}
-
-// On unless a file on the card says otherwise, so the two can be compared on
-// hardware without a rebuild.
-static int handle_cache_on;
-
-// Only ever called when an open has already failed, to tell "there is no such
-// file" apart from "there are no descriptors left".
-//
-// Asking about the file cost 43 s a session, more than holding handles saved,
-// because two thirds of this game's opens are probes for files that are not
-// there. Asking about the directory once answers for every file in it.
-static int stat_one_file(const char *path) {
-  SceIoStat st;
-  return path && sceIoGetstat(path, &st) >= 0;
-}
-
-static int open_dir(const char *path) { return sceIoDopen(path); }
-
-static int read_dir(int handle, char *name, int size) {
-  SceIoDirent entry;
-  memset(&entry, 0, sizeof(entry));
-  if (sceIoDread(handle, &entry) <= 0)
-    return 0;
-  snprintf(name, size, "%s", entry.d_name);
-  return 1;
-}
-
-static void close_dir(int handle) { sceIoDclose(handle); }
-
-static int path_exists(const char *path) { return dir_cache_exists(path); }
-
-// The dir cache's lock. A real mutex rather than a spin, because a listing
-// happens under it and that is card I/O: a thread spinning through that on
-// the same core as the lister at a higher priority would never let it finish.
-static SceUID dir_cache_mutex;
-static void dir_cache_lock(void) { sceKernelLockMutex(dir_cache_mutex, 1, NULL); }
-static void dir_cache_unlock(void) { sceKernelUnlockMutex(dir_cache_mutex, 1); }
-
-// Two thirds of the opens in a session are for files that are not there:
-// around 11800 of 17500, and every one of them goes to the card. They have
-// never been timed apart from the opens that succeed, so the 60 s the open
-// counter reports is an average over two things that have nothing to do with
-// each other, which is the mistake the read cache and the handle cache were
-// both built on.
-//
-// Time them apart, and count the directories they fall in. A probe that finds
-// nothing can only be answered from memory if the directory it is in has been
-// listed, so the number of distinct directories is the difference between a
-// listing that answers for thousands of probes and one that answers for a
-// handful. This only counts -- nothing is listed here and no answer changes.
-#define MISS_DIRS 64 // a power of two
-static uint32_t io_opens_missing, miss_dirs_used, miss_dirs_unplaced;
-static uint32_t io_opens_skipped; // never reached the card at all
-static uint64_t io_open_missing_us;
-static struct {
-  uint32_t hash;
-  uint32_t probes;
-  char path[96];
-} miss_dirs[MISS_DIRS];
-
-static void note_missing(const char *path, uint32_t spent) {
-  io_opens_missing++;
-  io_open_missing_us += spent;
-  if (!path)
-    return;
-
-  const char *cut = NULL;
-  for (const char *c = path; *c; c++)
-    if (*c == '/' || *c == ':')
-      cut = c;
-  int len = cut ? (int)(cut - path) : 0;
-  if (len <= 0 || len >= (int)sizeof(miss_dirs[0].path)) {
-    miss_dirs_unplaced++;
-    return;
-  }
-
-  uint32_t h = 2166136261u;
-  for (int i = 0; i < len; i++)
-    h = (h ^ (unsigned char)path[i]) * 16777619u;
-  if (!h)
-    h = 1;
-  for (uint32_t i = 0; i < MISS_DIRS; i++) {
-    uint32_t slot = (h + i) & (MISS_DIRS - 1);
-    if (miss_dirs[slot].hash == h) {
-      miss_dirs[slot].probes++;
-      return;
-    }
-    if (!miss_dirs[slot].hash) {
-      miss_dirs[slot].hash = h;
-      miss_dirs[slot].probes = 1;
-      memcpy(miss_dirs[slot].path, path, len);
-      miss_dirs[slot].path[len] = 0;
-      miss_dirs_used++;
-      return;
-    }
-  }
-  miss_dirs_unplaced++; // more than MISS_DIRS directories, which is the answer
-}
-
-// How big are the files that get opened over and over? Holding the handle
-// stops the open costing anything, but the game still reads the bytes back off
-// the card every time, and a path-keyed cache of whole small files would stop
-// that too. What it would cost in memory, and what it would save, is the sum
-// of these -- and there is a lot of memory to spend: the newlib heap is capped
-// at 176 MB and three sessions running peaked at 90.
-//
-// Measured as the file position at close, which is the bytes consumed for
-// anything read start to finish. It is not that for a file seeked around in,
-// and the first run of this reported 64556 MB over 223 visits -- 290 MB each,
-// which is the offset reached inside the game's big archives rather than
-// anything read. Those are exactly the files a cache of whole small files
-// would never hold, so the totals only count visits below the cap, and the
-// ones above it are counted separately instead of poisoning the sum.
-#define VISIT_CACHEABLE (256 * 1024)
-#define VISIT_TRACKED 256
-static struct {
-  FILE *file;
-  int again;
-  uint64_t bytes;
-} visits[VISIT_TRACKED];
-static uint32_t visit_first, visit_again, visit_untracked, visit_too_big;
-static uint64_t visit_first_bytes, visit_again_bytes;
-static uint32_t visit_buckets[4]; // under 4K, 16K, 64K, and the rest
-
-static void visit_open(FILE *f, int again) {
-  for (int i = 0; i < VISIT_TRACKED; i++) {
-    if (!__atomic_load_n(&visits[i].file, __ATOMIC_RELAXED)) {
-      FILE *empty = NULL;
-      if (__atomic_compare_exchange_n(&visits[i].file, &empty, f, 0,
-                                      __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-        visits[i].again = again;
-        visits[i].bytes = 0;
-        return;
-      }
-    }
-  }
-  visit_untracked++;
-}
-
-// Bytes actually read, rather than the file position at close. The position
-// was what the first version of this used, and inside the game's big archives
-// it is the offset seeked to rather than anything read -- it reported 64556 MB
-// over 223 visits. Counting the reads themselves is the only way to answer
-// what a cache of file contents would have to hold and would save.
-static void visit_read(FILE *f, size_t bytes) {
-  for (int i = 0; i < VISIT_TRACKED; i++) {
-    if (__atomic_load_n(&visits[i].file, __ATOMIC_RELAXED) == f) {
-      visits[i].bytes += bytes;
-      return;
-    }
-  }
-}
-
-static void visit_close(FILE *f, long consumed) {
-  for (int i = 0; i < VISIT_TRACKED; i++) {
-    if (__atomic_load_n(&visits[i].file, __ATOMIC_RELAXED) == f) {
-      int again = visits[i].again;
-      __atomic_store_n(&visits[i].file, NULL, __ATOMIC_RELEASE);
-      if (consumed < 0)
-        return;
-      uint64_t bytes = visits[i].bytes;
-      if (bytes > VISIT_CACHEABLE) {
-        visit_too_big++;
-      } else if (again) {
-        visit_again++;
-        visit_again_bytes += bytes;
-      } else {
-        visit_first++;
-        visit_first_bytes += bytes;
-      }
-      consumed = (long)bytes;
-      visit_buckets[consumed < 4096 ? 0 : consumed < 16384 ? 1
-                    : consumed < 65536 ? 2 : 3]++;
-      return;
-    }
-  }
-}
-
-static FILE *traced_fopen(const char *path, const char *mode) {
-  // Before the open, so the timing below covers only the open itself. The
-  // split stays measured the same way with the cache in the path: an open the
-  // cache serves is still a repeat, it just stops costing anything, which is
-  // the whole point and shows up in this counter.
-  int again = path && open_seen_before(path);
-  int writing = mode && (strchr(mode, 'w') || strchr(mode, 'a') ||
-                         strchr(mode, '+'));
-
-  // A write can create the file, so a listing taken before it would go on
-  // saying "not there" about a file that now is. Drop the listing first, and
-  // never answer a write-mode open from one.
-  if (writing)
-    dir_cache_forget(path);
-
-  // The open that never happens.
-  //
-  // 11633 of a session's 17478 opens find nothing and cost 28.4 s between them,
-  // and they fall in 32 directories -- 91% of them in just two. One listing per
-  // directory answers for every probe into it, and answering costs nothing
-  // because it is a table lookup, not a question to the card.
-  //
-  // Only ever skipped on ABSENT, which dir_cache_lookup returns only from a
-  // complete listing of a directory that is there, or from a directory that is
-  // not there at all. UNKNOWN opens the file exactly as before. Getting this
-  // wrong the other way -- claiming absent for a file that exists -- hands the
-  // game a NULL it does not check, which is the crash this branch already had
-  // once, so the cache is built to be unable to say it.
-  if (!writing && path && dir_cache_lookup(path) == DIR_CACHE_ABSENT) {
-    io_opens++;
-    io_opens_skipped++;
-    note_missing(path, 0);
-    return NULL;
-  }
-
-  uint32_t t0 = io_now_us();
-  FILE *f = handle_cache_on ? handle_cache_fopen(path, mode)
-                            : sceLibcBridge_fopen(path, mode);
-  uint32_t spent = io_now_us() - t0;
-  // What the card said, checked against what the listing would have said. A
-  // listing only gets to answer "absent" once the card has agreed with it, and
-  // loses that the first time it is caught out.
-  if (!writing)
-    dir_cache_observe(path, f != NULL);
-  io_opens++;
-  if (again) {
-    io_reopens++;
-    io_open_again_us += spent;
-  } else {
-    io_open_first_us += spent;
-  }
-  // Anything holding handles open would have to leave these alone, so know how
-  // many there are before designing around them.
-  if (writing)
-    io_opens_writing++;
-  if (!f)
-    note_missing(path, spent);
-  if (f) {
-    visit_open(f, again);
-    // The first time a path is opened successfully, say what it is and how big.
-    //
-    // Thirty. That is how many distinct files the game actually opens in a
-    // session, against eleven thousand opens of paths that are not there, and
-    // between them those thirty account for 126 MB of the 248 MB read. Whether
-    // the idle 86 MB of heap can hold them is the whole question, and their
-    // sizes have never been looked at. Two seeks each, thirty times.
-    if (!again) {
-      long here = sceLibcBridge_ftell(f);
-      if (sceLibcBridge_fseek(f, 0, SEEK_END) == 0) {
-        long size = sceLibcBridge_ftell(f);
-        sceLibcBridge_fseek(f, here, SEEK_SET);
-        opened_bytes += size > 0 ? (uint64_t)size : 0;
-        opened_files++;
-        traceLog("file: %ld KB  %s\n", size / 1024, path);
-      }
-    }
-  }
-  return f;
-}
-
-static int traced_fclose(FILE *stream) {
-  visit_close(stream, sceLibcBridge_ftell(stream));
-  if (read_cache_on)
-    read_cache_forget(stream);
-  if (stream == io_last_stream)
-    io_last_stream = NULL;
-  // The handle may not actually close here -- it gets parked under its path so
-  // the next open of it costs nothing. Both the sequential tracking above and
-  // the read cache are dropped either way, because a parked handle comes back
-  // rewound and neither should carry state across that.
-  return handle_cache_on ? handle_cache_fclose(stream)
-                         : sceLibcBridge_fclose(stream);
-}
-
-static int traced_fseek(FILE *stream, long int offset, int origin) {
-  io_seeks++;
-  int timed = io_seeks % IO_SAMPLE == 0;
-  uint32_t t0 = timed ? io_now_us() : 0;
-  int r = sceLibcBridge_fseek(stream, offset, origin);
-  if (timed)
-    io_seek_us += io_now_us() - t0;
-  return r;
-}
-
-// What a stalled frame was made of, logged as it happens rather than averaged
-// into a heartbeat.
-//
-// Cutting the loader's per-frame cost from 8.2 ms to 0.9 ms changed nothing a
-// player would notice, and the pacing line says why: 94% of frames land on
-// exactly two display periods, so the frame had 33 ms of budget and the 8 ms
-// fitted inside it. What is left is entirely the tail -- sixty-odd intervals a
-// session that present nothing for over a tenth of a second, the worst of them
-// twenty seconds, coming to about fifty of the three hundred seconds a session
-// lasts.
-//
-// Averages cannot say what those are. A heartbeat holding one twenty second
-// stall reports the same read and open totals whether they happened during the
-// stall or around it.
-//
-// The first version of this could not say either, and looked like it could.
-// It only sampled the counters when it logged, so every line reported
-// everything since the previous stall -- all the ordinary frames in between
-// included -- under a heading that said "since the frame before". Summed over a
-// session it came to every read and every open the game made, which is how it
-// was caught. The snapshot has to happen on every frame for the difference to
-// mean the stall; only the printing is conditional.
-static uint32_t frame_was_reads, frame_was_opens, frame_was_reopens;
-static uint64_t frame_was_bytes, frame_was_read_us, frame_was_open_us;
-
-void trace_frame_io(unsigned ms, int stalled) {
-  uint64_t open_us = io_open_first_us + io_open_again_us;
-  if (stalled) {
-    TextureCacheStats cache;
-    texture_cache_stats(&cache);
-    uint32_t opens = io_opens - frame_was_opens;
-    uint32_t again = io_reopens - frame_was_reopens;
-    // Times, not counts multiplied by a session average: a stall is exactly
-    // where the average is least likely to hold. The read figure carries the
-    // one-in-eight sampling the io line uses, which over a couple of thousand
-    // reads is a few hundred samples and good enough to attribute a stall.
-    traceLog("stall: %u ms with no frame | %u reads, %u KB, %d ms | %u opens, "
-             "%u of them repeats, %d ms | %u textures, %u evicted, %u restored\n",
-             ms, (unsigned)(io_reads - frame_was_reads),
-             (unsigned)((io_read_bytes - frame_was_bytes) / 1024),
-             (int)((io_read_us - frame_was_read_us) * IO_SAMPLE / 1000), opens,
-             again, (int)((open_us - frame_was_open_us) / 1000), cache.tracked_mb,
-             cache.evicted, cache.restored);
-  }
-  frame_was_reads = io_reads;
-  frame_was_bytes = io_read_bytes;
-  frame_was_opens = io_opens;
-  frame_was_reopens = io_reopens;
-  frame_was_read_us = io_read_us;
-  frame_was_open_us = open_us;
-}
-
-int traceLog(char *text, ...) {
-#ifdef LOADER_TRACE
-  va_list list;
-  char string[512];
-
-  va_start(list, text);
-  vsnprintf(string, sizeof(string), text, list);
-  va_end(list);
-
-  SceUID fd = sceIoOpen("ux0:data/bully_trace.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
   if (fd >= 0) {
     sceIoWrite(fd, string, strlen(string));
     sceIoClose(fd);
@@ -708,27 +128,24 @@ int ret0(void) {
   return 0;
 }
 
-void glLinkProgramHook(GLuint prog) {
-  glLinkProgram(prog);
-#ifdef LOADER_TRACE
-  static int links;
-  if (links < 6) {
-    GLint linked = 0;
-    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
-    traceLog("program: %u link status %d, gl error 0x%x\n", prog, (int)linked, glGetError());
-  }
-  links++;
-#endif
-}
+// What the memory work reports through: which tiers came up, what the pools
+// held at the start, where the streaming budget settled. Rare events only --
+// nothing here runs per frame. Appended so a crash keeps what came before it.
+int traceLog(char *text, ...) {
+  va_list list;
+  char string[512];
 
-void glDrawElementsHook(GLenum mode, GLsizei count, GLenum type, const void *indices) {
-  glDrawElements(mode, count, type, indices);
-#ifdef LOADER_TRACE
-  extern int trace_draws;
-  if (trace_draws == 0 || trace_draws == 100 || trace_draws == 1000)
-    traceLog("draw: glDrawElements %d, %d indices, gl error 0x%x\n", trace_draws, count, glGetError());
-  trace_draws++;
-#endif
+  va_start(list, text);
+  vsnprintf(string, sizeof(string), text, list);
+  va_end(list);
+
+  SceUID fd = sceIoOpen("ux0:data/bully_log.txt",
+                        SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+  if (fd >= 0) {
+    sceIoWrite(fd, string, strlen(string));
+    sceIoClose(fd);
+  }
+  return 0;
 }
 
 int ret1(void) {
@@ -743,289 +160,21 @@ int OS_ScreenGetWidth(void) {
   return SCREEN_W;
 }
 
-#ifdef LOADER_TRACE
-// Counted rather than logged individually: the question after startup is
-// whether the game is still doing work at all, and five numbers on each
-// heartbeat answer that without thousands of lines.
-int trace_files, trace_textures, trace_buffers, trace_clears, trace_draws;
-#endif
+// Frames the game has run, which the streaming gate uses to know when the game
+// has finished loading and its heap has settled. Counted here rather than in
+// swapBuffers so that jni_patch.c -- the controller code -- stays byte for byte
+// as the original left it.
+int frames_swapped;
 
 int ProcessEvents(void) {
-#ifdef LOADER_TRACE
-  // The game's main loop calls this every iteration, so it tells apart a loop
-  // that is running but never drawing from one that is not running at all.
-  static int events;
-  if (events % 600 == 0) {
-    TextureCacheStats cache;
-    texture_cache_stats(&cache);
-    // Heap used as well as the GPU pools. The cache parks evicted textures in
-    // the newlib heap, so a crash could now be the heap running out rather than
-    // the pools, and the two look nothing alike from a coredump.
-    //
-    // Broken out rather than taken as one number, because the allocation trace
-    // accounts for 76 MB of what this reports as 155 MB, and the shape of that
-    // gap decides what the fix even is. arena is what has been taken from the
-    // system and never given back; uordblks is what is actually live; fordblks
-    // is what has been freed and is sitting in the free lists. A large fordblks
-    // is fragmentation, not a leak, and no amount of freeing things fixes it.
-    struct mallinfo heap = mallinfo();
-    // A high-water mark, because everything else here is an instant reading and
-    // a spike between two heartbeats leaves no trace at all.
-    static size_t heap_peak;
-    if ((size_t)heap.uordblks > heap_peak)
-      heap_peak = (size_t)heap.uordblks;
-    traceLog("loop: %d | tex %d draw %d | vgl ram %d cdram %d phycont %d MB | heap %d MB | "
-             "cache %d MB parked %d ev %d re %d lost %d spill %d free %d store %d "
-             "starve %d defer %d block %d\n",
-             events, trace_textures, trace_draws,
-             (int)(vglMemFree(VGL_MEM_RAM) / (1024 * 1024)),
-             (int)(vglMemFree(VGL_MEM_VRAM) / (1024 * 1024)),
-             (int)(vglMemFree(VGL_MEM_PHYCONT) / (1024 * 1024)),
-             (int)(heap.uordblks / (1024 * 1024)),
-             cache.tracked_mb, cache.parked_mb, cache.evicted, cache.restored, cache.failed,
-             cache.spilled, cache.reused, cache.stored, cache.starved, cache.deferred,
-             cache.blocked);
-    // Where an area load's time goes. The freeze on walking into a new area is
-    // fifteen heartbeats with no frame presented while the game uploads four
-    // thousand textures, and the cache does nothing at all through it. These
-    // two say how much of that is vitaGL doing the upload and how much is the
-    // loader's own work on top of it.
-    traceLog("upload: %d ms in the driver, %d ms in the cache, %d MB hashed\n",
-             cache.upload_driver_ms, cache.upload_loader_ms, cache.key_hashed_mb);
-    traceLog("restore: %d open, %d read, %d checksum, %d replay, %d copy (ms); "
-             "%d from the heap, %d from the card\n",
-             cache.restore_open_ms, cache.restore_read_ms, cache.restore_sum_ms,
-             cache.restore_replay_ms, cache.restore_copy_ms, cache.restore_from_heap,
-             cache.restore_from_card);
-    // Which game code was running since the last heartbeat. During a freeze
-    // this is the only line that can see the 53% nothing else accounts for.
-    game_memory_hot_report();
-    // ...and the same for the file reads the game does to fill those textures
-    // and everything else an area is made of. Scaled up from the sample.
-    for (int i = 0; i < IO_THREADS && io_tid[i]; i++)
-      traceLog("io thread: %-20s 0x%08x%s %d ms over %u sampled reads\n", io_tid_name[i],
-               (unsigned)io_tid[i],
-               io_tid[i] == presenting_thread ? " (presents frames)" : "",
-               (int)(io_tid_us[i] * IO_SAMPLE / 1000), (unsigned)io_tid_reads[i]);
-    if (handle_cache_on) {
-      HandleCacheStats hc;
-      handle_cache_stats(&hc);
-      traceLog("handles: %u opens served from a held file, %u went to the card, "
-               "%u parked, %u evicted, %u not kept, %u given back of which %u "
-               "rescued an open, %u were not there and %u already known not "
-               "to be, holding %u of %u\n",
-               hc.hits, hc.misses, hc.parked, hc.evicted, hc.dropped, hc.drains,
-               hc.rescued, hc.absent, hc.absent_again, hc.held, hc.slots);
-    }
-    // Whatever the handle cache is doing, the dir cache is in the open path
-    // now. "contradicted" is the number to read first: anything but 0 means a
-    // listing was caught claiming absent for a file that opened, and that
-    // directory has been retired from answering.
-    DirCacheStats dc;
-    dir_cache_stats(&dc);
-    extern unsigned dir_list_us;
-    extern char dir_last[4][160];
-    extern unsigned dir_last_count[4];
-    traceLog("dirs: %u listed, %u not there, %u unreadable, %u names | "
-             "answered %u, unknown %u, statted %u | %u too big, %u forgotten "
-             "| contradicted %u, stale %u | %d ms listing\n",
-             dc.listed, dc.missing, dc.unreadable, dc.entries, dc.answered,
-             dc.unknown, dc.statted, dc.overflow, dc.forgotten,
-             dc.contradicted, dc.stale, (int)(dir_list_us / 1000));
-    for (int i = 0; i < 4; i++)
-      if (dir_last[i][0])
-        traceLog("dir: %s -- %u names\n", dir_last[i], dir_last_count[i]);
-    traceLog("miss: %u opens found nothing, %d ms | %u never reached the card "
-             "| %u directories between them, %u unplaced\n",
-             (unsigned)io_opens_missing, (int)(io_open_missing_us / 1000),
-             (unsigned)io_opens_skipped, (unsigned)miss_dirs_used,
-             (unsigned)miss_dirs_unplaced);
-    // The busiest few by name, because whether one listing covers them is the
-    // whole question and a count alone cannot say. Picked by repeated maximum
-    // rather than by sorting, and marked off in a bitmap rather than by zeroing
-    // the counter, so the totals above stay the totals.
-    uint64_t already_shown = 0;
-    for (int shown = 0; shown < 6; shown++) {
-      int best = -1;
-      for (int i = 0; i < MISS_DIRS; i++) {
-        if (!miss_dirs[i].probes || (already_shown >> i) & 1)
-          continue;
-        if (best < 0 || miss_dirs[i].probes > miss_dirs[best].probes)
-          best = i;
-      }
-      if (best < 0)
-        break;
-      already_shown |= (uint64_t)1 << best;
-      traceLog("miss dir: %u probes  %s\n", miss_dirs[best].probes,
-               miss_dirs[best].path);
-    }
-    traceLog("files: %u distinct opened, %d MB between them\n",
-             (unsigned)opened_files, (int)(opened_bytes / (1024 * 1024)));
-    traceLog("visit: %u first read %d KB, %u again read %d KB, %u over "
-             "%d KB, %u untracked | per visit <4K %u <16K %u <64K %u more %u\n",
-             (unsigned)visit_first, (int)(visit_first_bytes / 1024),
-             (unsigned)visit_again, (int)(visit_again_bytes / 1024),
-             (unsigned)visit_too_big, VISIT_CACHEABLE / 1024,
-             (unsigned)visit_untracked, visit_buckets[0], visit_buckets[1],
-             visit_buckets[2], visit_buckets[3]);
-    traceLog("open: %u opens, %d ms | %u first at %d ms, %u again at %d ms | "
-             "%u distinct, %u for writing, %u unplaced\n", (unsigned)io_opens,
-             (int)((io_open_first_us + io_open_again_us) / 1000),
-             (unsigned)(io_opens - io_reopens), (int)(io_open_first_us / 1000),
-             (unsigned)io_reopens, (int)(io_open_again_us / 1000),
-             (unsigned)io_open_distinct, (unsigned)io_opens_writing,
-             (unsigned)io_open_unplaced);
-    traceLog("io: %d ms reading, %d ms seeking, %d MB over %u card reads for %u asked, "
-             "%u seeks, %u sequential | sizes <4K %u <16K %u <64K %u more %u\n",
-             (int)(io_read_us * IO_SAMPLE / 1000), (int)(io_seek_us * IO_SAMPLE / 1000),
-             (int)(io_read_bytes / (1024 * 1024)), (unsigned)io_reads, (unsigned)io_asked,
-             (unsigned)io_seeks, (unsigned)io_sequential, io_size_buckets[0],
-             io_size_buckets[1], io_size_buckets[2], io_size_buckets[3]);
-    ReadCacheStats rc;
-    read_cache_stats(&rc);
-    traceLog("readcache: %u served from memory, %u went to the card, %u read aheads, %u KB, "
-             "%u KB fetched ahead, %u found no buffer of their own\n",
-             rc.hits, rc.misses, rc.refills, rc.bytes_served_kb, rc.fetched_kb, rc.unowned);
-    // Frames actually presented since the last heartbeat, over the wall clock
-    // between them. vsync is disabled, so this is what the hardware managed.
-    static int last_frames;
-    static uint32_t last_us;
-    SceKernelSysClock now;
-    sceKernelGetProcessTime(&now);
-    uint32_t us = (uint32_t)now;
-    int drawn = frames_swapped - last_frames;
-    int fps = 0;
-    // How long this heartbeat actually took. Every millisecond figure in the
-    // lines above is only meaningful against it: "953 ms of reading" is nearly
-    // the whole of a one second heartbeat and a third of a three second one,
-    // and until now there was no way to tell which.
-    uint32_t elapsed_us = last_us && us > last_us ? us - last_us : 0;
-    if (elapsed_us)
-      fps = (int)(((uint64_t)drawn * 1000000u) / elapsed_us);
-    last_frames = frames_swapped;
-    last_us = us;
-    traceLog("fps: %d over the last %d frames, %d ms since the last heartbeat\n", fps, drawn,
-             (int)(elapsed_us / 1000));
-    // What the frame rate above cannot say. A steady 50 ms frame and one that
-    // alternates 17 and 83 are the same average and nothing alike to play, so
-    // this counts the intervals themselves, in display periods, and how often
-    // one frame differs from the last by more than half a period.
-    {
-      extern void frame_pacing_snapshot(unsigned out[8]);
-      extern unsigned frame_measured, frame_judder, frame_worst_us;
-      extern unsigned long long frame_span_us, frame_swap_us, frame_tick_us;
-      unsigned p[8];
-      frame_pacing_snapshot(p);
-      static unsigned last_measured, last_judder;
-      unsigned n = frame_measured - last_measured;
-      unsigned j = frame_judder - last_judder;
-      last_measured = frame_measured;
-      last_judder = frame_judder;
-      traceLog("pacing: %u frames, %u uneven (%u%% this heartbeat, %u%% all "
-               "session) | worst %u ms | periods 1:%u 2:%u 3:%u 4:%u 5-6:%u "
-               "7-12:%u 13-30:%u more:%u | mean frame %u ms, %u in the display, "
-               "%u in the loader\n",
-               (unsigned)frame_measured, (unsigned)frame_judder,
-               n ? j * 100 / n : 0,
-               frame_measured ? frame_judder * 100 / frame_measured : 0,
-               (unsigned)(frame_worst_us / 1000), p[0], p[1], p[2], p[3], p[4],
-               p[5], p[6], p[7],
-               frame_measured ? (unsigned)(frame_span_us / frame_measured / 1000) : 0,
-               frame_measured ? (unsigned)(frame_swap_us / frame_measured / 1000) : 0,
-               frame_measured ? (unsigned)(frame_tick_us / frame_measured / 1000) : 0);
-      // And which part of the loader's share it is, per call so that changing
-      // how often something is sampled cannot flatter it.
-      extern unsigned long long frame_texture_tick_us, frame_vertex_tick_us;
-      extern unsigned tick_heap_us, tick_heap_calls, tick_pool_us, tick_pool_calls;
-      traceLog("tick: texture %u us a frame, vertex %u us a frame | mallinfo "
-               "%u calls at %u us, vglMemFree %u calls at %u us\n",
-               frame_measured ? (unsigned)(frame_texture_tick_us / frame_measured) : 0,
-               frame_measured ? (unsigned)(frame_vertex_tick_us / frame_measured) : 0,
-               tick_heap_calls, tick_heap_calls ? tick_heap_us / tick_heap_calls : 0,
-               tick_pool_calls, tick_pool_calls ? tick_pool_us / tick_pool_calls : 0);
-      frame_worst_us = 0; // worst since the last heartbeat, not ever
-    }
-    // How often the sticks are actually read from the hardware, next to the
-    // frame rate because that is what it will turn out to be tied to. The
-    // game's axis reads all come off one cached sample taken in
-    // GetGamepadType; nothing else touches the pad. So this rate, not the axis
-    // rate, is what stick responsiveness is made of, and no amount of work on
-    // file I/O moves it.
-    {
-      extern unsigned pad_samples, pad_axis_reads, pad_button_reads;
-      extern unsigned char pad_lo[2][4], pad_hi[2][4];
-      static unsigned last_pad;
-      unsigned took = pad_samples - last_pad;
-      last_pad = pad_samples;
-      traceLog("pad: %u hardware samples, %d a second, %u axis reads, "
-               "%u button reads | port 0 reached lx %u-%u ly %u-%u rx %u-%u "
-               "ry %u-%u | port 1 lx %u-%u ly %u-%u\n",
-               (unsigned)pad_samples,
-               elapsed_us ? (int)((uint64_t)took * 1000000u / elapsed_us) : 0,
-               (unsigned)pad_axis_reads, (unsigned)pad_button_reads,
-               pad_lo[0][0], pad_hi[0][0], pad_lo[0][1], pad_hi[0][1],
-               pad_lo[0][2], pad_hi[0][2], pad_lo[0][3], pad_hi[0][3],
-               pad_lo[1][0], pad_hi[1][0], pad_lo[1][1], pad_hi[1][1]);
-    }
-    traceLog("heapinfo: arena %d MB, live %d MB, free-listed %d MB, top %d KB, peak %d MB\n",
-             (int)(heap.arena / (1024 * 1024)), (int)(heap.uordblks / (1024 * 1024)),
-             (int)(heap.fordblks / (1024 * 1024)), (int)(heap.keepcost / 1024),
-             (int)(heap_peak / (1024 * 1024)));
-
-    // What the kernel thinks is left, which is the only figure that covers the
-    // whole process. mallinfo sees the newlib heap and vglMemFree sees vitaGL's
-    // pools, and everything allocated as a memory block straight from the
-    // kernel -- GXM's buffers, the movie player's, OpenAL's, the pools
-    // themselves -- appears in neither. Two sub-allocators are not the process,
-    // and assuming they were is why the heap figures never added up.
-    SceKernelFreeMemorySizeInfo freemem;
-    freemem.size = sizeof(freemem);
-    if (sceKernelGetFreeMemorySize(&freemem) >= 0)
-      traceLog("system: %d MB user, %d MB cdram, %d MB phycont free to the kernel\n",
-               freemem.size_user / (1024 * 1024), freemem.size_cdram / (1024 * 1024),
-               freemem.size_phycont / (1024 * 1024));
-
-    // vitaGL's fourth pool. Reported because it is a real pool that textures
-    // fall back to, and nothing here has ever looked at it.
-    traceLog("vgl: budget pool %d MB free\n", (int)(vglMemFree(VGL_MEM_BUDGET) / (1024 * 1024)));
-
-    VertexCacheStats vertex;
-    vertex_cache_stats(&vertex);
-    traceLog("vertex: %s, %d buffers, %d KB held, %d MB handed out, %d KB released, "
-             "%d relocked\n",
-             vertex.installed ? "on" : "OFF", vertex.tracked, vertex.held_kb,
-             vertex.churn_mb, vertex.released_kb, vertex.relocked);
-
-    StreamingStats stream;
-    streaming_patch_stats(&stream);
-    traceLog("stream: gate %s, streamer holds %d MB of %d, %d asked, %d refused, "
-             "%d backoffs, %d raises, %d frames left in this backoff\n",
-             stream.installed ? "on" : "OFF", stream.memory_used_mb, stream.budget_mb,
-             stream.calls, stream.refusals, stream.backoffs, stream.raises,
-             stream.backoff_left);
-
-    // What the engine says it is holding, broken down by its own categories.
-    // The heap figures above say how much went; this says what took it.
-    game_memory_report();
-
-#ifdef LOADER_ALLOC_TRACE
-    // Less often than the heartbeat: this one walks a table and prints several
-    // lines, and the question it answers changes over minutes, not frames.
-    if (events % 6000 == 0) {
-      alloc_trace_report();
-      alloc_trace_loader_report();
-    }
-#endif
-  }
-  events++;
-#endif
+  frames_swapped++;
   movie_draw_frame();
+  // Once a frame: sample how much room is left in each pool and, if it is
+  // running out, evict the textures that have gone longest without being drawn.
+  texture_cache_tick();
   return 0; // 1 is exit!
 }
 
-// The game is an Android binary and passes Bionic's clock ids, which do not
-// match newlib's, so match on the raw numbers this port has always used rather
-// than on whatever CLOCK_MONOTONIC happens to mean to the host headers.
 #define ANDROID_CLOCK_ID_0 0
 #define ANDROID_CLOCK_ID_1 1
 
@@ -1092,13 +241,8 @@ int thread_stub(SceSize args, uintptr_t *argp) {
   int (* func)(void *arg) = (void *)argp[0];
   void *arg = (void *)argp[1];
   char *out = (char *)argp[2];
-  const char *name = (const char *)argp[3];
   out[0x41] = 1; // running
-  traceLog("thread: %s entered\n", name ? name : "?");
   func(arg);
-  // A thread that faults never gets here, so the absence of this line for a
-  // given thread is what tells a trace apart from a clean shutdown.
-  traceLog("thread: %s returned\n", name ? name : "?");
   return sceKernelExitDeleteThread(0);
 }
 
@@ -1146,17 +290,15 @@ void *OS_ThreadLaunch(int (* func)(), void *arg, int cpu, char *name, int unused
     }
   }
 
-  traceLog("thread: %s starting (priority %d, affinity 0x%x)\n", name, vita_priority, vita_affinity);
   SceUID thid = sceKernelCreateThread(name, (SceKernelThreadEntry)thread_stub, vita_priority, 128 * 1024, 0, vita_affinity, NULL);
   if (thid >= 0) {
     char *out = malloc(0x48);
     *(int *)(out + 0x24) = thid;
 
-    uintptr_t args[4];
+    uintptr_t args[3];
     args[0] = (uintptr_t)func;
     args[1] = (uintptr_t)arg;
     args[2] = (uintptr_t)out;
-    args[3] = (uintptr_t)name;
     sceKernelStartThread(thid, sizeof(args), args);
 
     return out;
@@ -1267,11 +409,9 @@ extern void *__cxa_guard_acquire;
 extern void *__cxa_guard_release;
 
 void patch_game(void) {
-#ifdef LOADER_ALLOC_TRACE
-  hook_addr(so_symbol(&bully_mod, "_Znwj"), (uintptr_t)&bully_operator_new);
-  hook_addr(so_symbol(&bully_mod, "_Znaj"), (uintptr_t)&bully_operator_new_array);
-#endif
-  game_memory_init();
+  // Tell the game's streamer the truth about how much memory is left, so it
+  // frees what it loads, and stop the engine holding a CPU-side copy of every
+  // vertex buffer for the whole session.
   streaming_patch_init();
   vertex_cache_init();
   hook_addr(so_symbol(&bully_mod, "__cxa_guard_acquire"), (uintptr_t)&__cxa_guard_acquire);
@@ -1370,11 +510,6 @@ int stat_hook(const char *pathname, void *statbuf) {
   return res;
 }
 
-
-
-
-
-
 extern void *__aeabi_dcmplt;
 extern void *__aeabi_dmul;
 extern void *__aeabi_dsub;
@@ -1451,22 +586,11 @@ static so_default_dynlib default_dynlib[] = {
   { "tan", (uintptr_t)&tan },
   { "tanf", (uintptr_t)&tanf },
 
-  // The game's allocators go through game_memory.c, which passes them straight
-  // to newlib and only does anything when one comes back NULL: it writes down
-  // the size and the caller, and hands over a block reserved at boot so the
-  // call can be retried. The game never checks a result -- ReadBuffer::
-  // RequestData stores through it two instructions later -- so a NULL returned
-  // here is a null dereference in the game, and every session so far has ended
-  // as one.
-  //
-  // Underneath, these still resolve to __wrap_malloc and friends when the
-  // allocation trace is on, so the game's allocations and the eboot's are
-  // counted in the same place and told apart by return address.
-  { "calloc", (uintptr_t)&game_calloc },
+  { "calloc", (uintptr_t)&calloc },
   { "free", (uintptr_t)&free },
-  { "malloc", (uintptr_t)&game_malloc },
-  { "memalign", (uintptr_t)&game_memalign },
-  { "realloc", (uintptr_t)&game_realloc },
+  { "malloc", (uintptr_t)&malloc },
+  { "memalign", (uintptr_t)&memalign },
+  { "realloc", (uintptr_t)&realloc },
 
   { "atoi", (uintptr_t)&atoi },
 
@@ -1492,19 +616,18 @@ static so_default_dynlib default_dynlib[] = {
   // { "eglGetProcAddress", (uintptr_t)&eglGetProcAddress },
   // { "eglQueryString", (uintptr_t)&eglQueryString },
 
-  { "fclose", (uintptr_t)&traced_fclose },
+  { "fclose", (uintptr_t)&sceLibcBridge_fclose },
   // { "fdopen", (uintptr_t)&fdopen },
   // { "fflush", (uintptr_t)&fflush },
   // { "fgetc", (uintptr_t)&fgetc },
   // { "fgets", (uintptr_t)&fgets },
 
-  { "fopen", (uintptr_t)&traced_fopen },
-
+  { "fopen", (uintptr_t)&sceLibcBridge_fopen },
   { "fprintf", (uintptr_t)&sceLibcBridge_fprintf },
   // { "fputc", (uintptr_t)&sceLibcBridge_fputc },
   // { "fputs", (uintptr_t)&sceLibcBridge_fputs },
-  { "fread", (uintptr_t)&traced_fread },
-  { "fseek", (uintptr_t)&traced_fseek },
+  { "fread", (uintptr_t)&sceLibcBridge_fread },
+  { "fseek", (uintptr_t)&sceLibcBridge_fseek },
   { "ftell", (uintptr_t)&sceLibcBridge_ftell },
   { "fwrite", (uintptr_t)&sceLibcBridge_fwrite },
 
@@ -1516,7 +639,6 @@ static so_default_dynlib default_dynlib[] = {
 
   { "glActiveTexture", (uintptr_t)&glActiveTextureHook },
   { "glAttachShader", (uintptr_t)&glAttachShader },
-
   { "glBindAttribLocation", (uintptr_t)&glBindAttribLocation },
   { "glBindBuffer", (uintptr_t)&glBindBuffer },
   { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer },
@@ -1525,9 +647,7 @@ static so_default_dynlib default_dynlib[] = {
   { "glBlendFunc", (uintptr_t)&glBlendFunc },
   { "glBlendFuncSeparate", (uintptr_t)&glBlendFuncSeparate },
   { "glBufferData", (uintptr_t)&glBufferData },
-
   { "glClear", (uintptr_t)&glClear },
-
   { "glClearColor", (uintptr_t)&glClearColor },
   { "glClearDepthf", (uintptr_t)&glClearDepthf },
   { "glClearStencil", (uintptr_t)&glClearStencil },
@@ -1536,7 +656,6 @@ static so_default_dynlib default_dynlib[] = {
   { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2DHook },
   { "glCompressedTexSubImage2D", (uintptr_t)&ret0 }, // TODO
   { "glCreateProgram", (uintptr_t)&glCreateProgram },
-
   { "glCreateShader", (uintptr_t)&glCreateShader },
   { "glCullFace", (uintptr_t)&glCullFace },
   { "glDeleteBuffers", (uintptr_t)&glDeleteBuffers },
@@ -1549,7 +668,7 @@ static so_default_dynlib default_dynlib[] = {
   { "glDepthMask", (uintptr_t)&glDepthMask },
   { "glDisable", (uintptr_t)&glDisable },
   { "glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray },
-  { "glDrawElements", (uintptr_t)&glDrawElementsHook },
+  { "glDrawElements", (uintptr_t)&glDrawElements },
   { "glEnable", (uintptr_t)&glEnable },
   { "glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray },
   { "glFinish", (uintptr_t)&glFinish },
@@ -1566,13 +685,12 @@ static so_default_dynlib default_dynlib[] = {
   { "glGetIntegerv", (uintptr_t)&glGetIntegerv },
   { "glGetProgramInfoLog", (uintptr_t)&glGetProgramInfoLog },
   { "glGetProgramiv", (uintptr_t)&glGetProgramiv },
-
   { "glGetShaderInfoLog", (uintptr_t)&glGetShaderInfoLog },
   { "glGetShaderiv", (uintptr_t)&glGetShaderiv },
   { "glGetString", (uintptr_t)&glGetString },
   { "glGetUniformLocation", (uintptr_t)&glGetUniformLocation },
   { "glLineWidth", (uintptr_t)&glLineWidth },
-  { "glLinkProgram", (uintptr_t)&glLinkProgramHook },
+  { "glLinkProgram", (uintptr_t)&glLinkProgram },
   { "glPolygonOffset", (uintptr_t)&glPolygonOffset },
   { "glReadPixels", (uintptr_t)&glReadPixels },
   { "glRenderbufferStorage", (uintptr_t)&ret0 },
@@ -1589,11 +707,8 @@ static so_default_dynlib default_dynlib[] = {
   { "glUniform4fv", (uintptr_t)&glUniform4fv },
   { "glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv },
   { "glUseProgram", (uintptr_t)&glUseProgram },
-
   { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
-
   { "glViewport", (uintptr_t)&glViewport },
-
 
   { "longjmp", (uintptr_t)&longjmp },
   { "setjmp", (uintptr_t)&setjmp },
@@ -1603,13 +718,7 @@ static so_default_dynlib default_dynlib[] = {
 
   { "memchr", (uintptr_t)&sceClibMemchr },
   { "memcmp", (uintptr_t)&sceClibMemcmp },
-  // Through the wrapper, not straight to sceClibMemcpy. It went direct until
-  // now, which meant the "hot copy" half of the profile never saw a single game
-  // call and printed nothing at all -- so the profile reported last time was
-  // entirely allocation sites, not the memcpy sites it was presented as. The
-  // wrapper forwards to sceClibMemcpy and samples one call in 256 off the
-  // destination pointer.
-  { "memcpy", (uintptr_t)&memcpy },
+  { "memcpy", (uintptr_t)&sceClibMemcpy },
   { "memmove", (uintptr_t)&sceClibMemmove },
   { "memset", (uintptr_t)&sceClibMemset },
 
@@ -1780,8 +889,6 @@ int main(int argc, char *argv[]) {
   scePowerSetGpuClockFrequency(222);
   scePowerSetGpuXbarClockFrequency(166);
 
-  sceIoMkdir(GLSL_PATH, 0777);
-
   capunlocker_enabled = check_capunlocker() >= 0;
   if (capunlocker_enabled) {
     _oal_thread_priority = 64;
@@ -1791,112 +898,40 @@ int main(int argc, char *argv[]) {
     _oal_thread_affinity = 0x10000;
   }
 
-  // Stamped so a trace file can never be ambiguous about which build wrote it.
-  traceLog("---- loader built %s %s ----\n", __DATE__, __TIME__);
-  // Where this boot put us. Addresses in the trace are only meaningful against
-  // it: the module slide changes from run to run, and reconstructing it from a
-  // coredump afterwards means rebuilding the exact binary to symbolise anything.
-  // A known function's runtime address. Every eboot address in this trace is
-  // only meaningful against it: the module slide changes from run to run, so
-  // without this, turning a logged address back into a function means rebuilding
-  // the exact binary and reading the slide out of a coredump. Subtract the
-  // linked address of ProcessEvents from this and you have the slide.
-  traceLog("eboot: ProcessEvents is at 0x%x this boot\n", (unsigned)(uintptr_t)&ProcessEvents);
-  traceLog("boot: reached kubridge check\n");
   if (check_kubridge() < 0)
     fatal_error("Error kubridge.skprx is not installed.");
 
-  // The game's shaders are compiled at runtime now, so this module is required.
-  // Without it every shader fails and the screen is simply black, which is not
-  // a state anybody should have to diagnose.
-  if (!file_exists("ur0:/data/libshacccg.suprx") && !file_exists("ur0:/data/external/libshacccg.suprx"))
-    fatal_error("Error libshacccg.suprx is not installed.");
-
-  traceLog("boot: loading %s\n", SO_PATH);
   if (so_load(&bully_mod, SO_PATH, LOAD_ADDRESS) < 0)
     fatal_error("Error could not load %s.", SO_PATH);
 
   stderr_fake = stderr;
   stdin_fake = stdin;
-  traceLog("boot: so_load ok, relocating\n");
   so_relocate(&bully_mod);
   so_resolve(&bully_mod, default_dynlib, sizeof(default_dynlib), 0);
 
-  traceLog("boot: resolved imports, patching\n");
   patch_openal();
   patch_game();
   patch_movie();
   so_flush_caches(&bully_mod);
 
-  // Before any of the game's code runs, because fopen is hooked and the hook
-  // asks this first. An initialiser that opens a file would otherwise call
-  // through an ops table of NULLs.
-  dir_cache_mutex = sceKernelCreateMutex("dir_cache", 0, 0, NULL);
-  static const DirCacheOps dir_cache_ops = { open_dir, read_dir, close_dir,
-                                             stat_one_file, io_now_us,
-                                             dir_cache_lock, dir_cache_unlock };
-  dir_cache_init(&dir_cache_ops);
-
-  traceLog("boot: patched, running .so initializers\n");
   so_initialize(&bully_mod);
 
-  static const HandleCacheOps handle_cache_ops = {
-    sceLibcBridge_fopen, sceLibcBridge_fclose, sceLibcBridge_fseek,
-    sceLibcBridge_ferror, path_exists
-  };
-  SceIoStat hc_stat;
-  if (sceIoGetstat(HANDLE_CACHE_ENABLE_PATH, &hc_stat) >= 0) {
-    handle_cache_init(&handle_cache_ops, HANDLE_CACHE_SLOTS);
-    handle_cache_on = 1;
-    traceLog("handles: on, asked for by %s\n", HANDLE_CACHE_ENABLE_PATH);
-  } else {
-    traceLog("handles: off -- a first open costs 3.5 ms with this off and 10 ms "
-             "with it on,\n"
-             "         in every build and at every number of handles held, and "
-             "that is not the bookkeeping\n");
-  }
+  if (fios_init() < 0)
+    fatal_error("Error could not initialize fios.");
 
-  static const ReadCacheOps read_cache_ops = { raw_fread, sceLibcBridge_fseek,
-                                              sceLibcBridge_ftell, read_cache_thread_id };
-  SceIoStat rc_stat;
-  if (sceIoGetstat(READ_CACHE_ENABLE_PATH, &rc_stat) >= 0) {
-    read_cache_init(&read_cache_ops);
-    read_cache_on = 1;
-    traceLog("readcache: on, asked for by %s\n", READ_CACHE_ENABLE_PATH);
-  } else {
-    traceLog("readcache: off -- the reads it can predict are already buffered\n"
-             "           below fread, and the ones that cost are scattered\n");
-  }
-
-  traceLog("boot: initializers done, starting fios\n");
-  // With the code, not just the message. The last build died here on a blue
-  // screen that named nothing, and the cause was a work buffer this loader had
-  // sized wrongly rather than anything on the card.
-  int fios_res = fios_init();
-  if (fios_res < 0) {
-    traceLog("boot: fios_init failed with 0x%08x\n", (unsigned)fios_res);
-    fatal_error("Error could not initialize fios (0x%08x).", (unsigned)fios_res);
-  }
-
-  traceLog("boot: fios ok, starting texture cache\n");
   texture_cache_init();
 
-  {
-    extern unsigned store_scan_us, store_scan_dirs;
-    traceLog("boot: texture cache done in %d ms, %u store directories read, "
-             "initialising vitaGL\n",
-             (int)(store_scan_us / 1000), store_scan_dirs);
-  }
   // The game ships GLSL and this hands it to vitaGL's runtime compiler, which
   // caches the compiled result on the card. The precompiled .gxp route this
   // port used instead only works with the 2021 vitaGL: current versions read a
   // glShaderBinary payload as their own serialized container, and a bare GXP
   // wrapped to satisfy that parser registers a program that links, draws
   // without error and rasterises nothing. Requires libshacccg.suprx.
+  //
   // Semantics can only be resolved accurately when vitaGL can see a vertex and
-  // fragment shader together. This engine compiles some forty shaders during
+  // a fragment shader together. This engine compiles some forty shaders during
   // startup and does not create a program from any of them until much later,
-  // so the pair mode layton3-vita uses does not hold here and the global pool
+  // so the pair mode other ports use does not hold here and the global pool
   // vitaGL defaults to is the least accurate option. Postponing compilation to
   // glLinkProgram always gives it the right couple.
   vglSetTextureCacheFrequency(TEXTURE_CACHE_IDLE_FRAMES);
@@ -1913,25 +948,17 @@ int main(int argc, char *argv[]) {
   // vgl_mem_get_free_space(VGL_MEM_EXTERNAL) returns 0 unconditionally, so none
   // of it is visible to anything that asks vitaGL how much memory is left.
   //
-  // That is the leak this port has been dying of. It explains a heap that
-  // climbed to 155 MB while every pool reading said there was room to spare, a
-  // texture cache that never evicted because it could not see any pressure, and
-  // 79 MB of live allocations that the allocation trace could not account for
-  // -- vitaGL's own mallocs do not come through the wrappers the game's do.
+  // That is the leak this port was dying of. It explains a heap that climbed to
+  // 155 MB while every pool reading said there was room to spare, and a texture
+  // cache that never evicted because it could not see any pressure.
   //
   // With this off the allocation fails instead, which the loader is set up for:
   // an upload vitaGL rejects allocates nothing, texture_is_allocated notices,
-  // and the pressure shows up in the pool figures where the texture cache can
-  // act on it.
+  // and the pressure shows up in the pool figures the texture cache acts on.
   vglUseExtraMem(GL_FALSE);
-
-
-  traceLog("boot: vitaGL up (%s / %s), setting up movie player\n",
-           (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER));
 
   movie_setup_player();
 
-  traceLog("boot: handing over to the game\n");
   jni_load();
 
   return 0;

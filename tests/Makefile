@@ -14,30 +14,13 @@ CFLAGS := -idirafter $(VITASDK)/arm-vita-eabi/include -I../loader -I. \
           -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -g -O1
 LDFLAGS := -pthread
 
-TESTS := test_budget test_revisit test_regress test_no_backing_store test_alloc_trace test_read_cache test_handle_cache test_dir_cache
+TESTS := test_budget test_revisit test_regress test_no_backing_store
 FAKES := fake_vitagl.c fake_vita_os.c
 
 .PHONY: all check clean
 all: check
 
-# Both of these stand alone: they need neither the GL fake nor the OS one, and
-# linking them would pull in a second definition of the loader stubs.
-$(OUT)/test_handle_cache: test_handle_cache.c ../loader/handle_cache.c ../loader/handle_cache.h
-	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
-
-$(OUT)/test_dir_cache: test_dir_cache.c ../loader/dir_cache.c ../loader/dir_cache.h
-	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
-
-# The allocation tracer stands alone: it needs neither the GL fake nor the OS
-# one, and linking them would pull in a second definition of the loader stubs.
-$(OUT)/test_alloc_trace: test_alloc_trace.c fake_alloc_env.h ../loader/alloc_trace.c \
-                         ../loader/config.h
-	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -DLOADER_ALLOC_TRACE $< $(LDFLAGS) -o $@
-
-$(OUT)/%: %.c $(FAKES) harness.h fake_vitagl.h ../loader/texture_cache.c ../loader/read_cache.c ../loader/config.h
+$(OUT)/%: %.c $(FAKES) harness.h fake_vitagl.h ../loader/texture_cache.c ../loader/config.h
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) $< $(FAKES) $(LDFLAGS) -o $@
 

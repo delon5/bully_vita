@@ -7,9 +7,11 @@
 extern so_module bully_mod;
 
 int debugPrintf(char *text, ...);
+
+// Notable, rare events from the memory work. Appends to ux0:data/bully_log.txt.
 int traceLog(char *text, ...);
 
-// Presented frames, counted in jni_patch.c's swapBuffers.
+// Frames the game has run, counted in ProcessEvents.
 extern int frames_swapped;
 
 int ret0();

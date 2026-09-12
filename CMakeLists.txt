@@ -14,27 +14,20 @@ set(VITA_APP_NAME "Bully")
 set(VITA_TITLEID  "BULLY0000")
 set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Wl,-q,--wrap,memcpy,--wrap,memmove,--wrap,memset,--wrap,malloc,--wrap,calloc,--wrap,realloc,--wrap,memalign,--wrap,aligned_alloc,--wrap,free -D_GNU_SOURCE -Wall -O3 -mfloat-abi=softfp")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Wl,-q,--wrap,memcpy,--wrap,memmove,--wrap,memset -D_GNU_SOURCE -Wall -O3 -mfloat-abi=softfp")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++11")
-
 
 add_executable(Bully
   loader/main.c
-  loader/alloc_trace.c
   loader/streaming_patch.c
+  loader/texture_cache.c
   loader/vertex_cache.c
   loader/dialog.c
   loader/fios.c
-  loader/game_memory.c
-  loader/dir_cache.c
-  loader/handle_cache.c
-  loader/read_cache.c
   loader/so_util.c
   loader/jni_patch.c
   loader/movie_patch.c
   loader/openal_patch.c
-  loader/sha1.c
-  loader/texture_cache.c
 )
 
 target_link_libraries(Bully
@@ -49,9 +42,7 @@ target_link_libraries(Bully
   openal
   vitaGL
   vitashark
-  # vitaShaRK references these to patch the ShaccCg module through taiHEN. The
-  # loader disables the runtime shader compiler so none of it ever runs, but the
-  # symbols still have to resolve.
+  # vitaShaRK references these to patch the ShaccCg module through taiHEN.
   SceShaccCgExt
   taihen_stub
   stdc++

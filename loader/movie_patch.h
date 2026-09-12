@@ -3,7 +3,6 @@
 
 void movie_setup_player(void);
 void movie_draw_frame(void);
-int movie_player_state(void);
 void patch_movie(void);
 
 #endif

@@ -69,7 +69,6 @@ int fios_init(void) {
   if (res < 0)
     return res;
 
-  traceLog("fios: initialised, no RAM caches -- they were never in the read path\n");
   return 0;
 }
 

@@ -154,22 +154,11 @@ int movie_audio_thread(SceSize args, void *argp) {
   return sceKernelExitDeleteThread(0);
 }
 
-int movie_player_state(void) {
-  return player_state;
-}
-
 void movie_draw_frame(void) {
   if (player_state == PLAYER_ACTIVE) {
     if (sceAvPlayerIsActive(movie_player)) {
       SceAvPlayerFrameInfo frame;
       if (sceAvPlayerGetVideoData(movie_player, &frame)) {
-#ifdef LOADER_TRACE
-        static int drawn;
-        if (drawn == 0 || drawn == 60)
-          traceLog("movie: video frame %d, %dx%d\n", drawn,
-                   frame.details.video.width, frame.details.video.height);
-        drawn++;
-#endif
         movie_frame_idx = (movie_frame_idx + 1) % 2;
         sceGxmTextureInitLinear(
           movie_tex[movie_frame_idx],
@@ -188,18 +177,6 @@ void movie_draw_frame(void) {
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, &movie_pos[0]);
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, &movie_texcoord[0]);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-#ifdef LOADER_TRACE
-        if (drawn <= 1) {
-          // Same question as the game's own frames: is anything actually in
-          // the surface, and is a framebuffer object still bound (which makes
-          // vitaGL skip the display queue entirely)?
-          extern void *in_use_framebuffer;
-          uint32_t px = 0;
-          glReadPixels(SCREEN_W / 2, SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &px);
-          traceLog("movie: drew frame, gl error 0x%x, centre 0x%08x, fbo bound %p\n",
-                   glGetError(), px, in_use_framebuffer);
-        }
-#endif
         vglSwapBuffers(GL_FALSE);
       }
     } else {
@@ -208,7 +185,6 @@ void movie_draw_frame(void) {
   }
 
   if (player_state == PLAYER_STOP) {
-    traceLog("movie: stopping\n");
     sceAvPlayerStop(movie_player);
     sceKernelWaitThreadEnd(audio_thid, NULL, NULL);
     sceAvPlayerClose(movie_player);
@@ -216,7 +192,6 @@ void movie_draw_frame(void) {
     player_state = PLAYER_INACTIVE;
     glClear(GL_COLOR_BUFFER_BIT);
     vglSwapBuffers(GL_FALSE);
-    traceLog("movie: finished, handed the screen back to the game\n");
   }
 }
 
@@ -267,17 +242,17 @@ void movie_setup_player(void) {
   glBindAttribLocation(movie_prog, 1, "inTex");
   glLinkProgram(movie_prog);
 
-  // These two shaders are raw GXP compiled into the loader, so they exercise
-  // the same glShaderBinary path the game's own shaders take. If this program
-  // does not link, neither will anything the game loads.
+  // If this one will not link, nothing the game loads will either: it goes
+  // through the same runtime compiler. Worth a line in the log, because a movie
+  // that renders black looks like a decode problem and is not one.
   GLint linked = 0;
   glGetProgramiv(movie_prog, GL_LINK_STATUS, &linked);
-  traceLog("movie: shader program %u link status %d, gl error 0x%x\n",
-           movie_prog, (int)linked, glGetError());
+  if (!linked)
+    traceLog("movie: shader program %u did not link, gl error 0x%x\n",
+             movie_prog, glGetError());
 }
 
 int OS_MoviePlay(const char *file, int a2, int a3, float a4) {
-  traceLog("movie: OS_MoviePlay(%s)\n", file ? file : "(null)");
   movie_audio_init();
 
   SceAvPlayerInitData playerInit;
