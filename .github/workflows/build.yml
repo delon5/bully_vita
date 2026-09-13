@@ -26,6 +26,7 @@ jobs:
       # vglEnableRuntimeShaderCompiler is gone. Going back below this revision
       # no longer compiles.
       VITAGL_REV: cd3791e29ff7f1c0ab349f12c7231f4871ce6a75
+      VITASHARK_REV: df24065e65098b2d1ac533760109ad4367573f28
       OPENAL_REV: c851a68f0939040a56bf0dd453367c1021264bb9
 
     steps:
@@ -41,6 +42,23 @@ jobs:
 
       - name: Install prebuilt dependencies
         run: VDPM_NONINTERACTIVE=1 vdpm install libmathneon mpg123 kubridge taihen SceShaccCgExt vitaShaRK
+
+      # Over the top of the one vdpm just installed, which is older than the
+      # pinned vitaGL needs. vgl.c calls shark_set_shader_association_path
+      # unconditionally -- no #ifdef around it, unlike every other optional
+      # feature there -- and that symbol arrived in vitaShaRK only with Razor
+      # shader association support. The packaged release predates it, so the
+      # link fails on "undefined reference" while a developer machine whose
+      # vitaShaRK came from source links fine. Pin it the way vitaGL and
+      # openal-soft are pinned, so the three move together or not at all.
+      - name: Build vitaShaRK
+        run: |
+          git clone https://github.com/Rinnegatamante/vitaShaRK
+          git -C vitaShaRK checkout --detach "$VITASHARK_REV"
+          make -C vitaShaRK -j"$(nproc)" install
+          arm-vita-eabi-nm --defined-only "$VITASDK/arm-vita-eabi/lib/libvitashark.a" |
+            grep -q shark_set_shader_association_path || {
+              echo "vitaShaRK built without the symbol vitaGL needs" >&2; exit 1; }
 
       # Built from source rather than taken from the package set, because the
       # port depends on compile-time options (unpure textures, phycont on
