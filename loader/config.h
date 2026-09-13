@@ -135,6 +135,35 @@
 // Long enough that anything the game touches regularly is never swept -- those
 // are the buffers where handing back fresh memory could matter, since a buffer
 // filled completely before it is unlocked does not care.
+// Which cores the streaming thread may run on.
+//
+// The loader hard-pins one thread per core, which is the homebrew convention,
+// and it puts two of them on core 2: the process's own main thread -- the one
+// that runs ProcessEvents, and so the texture and vertex ticks -- and
+// CDStreamThread. Measured on hardware they come to 54% and 45%, which is 99%
+// of that core, while core 3 sits 61% idle with only Sound and the OpenAL mixer
+// on it.
+//
+// The main thread is priority 127 and CDStreamThread is 65. Lower is higher
+// here, so every time they want the core at once the streamer wins and the tick
+// waits. That is the wrong way round: one of them is a background reader and
+// the other is the frame.
+//
+// So let the streamer have core 3 as well and leave the scheduler to move it.
+// A pair of cores rather than a hard move, because core 3 is not empty -- the
+// mixer is there at priority 64 -- and because that is what the retail titles
+// do: a coreprobe capture of two of them shows every game thread with all
+// three of its cores in the mask and the scheduler migrating them tens of
+// thousands of times a session. Nothing here needs a particular core; it needs
+// not to be behind something else.
+//
+// Only when CapUnlocker is present. Without it core 3 belongs to the system and
+// the loader stays off it entirely.
+#define THREAD_CDSTREAM_AFFINITY (0x40000 | 0x80000)
+
+// Put it back on core 2 alone, to measure against.
+#define THREAD_SPREAD_DISABLE_PATH DATA_PATH "/" "no_corespread"
+
 #define VERTEX_CACHE_IDLE_FRAMES 600
 // An empty file here turns it off.
 #define VERTEX_CACHE_DISABLE_PATH DATA_PATH "/" "no_vertexfix"

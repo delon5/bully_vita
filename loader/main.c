@@ -59,6 +59,9 @@
 int sceLibcHeapSize = MEMORY_SCELIBC_MB * 1024 * 1024;
 int _newlib_heap_size_user = MEMORY_NEWLIB_MB * 1024 * 1024;
 
+// Whether CDStreamThread may use core 3 as well as core 2. Off without
+// CapUnlocker, and off if the card asks for it back.
+static int core_spread;
 unsigned int _oal_thread_priority;
 unsigned int _oal_thread_affinity;
 
@@ -266,7 +269,9 @@ void *OS_ThreadLaunch(int (* func)(), void *arg, int cpu, char *name, int unused
       vita_affinity = 0x20000;
     } else if (strcmp(name, "CDStreamThread") == 0) {
       vita_priority = 65;
-      vita_affinity = 0x40000;
+      // Core 2 is shared with this process's main thread, which runs
+      // ProcessEvents. See THREAD_CDSTREAM_AFFINITY.
+      vita_affinity = core_spread ? THREAD_CDSTREAM_AFFINITY : 0x40000;
     } else if (strcmp(name, "Sound") == 0) {
       vita_priority = 65;
       vita_affinity = 0x80000;
@@ -893,6 +898,12 @@ int main(int argc, char *argv[]) {
   scePowerSetGpuXbarClockFrequency(166);
 
   capunlocker_enabled = check_capunlocker() >= 0;
+  {
+    // Core 3 only exists for this process when CapUnlocker is present.
+    SceIoStat cs;
+    core_spread = capunlocker_enabled &&
+                  sceIoGetstat(THREAD_SPREAD_DISABLE_PATH, &cs) < 0;
+  }
   if (capunlocker_enabled) {
     _oal_thread_priority = 64;
     _oal_thread_affinity = 0x80000;
