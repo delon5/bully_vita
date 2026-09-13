@@ -149,17 +149,38 @@
 // waits. That is the wrong way round: one of them is a background reader and
 // the other is the frame.
 //
-// So let the streamer have core 3 as well and leave the scheduler to move it.
-// A pair of cores rather than a hard move, because core 3 is not empty -- the
-// mixer is there at priority 64 -- and because that is what the retail titles
-// do: a coreprobe capture of two of them shows every game thread with all
-// three of its cores in the mask and the scheduler migrating them tens of
-// thousands of times a session. Nothing here needs a particular core; it needs
-// not to be behind something else.
+// A live reading of all four cores while the game was running:
+//
+//   c0 85%   GameMain, alone
+//   c1 28%   RenderThread, vitaGL garbage collector
+//   c2 79%   this process's main thread, CDStreamThread
+//   c3 34%   Sound, OpenAL mixer
+//
+// Two cores near saturation and two half idle, which is what pinning one
+// thread per core and never revisiting it produces. Core 0 is not fixable from
+// here -- that is one thread wanting 85% of a core, and no affinity mask splits
+// a thread. Core 2 is, because two threads are on it and the slack is next
+// door.
+//
+// So the streamer gets cores 1, 2 and 3 and the scheduler places it. Not a move
+// to one chosen core: which core has room changes with the scene, and picking
+// from a single sample is how you end up hand-pinning the next collision. Not
+// core 0 either, since that is the busiest and the streamer would only wait
+// there anyway.
+//
+// This cannot push anything important aside. CDStreamThread is priority 65;
+// RenderThread, GameMain and the mixer are all 64, and lower wins here, so it
+// can never preempt them. What it can displace is the main thread and the
+// garbage collector, both 127 -- and on core 1 that is the collector, which is
+// exactly the trade wanted.
+//
+// It is also what the retail titles do: a coreprobe capture of two of them
+// shows every game thread carrying all of its cores in the mask, with the
+// scheduler migrating them tens of thousands of times a session.
 //
 // Only when CapUnlocker is present. Without it core 3 belongs to the system and
 // the loader stays off it entirely.
-#define THREAD_CDSTREAM_AFFINITY (0x40000 | 0x80000)
+#define THREAD_CDSTREAM_AFFINITY (0x20000 | 0x40000 | 0x80000)
 
 // Put it back on core 2 alone, to measure against.
 #define THREAD_SPREAD_DISABLE_PATH DATA_PATH "/" "no_corespread"

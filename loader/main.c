@@ -170,6 +170,27 @@ int OS_ScreenGetWidth(void) {
 int frames_swapped;
 
 int ProcessEvents(void) {
+  // Which thread actually drives the frame, said once.
+  //
+  // The loader pins one thread per core by name, and a live reading showed
+  // core 0 at 85% with GameMain alone on it and core 2 at 79% shared between
+  // this process's main thread and CDStreamThread. Whether moving anything is
+  // worth doing turns entirely on which of those runs this function -- the
+  // texture and vertex ticks below, and everything else the frame waits on --
+  // and that has been assumed rather than looked at.
+  static int named;
+  if (!named) {
+    named = 1;
+    SceKernelThreadInfo info;
+    memset(&info, 0, sizeof(info));
+    info.size = sizeof(info);
+    if (sceKernelGetThreadInfo(sceKernelGetThreadId(), &info) >= 0)
+      traceLog("frame: ProcessEvents runs on \"%s\", priority %d, affinity 0x%x\n",
+               info.name, (int)info.currentPriority, (unsigned)info.currentCpuAffinityMask);
+    else
+      traceLog("frame: ProcessEvents thread could not be identified\n");
+  }
+
   frames_swapped++;
   movie_draw_frame();
   // Once a frame: sample how much room is left in each pool and, if it is
