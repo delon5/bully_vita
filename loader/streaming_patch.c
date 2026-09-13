@@ -54,8 +54,6 @@
 // a refusal by evicting and then giving up gracefully. Keep the behaviour.
 #define ORIGINAL_MAX_REQUEST (10 * 1024 * 1024)
 
-static volatile int *ms_memory_used;
-static void (*update_memory_used)(void);
 static uint32_t call_count, refusal_count, backoff_count, raise_count;
 // Exposed so the trace can tell "the gate stopped refusing" from "the game
 // stopped asking". A whole session read 160 refusals from start to finish and
@@ -272,14 +270,6 @@ void streaming_patch_init(void) {
     // it runs and eventually runs out of memory.
     traceLog("streaming: could not find CStreaming::IsThereEnoughFreeMemory, "
              "the game will not free streamed data\n");
-    return;
-  }
-
-  ms_memory_used = (volatile int *)so_symbol(&bully_mod, "_ZN10CStreaming13ms_memoryUsedE");
-  update_memory_used =
-      (void (*)(void))so_symbol(&bully_mod, "_ZN10CStreaming16UpdateMemoryUsedEv");
-  if (!ms_memory_used || !update_memory_used) {
-    traceLog("streaming: no memory accounting to read, leaving the gate alone\n");
     return;
   }
 

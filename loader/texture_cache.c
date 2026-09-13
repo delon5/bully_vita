@@ -945,6 +945,7 @@ static int restore_texture(GLuint id) {
     if (fd < 0)
       return 0;
     BackupRecord record;
+    memset(&record, 0, sizeof(record));
     int header = sceIoRead(fd, &record, sizeof(record));
     int got = 0;
     // The key as well as the size, because a file reached across a restart is
@@ -991,6 +992,10 @@ static int restore_texture(GLuint id) {
   restore_replay_us += t_copy - t_replay;
   void *pixels = vglGetTexDataPointer(GL_TEXTURE_2D);
   if (!pixels) {
+    // The caller marks this texture unbacked, so the copy will never be asked
+    // for again. Give the heap back rather than holding it for nothing and
+    // leaving ram_cache_bytes claiming it forever.
+    backup_release(info);
     install_placeholder(id);
     return 0;
   }
@@ -1179,13 +1184,17 @@ static int evict_textures(size_t target_bytes, uint32_t min_idle_frames) {
 }
 
 void texture_cache_tick(void) {
+  // Before the enabled check, not after it. This is also the streaming gate's
+  // only reading of the heap, and the two fixes are separately disableable:
+  // sampling it inside the check meant that turning the texture cache off with
+  // TEXTURE_CACHE_DISABLE_PATH silently turned the streaming gate off as well,
+  // by freezing the number it decides on at zero.
+  sample_heap();
+
   if (!cache_enabled)
     return;
 
   frame_counter++;
-
-  // Once a frame, for everything that asks about it below.
-  sample_heap();
 
   // A texture stays bound to its unit until something displaces it, so one the
   // game bound once and keeps drawing with is still in use even though we never

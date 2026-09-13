@@ -58,16 +58,31 @@
 
 // Field offsets, read out of VertexBufferES::Lock, Unlock, CleanUp and
 // Allocate. All four agree on them.
+//
+// Overridable as a set, and only so that the host tests can lay a fake object
+// out for a 64-bit pointer. On the device m_data is four bytes at 0x28 and
+// m_uploaded is the byte at 0x2c; on a build machine the pointer is eight bytes
+// and swallows the flag, so writing one corrupts the other and every test lies.
+#ifndef VB_OFFSETS_OVERRIDDEN
 #define VB_COUNT 0x0c
 #define VB_DECLARATION 0x10
 #define VB_GLBUFFER 0x24
 #define VB_DATA 0x28
 #define VB_UPLOADED 0x2c
+#endif
 
 #define MAX_BUFFERS 4096
 
 typedef struct {
   void *buffer;
+  // The staging copy this slot last handed out. The sweep has to write into the
+  // object to null m_data, so it cannot avoid dereferencing buffer -- and if
+  // that object has been destroyed and its memory reused, it would be reading
+  // and freeing a pointer out of whatever lives there now. CleanUp is hooked
+  // below to drop the slot when that happens, and this is the second lock on
+  // the same door: unless the object still holds the exact pointer this slot
+  // handed it, the sweep leaves it alone.
+  void *data;
   uint32_t last_lock;
   uint32_t bytes;
 } TrackedBuffer;
@@ -95,16 +110,34 @@ static uint32_t buffer_size(void *self) {
   return count * declaration_size((char *)self + VB_DECLARATION);
 }
 
+// A slot emptied by CleanUp, still standing so that linear probing can walk
+// past it. Clearing it outright would cut the chain, and every buffer stored
+// after the gap would stop being found -- each one then claiming a second slot
+// and being tracked twice.
+#define VB_TOMBSTONE ((void *)(uintptr_t)1)
+
+static int slot_live(const TrackedBuffer *t) {
+  return t->buffer && t->buffer != VB_TOMBSTONE;
+}
+
 // One slot per buffer, found by address. The game reuses these objects, so a
 // slot is claimed by whichever buffer is living at that address now.
 static TrackedBuffer *slot_for(void *buffer) {
   uint32_t i = ((uint32_t)(uintptr_t)buffer >> 4) * 0x9e3779b1u >> 20;
+  TrackedBuffer *reuse = NULL;
   for (uint32_t probe = 0; probe < 32; probe++) {
     TrackedBuffer *t = &tracked[(i + probe) & (MAX_BUFFERS - 1)];
-    if (t->buffer == buffer || !t->buffer)
+    if (t->buffer == buffer)
       return t;
+    if (t->buffer == VB_TOMBSTONE) {
+      if (!reuse)
+        reuse = t; // claimable, but keep looking for this buffer's own slot
+      continue;
+    }
+    if (!t->buffer) // end of the chain: nothing beyond this can be a match
+      return reuse ? reuse : t;
   }
-  return NULL; // more live buffers than slots; the rest simply keep their copy
+  return reuse; // full, unless a dead slot turned up; the rest keep their copy
 }
 
 // Replaces VertexBufferES::Lock, which is short enough to reproduce exactly.
@@ -116,8 +149,13 @@ static void *VertexBufferES_Lock(void *self) {
 
   TrackedBuffer *t = slot_for(self);
   if (t) {
-    if (!t->buffer)
+    if (t->buffer != self) {
+      // A fresh slot, or a dead one being claimed by a new buffer that happens
+      // to live at this address. Either way nothing carried over is about it.
       t->buffer = self;
+      t->data = NULL;
+      t->bytes = 0;
+    }
     t->last_lock = frame_counter;
   }
 
@@ -162,10 +200,38 @@ static void *VertexBufferES_Lock(void *self) {
     // freed the old copy itself. Replace the figure, do not add to it.
     held_bytes -= t->bytes < held_bytes ? t->bytes : held_bytes;
     t->bytes = size;
+    t->data = *data;
     held_bytes += size;
   }
   churn_bytes += size;
   return *data;
+}
+
+// VertexBufferES::CleanUp, reproduced exactly:
+//
+//   glDeleteBuffers(1, &m_glBuffer);
+//   if (m_data) { free(m_data); m_data = NULL; }
+//
+// Hooked for one reason: it is the last thing that runs on a buffer before
+// Delete hands the object to WLClassType::DestroyInstance and its memory goes
+// back to the heap. Without dropping the slot here, the table keeps a pointer
+// to a dead object and the sweep eventually reads m_data out of whatever has
+// been allocated over it and calls free on that.
+static void VertexBufferES_CleanUp(void *self) {
+  TrackedBuffer *t = slot_for(self);
+  if (t && t->buffer == self) {
+    held_bytes -= t->bytes < held_bytes ? t->bytes : held_bytes;
+    t->buffer = VB_TOMBSTONE;
+    t->data = NULL;
+    t->bytes = 0;
+  }
+
+  glDeleteBuffers(1, (GLuint *)((char *)self + VB_GLBUFFER));
+  void **data = (void **)((char *)self + VB_DATA);
+  if (*data) {
+    free(*data);
+    *data = NULL;
+  }
 }
 
 void vertex_cache_init(void) {
@@ -176,14 +242,19 @@ void vertex_cache_init(void) {
   }
 
   uintptr_t lock = so_symbol(&bully_mod, "_ZN14VertexBufferES4LockEv");
+  uintptr_t cleanup = so_symbol(&bully_mod, "_ZN14VertexBufferES7CleanUpEv");
   declaration_size =
       (uint32_t (*)(void *))so_symbol(&bully_mod, "_ZNK17VertexDeclaration4SizeEv");
-  if (!lock || !declaration_size) {
-    traceLog("vertex cache: VertexBufferES::Lock not found, staging copies stay\n");
+  if (!lock || !cleanup || !declaration_size) {
+    // Without CleanUp there is no way to know when a buffer dies, and the sweep
+    // would be freeing pointers read out of reused memory. Both or neither.
+    traceLog("vertex cache: VertexBufferES::Lock or CleanUp not found, "
+             "staging copies stay\n");
     return;
   }
 
   hook_addr(lock, (uintptr_t)&VertexBufferES_Lock);
+  hook_addr(cleanup, (uintptr_t)&VertexBufferES_CleanUp);
   installed = 1;
   traceLog("vertex cache: holding staging copies for %d frames after a lock\n",
            VERTEX_CACHE_IDLE_FRAMES);
@@ -199,7 +270,7 @@ void vertex_cache_tick(void) {
   static uint32_t cursor;
   for (int n = 0; n < MAX_BUFFERS / 32; n++) {
     TrackedBuffer *t = &tracked[cursor++ & (MAX_BUFFERS - 1)];
-    if (!t->buffer || frame_counter - t->last_lock < VERTEX_CACHE_IDLE_FRAMES)
+    if (!slot_live(t) || frame_counter - t->last_lock < VERTEX_CACHE_IDLE_FRAMES)
       continue;
 
     void **data = (void **)((char *)t->buffer + VB_DATA);
@@ -208,9 +279,16 @@ void vertex_cache_tick(void) {
     // yet unlocked is being filled right now.
     if (!*uploaded || !*data)
       continue;
+    // And only if the object still holds the very pointer this slot handed it.
+    // Anything else means the slot is stale -- the buffer was destroyed by a
+    // path that did not run CleanUp, or the game replaced m_data itself -- and
+    // freeing what is there now would be freeing someone else's memory.
+    if (*data != t->data)
+      continue;
 
     free(*data);
     *data = NULL;
+    t->data = NULL;
     held_bytes -= t->bytes < held_bytes ? t->bytes : held_bytes;
     released_bytes += t->bytes;
     t->bytes = 0;
@@ -220,7 +298,7 @@ void vertex_cache_tick(void) {
 void vertex_cache_stats(VertexCacheStats *out) {
   int n = 0;
   for (int i = 0; i < MAX_BUFFERS; i++)
-    if (tracked[i].buffer)
+    if (slot_live(&tracked[i]))
       n++;
   out->tracked = n;
   out->held_kb = (int)(held_bytes / 1024);

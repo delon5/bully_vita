@@ -172,6 +172,9 @@ int ProcessEvents(void) {
   // Once a frame: sample how much room is left in each pool and, if it is
   // running out, evict the textures that have gone longest without being drawn.
   texture_cache_tick();
+  // And give back the CPU-side copies of vertex buffers the engine has stopped
+  // locking. Both of these used to be called from swapBuffers in jni_patch.c.
+  vertex_cache_tick();
   return 0; // 1 is exit!
 }
 
