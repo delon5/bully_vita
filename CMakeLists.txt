@@ -12,7 +12,12 @@ project(Bully C CXX)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 set(VITA_APP_NAME "Bully")
 set(VITA_TITLEID  "BULLY0000")
-set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
+# ATTRIBUTE2=12 is upstream's. CONTENT_ID is not: vita-mksfoex defaults it to
+# HB0001-ABCD99999_00-0000000000000000, a placeholder every homebrew built with
+# the toolchain shares, and it does not match the title id sitting next to it.
+# The format is SSSSSS-TTTTTTTTT_00 plus sixteen digits, so the title id goes in
+# where the placeholder was.
+set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12 -s CONTENT_ID=HB0001-${VITA_TITLEID}_00-0000000000000000")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Wl,-q,--wrap,memcpy,--wrap,memmove,--wrap,memset -D_GNU_SOURCE -Wall -O3 -mfloat-abi=softfp")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++11")
