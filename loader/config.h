@@ -135,56 +135,6 @@
 // Long enough that anything the game touches regularly is never swept -- those
 // are the buffers where handing back fresh memory could matter, since a buffer
 // filled completely before it is unlocked does not care.
-// Which cores the streaming thread may run on.
-//
-// The loader hard-pins one thread per core, which is the homebrew convention,
-// and it puts two of them on core 2: the process's own main thread -- the one
-// that runs ProcessEvents, and so the texture and vertex ticks -- and
-// CDStreamThread. Measured on hardware they come to 54% and 45%, which is 99%
-// of that core, while core 3 sits 61% idle with only Sound and the OpenAL mixer
-// on it.
-//
-// The main thread is priority 127 and CDStreamThread is 65. Lower is higher
-// here, so every time they want the core at once the streamer wins and the tick
-// waits. That is the wrong way round: one of them is a background reader and
-// the other is the frame.
-//
-// A live reading of all four cores while the game was running:
-//
-//   c0 85%   GameMain, alone
-//   c1 28%   RenderThread, vitaGL garbage collector
-//   c2 79%   this process's main thread, CDStreamThread
-//   c3 34%   Sound, OpenAL mixer
-//
-// Two cores near saturation and two half idle, which is what pinning one
-// thread per core and never revisiting it produces. Core 0 is not fixable from
-// here -- that is one thread wanting 85% of a core, and no affinity mask splits
-// a thread. Core 2 is, because two threads are on it and the slack is next
-// door.
-//
-// So the streamer gets cores 1, 2 and 3 and the scheduler places it. Not a move
-// to one chosen core: which core has room changes with the scene, and picking
-// from a single sample is how you end up hand-pinning the next collision. Not
-// core 0 either, since that is the busiest and the streamer would only wait
-// there anyway.
-//
-// This cannot push anything important aside. CDStreamThread is priority 65;
-// RenderThread, GameMain and the mixer are all 64, and lower wins here, so it
-// can never preempt them. What it can displace is the main thread and the
-// garbage collector, both 127 -- and on core 1 that is the collector, which is
-// exactly the trade wanted.
-//
-// It is also what the retail titles do: a coreprobe capture of two of them
-// shows every game thread carrying all of its cores in the mask, with the
-// scheduler migrating them tens of thousands of times a session.
-//
-// Only when CapUnlocker is present. Without it core 3 belongs to the system and
-// the loader stays off it entirely.
-#define THREAD_CDSTREAM_AFFINITY (0x20000 | 0x40000 | 0x80000)
-
-// Put it back on core 2 alone, to measure against.
-#define THREAD_SPREAD_DISABLE_PATH DATA_PATH "/" "no_corespread"
-
 #define VERTEX_CACHE_IDLE_FRAMES 600
 // An empty file here turns it off.
 #define VERTEX_CACHE_DISABLE_PATH DATA_PATH "/" "no_vertexfix"
