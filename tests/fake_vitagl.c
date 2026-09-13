@@ -82,6 +82,37 @@ uint32_t fake_sampled(GLuint id) {
 // A cube map reads back as itself, never as one of its faces.
 #define CUBE_CONTENT 0xCBCBCBCBu
 
+// vitaGL sizes a texture VGL_ALIGN(w, 8) * h * tex_format_to_bytespp(format),
+// and that bpp comes from the GXM format the GL pair maps to -- not from a
+// guess at the GL enums. The loader keeps its own estimate for the budget, and
+// the two do not always agree: GL_RGBA4 with GL_UNSIGNED_BYTE is two bytes a
+// pixel here and four in the estimate. A fake that made everything four could
+// never show the difference, which is how a copy sized by the estimate went on
+// reading and writing past the end of this buffer.
+size_t fake_bpp(GLint internalformat, GLenum type) {
+  switch (type) {
+    case GL_UNSIGNED_SHORT_5_6_5:
+    case GL_UNSIGNED_SHORT_4_4_4_4:
+    case GL_UNSIGNED_SHORT_5_5_5_1:
+      return 2;
+    default:
+      break;
+  }
+  switch (internalformat) {
+    case GL_RGBA4:
+    case GL_RGB5_A1:
+    case GL_LUMINANCE_ALPHA:
+      return 2;
+    case GL_ALPHA:
+    case GL_LUMINANCE:
+      return 1;
+    case GL_RGB:
+      return 3;
+    default:
+      return 4;
+  }
+}
+
 static uint32_t fingerprint(const void *data, size_t size) {
   if (!data || size < 4)
     return PLACEHOLDER_CONTENT;
@@ -148,7 +179,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
                   GLint border, GLenum format, GLenum type, const GLvoid *data) {
   assert(fake_slot_alive[fake_bound]);
   if (fake_reject_next_upload) { fake_reject_next_upload = 0; set_slot(fake_bound, 0, 0); return; }
-  size_t face = (size_t)((width + 7) & ~7) * height * 4;
+  size_t face = (size_t)((width + 7) & ~7) * height * fake_bpp(internalFormat, type);
   // A cube map is six faces in one allocation behind a single name, and it is
   // reachable through vglGetTexDataPointer just like a flat texture is. Getting
   // this right is what makes a cache that mistakes one for a 2D texture fail.
@@ -181,7 +212,13 @@ void *vglGetTexDataPointer(GLenum target) {
   if (!fake_slot_bytes[fake_bound])
     return NULL;
   if (!fake_slot_data[fake_bound]) {
-    fake_slot_data[fake_bound] = malloc(fake_slot_bytes[fake_bound]);
+    // A guard past the end, so that anything copying by a size other than the
+    // one this buffer was made with is caught rather than quietly scribbling
+    // on the next allocation the way it would on the console.
+    fake_slot_data[fake_bound] = malloc(fake_slot_bytes[fake_bound] + FAKE_CANARY);
+    if (fake_slot_data[fake_bound])
+      memset((char *)fake_slot_data[fake_bound] + fake_slot_bytes[fake_bound],
+             FAKE_CANARY_BYTE, FAKE_CANARY);
     // Fill with the slot's content marker so a round trip through the cache is
     // checkable: what comes back must be what went in.
     if (fake_slot_data[fake_bound]) {
@@ -193,10 +230,36 @@ void *vglGetTexDataPointer(GLenum target) {
   return fake_slot_data[fake_bound];
 }
 
+// What the driver really allocated for that pointer, which is the number the
+// cache now copies by rather than its own estimate. Looked up by address, the
+// way vitaGL's own does it, so a pointer from anywhere else answers zero.
+size_t vglMallocUsableSize(void *ptr) {
+  if (!ptr)
+    return 0;
+  for (int i = 0; i < FAKE_SLOTS; i++)
+    if (fake_slot_data[i] == ptr)
+      return fake_slot_bytes[i];
+  return 0;
+}
+
 // Mirrors the real one, including the trap: VGL_MEM_ALL is the enum terminator
 // and asking for it reports no memory at all rather than the total.
 size_t vglMemFree(vglMemType type) {
   if (type >= VGL_MEM_ALL)
     return 0;
   return (int)type < FAKE_POOLS ? fake_pool_free[type] : 0;
+}
+
+// Every texture buffer still has its guard bytes untouched. Returns the name of
+// the first one that does not, or 0 if all of them are intact.
+GLuint fake_first_overrun(void) {
+  for (GLuint id = 0; id < FAKE_SLOTS; id++) {
+    if (!fake_slot_data[id] || !fake_slot_bytes[id])
+      continue;
+    const unsigned char *guard = (const unsigned char *)fake_slot_data[id] + fake_slot_bytes[id];
+    for (int i = 0; i < FAKE_CANARY; i++)
+      if (guard[i] != FAKE_CANARY_BYTE)
+        return id ? id : 1;
+  }
+  return 0;
 }

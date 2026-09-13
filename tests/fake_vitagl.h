@@ -11,6 +11,9 @@
 #include <vitaGL.h>
 
 #define FAKE_SLOTS 16384
+// Guard bytes written past the end of every texture buffer.
+#define FAKE_CANARY 32
+#define FAKE_CANARY_BYTE 0x5a
 
 // What the driver actually holds for each texture name, as opposed to what the
 // cache believes. slot_content is a fingerprint of the pixels, so a test can
@@ -18,6 +21,16 @@
 // happens to be bound.
 extern size_t fake_slot_bytes[FAKE_SLOTS];
 extern void *fake_slot_data[FAKE_SLOTS];
+
+// The real allocation behind a vglGetTexDataPointer result.
+size_t vglMallocUsableSize(void *ptr);
+
+// How vitaGL itself sizes a pixel, which is not always what the loader's budget
+// estimate says.
+size_t fake_bpp(GLint internalformat, GLenum type);
+
+// 0 if every texture buffer's guard bytes are intact, else an overrun name.
+GLuint fake_first_overrun(void);
 extern uint32_t fake_slot_content[FAKE_SLOTS];
 extern int fake_slot_alive[FAKE_SLOTS];
 extern GLuint fake_bound;

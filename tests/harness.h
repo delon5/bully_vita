@@ -45,7 +45,29 @@ static void tex_reupload(GLuint id, uint32_t tag, GLsizei width, GLsizei height,
                              0, size, source_bytes);
 }
 
+// An uncompressed upload whose format makes the loader's budget estimate and
+// vitaGL's real allocation disagree: the estimate keys off the type first and
+// falls through to four bytes a pixel for GL_RGBA4 with GL_UNSIGNED_BYTE, where
+// the driver allocates two. Anything sized by the estimate reads and writes
+// twice the buffer.
+static GLuint tex_upload_narrow(uint32_t tag, GLsizei width, GLsizei height) {
+  GLuint id;
+  glGenTexturesHook(1, &id);
+  glBindTextureHook(GL_TEXTURE_2D, id);
+  fill_source(tag, (GLsizei)((size_t)width * height * 4));
+  glTexImage2DHook(GL_TEXTURE_2D, 0, GL_RGBA4, width, height, 0, GL_RGBA,
+                   GL_UNSIGNED_BYTE, source_bytes);
+  return id;
+}
+
 unsigned fake_store_files(void);
+
+// Cuts one stored texture short, as losing power mid-write does.
+int fake_tear_one_store_file(long keep_bytes);
+
+// Rewrites one 32-bit word of a stored texture's header.
+int fake_scramble_store_word(int word_index);
+const char *fake_last_scrambled_path(void);
 extern size_t fake_heap_used;
 unsigned fake_store_writes(void);
 

@@ -392,6 +392,200 @@ int main(void) {
            "reclaiming blocked for long enough has to escalate, not wait forever");
   }
 
+  // A file the console never finished writing must not be indexed as a good
+  // copy. If it is, the next eviction of that texture is told the store already
+  // holds it, frees the pixels without writing, and the restore then has
+  // nothing to read: the texture is lost for the session, and the store goes on
+  // lying about it in every run after this one.
+  {
+    const size_t over = ((size_t)TEXTURE_BUDGET_MB + TEXTURE_RAM_CACHE_MB + 96) * MB;
+    const int count = (int)(over / TEX_BYTES);
+
+    harness_start_empty(192 * MB);
+    for (int i = 0; i < count; i++) {
+      tex_upload(0x7C000000u + (unsigned)i, 512, 512, TEX_BYTES);
+      drain();
+      texture_cache_tick();
+    }
+    frames(TEXTURE_IDLE_FRAMES * 8);
+    unsigned written = fake_store_files();
+    assert(written > 1 && "this block needs a store to damage");
+
+    assert(fake_tear_one_store_file((long)sizeof(BackupRecord)) &&
+           "the harness had a file to tear");
+    fake_reset(192 * MB);
+    texture_cache_init();
+    assert(store_files == written - 1 &&
+           "a file with a header and no data was counted as a usable copy");
+    printf("torn file    : %u of %u indexed, the truncated one skipped  OK\n",
+           store_files, written);
+  }
+
+  // The loader's own size estimate must never be what a copy is measured by.
+  //
+  // resident_size guesses from the GL enums and rounds rows by a rule of thumb.
+  // It says so where it is defined -- close enough for the budget, not meant to
+  // match vitaGL to the byte -- and for GL_RGBA4 with GL_UNSIGNED_BYTE it comes
+  // out at four bytes a pixel where the driver allocated two. Evicting one of
+  // those read twice the buffer out of vitaGL's pool, and restoring it wrote
+  // twice the buffer back in, over whatever was next.
+  {
+    harness_start_empty(192 * MB);
+    const int count = 260;
+    GLuint ids[260];
+    for (int i = 0; i < count; i++) {
+      ids[i] = tex_upload_narrow(0x5E000000u + (unsigned)i, 512, 512);
+      drain();
+      texture_cache_tick();
+    }
+    frames(TEXTURE_IDLE_FRAMES * 8);
+
+    unsigned evicted = 0;
+    for (int i = 0; i < count; i++)
+      if (textures[ids[i]].evicted)
+        evicted++;
+    assert(evicted > 0 && "nothing was evicted, so nothing was copied");
+    assert(!fake_first_overrun() && "eviction read or wrote past a texture buffer");
+
+    int checked = 0;
+    for (int i = 0; i < count && checked < 16; i++) {
+      if (!textures[ids[i]].evicted)
+        continue;
+      glBindTextureHook(GL_TEXTURE_2D, ids[i]);
+      assert(fake_sampled(ids[i]) == fake_fingerprint_of(0x5E000000u + (unsigned)i) &&
+             "a narrow-format texture must come back as itself");
+      checked++;
+      texture_cache_tick();
+    }
+    assert(checked > 0);
+    assert(!fake_first_overrun() && "restoring wrote past a texture buffer");
+    printf("narrow fmt   : %u evicted, %d restored, no buffer overrun  OK\n",
+           evicted, checked);
+  }
+
+  // A file that belongs to a different texture must never be drawn as this one.
+  //
+  // The store is keyed by a hash of a sample of the pixels, so two textures can
+  // in principle land on the same name -- and not only by chance: two that
+  // differ solely in the gaps between sampled slices collide every time. The
+  // record used to guard against that by carrying the key back and comparing
+  // it, which is circular, since the file was found by that key. The verify
+  // hash is the real guard: written only inside the record, over bytes the key
+  // never reads. Scrambling it here is exactly what a colliding texture's file
+  // looks like -- right name, right length, its own valid checksum, wrong
+  // texture.
+  {
+    harness_start_empty(192 * MB);
+    const size_t over = ((size_t)TEXTURE_BUDGET_MB + TEXTURE_RAM_CACHE_MB + 96) * MB;
+    const int count = (int)(over / TEX_BYTES);
+    GLuint ids[1536];
+    assert(count <= (int)(sizeof(ids) / sizeof(ids[0])));
+
+    for (int i = 0; i < count; i++) {
+      ids[i] = tex_upload(0x33000000u + (unsigned)i, 512, 512, TEX_BYTES);
+      drain();
+      texture_cache_tick();
+    }
+    frames(TEXTURE_IDLE_FRAMES * 8);
+    assert(fake_store_files() > 0 && "this block needs a file on the card");
+
+    // Word 3 is verify_lo: magic, key_lo, key_hi, then verify_lo.
+    assert(fake_scramble_store_word(3) && "the harness had a file to scramble");
+
+    // Start again so the store is read fresh, then find the texture that file
+    // belongs to and ask for it back.
+    fake_reset(192 * MB);
+    texture_cache_init();
+    for (int i = 0; i < count; i++) {
+      ids[i] = tex_upload(0x33000000u + (unsigned)i, 512, 512, TEX_BYTES);
+      drain();
+      texture_cache_tick();
+    }
+    frames(TEXTURE_IDLE_FRAMES * 8);
+
+    uint32_t refused_before = restore_failed_count;
+    int wrong = 0, looked = 0;
+    for (int i = 0; i < count; i++) {
+      if (!textures[ids[i]].evicted)
+        continue;
+      glBindTextureHook(GL_TEXTURE_2D, ids[i]);
+      uint32_t got = fake_sampled(ids[i]);
+      looked++;
+      // Either the right texture, or a refusal. Never another texture's pixels.
+      for (int j = 0; j < count; j++)
+        if (j != i && got == fake_fingerprint_of(0x33000000u + (unsigned)j))
+          wrong++;
+      texture_cache_tick();
+    }
+    assert(looked > 0 && "nothing was evicted, so nothing was checked");
+    assert(wrong == 0 && "a texture was restored as a different texture");
+
+    // The scrambled one is only refused if the verify hash is actually
+    // compared. Nothing else in the record would notice: the name, the length
+    // and the checksum over the data are all still correct, which is precisely
+    // the position a colliding texture's file leaves us in. Every other file
+    // here is sound, so a refusal in this pass is that one and nothing else.
+    assert(restore_failed_count > refused_before &&
+           "the mismatched file was accepted rather than refused");
+    // And refusing it has to take it off the card. Left there, every future
+    // eviction of that texture is told the store already holds it, frees the
+    // pixels without writing, and finds nothing to read -- for the rest of this
+    // session and every session after it.
+    assert(access(fake_last_scrambled_path(), F_OK) != 0 &&
+           "the file that would not read back is still on the card");
+    // Off the card and out of the index, which are two separate things. An
+    // index still claiming a file that is gone is the same trap by another
+    // route: store_has says yes, the eviction frees the pixels without writing,
+    // and the restore opens nothing.
+    assert(store_files == fake_store_files() &&
+           "the index claims files the card does not have");
+    printf("wrong file   : %d restores checked, %d drawn as another texture, "
+           "%u refused  OK\n", looked, wrong, restore_failed_count - refused_before);
+  }
+
+  // What the key and the verify hash have to be, before any of the machinery
+  // above can mean anything.
+  {
+    harness_start_empty(192 * MB);
+    const GLsizei size = 64 * 1024;
+
+    // Two different textures must not share either hash.
+    GLuint a = tex_upload(0x11111111u, 128, 128, size);
+    GLuint b = tex_upload(0x22222222u, 128, 128, size);
+    assert(textures[a].key != textures[b].key && "different pixels, different key");
+    assert(textures[a].verify != textures[b].verify &&
+           "the verify hash does not vary, so it can refuse nothing");
+
+    // And the verify hash has to look where the key does not. The key reads the
+    // first and last 8 KB in full and a 128-byte slice every 8 KB in between;
+    // two textures differing only in the gaps between those slices collide
+    // every time, not once in a billion. Build exactly that pair: identical
+    // everywhere the key looks, different at a byte only the verify hash's
+    // midpoint slices reach.
+    memset(source_bytes, 0x5A, size);
+    GLuint c;
+    glGenTexturesHook(1, &c);
+    glBindTextureHook(GL_TEXTURE_2D, c);
+    glCompressedTexImage2DHook(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+                               128, 128, 0, size, source_bytes);
+
+    // 12288 is 8 KB + half a stride: past the leading block, past the key's
+    // first slice, and precisely where the verify hash starts sampling.
+    source_bytes[12288] = 0x5B;
+    GLuint d;
+    glGenTexturesHook(1, &d);
+    glBindTextureHook(GL_TEXTURE_2D, d);
+    glCompressedTexImage2DHook(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+                               128, 128, 0, size, source_bytes);
+
+    assert(textures[c].key == textures[d].key &&
+           "the pair was meant to collide on the key; the sampling must have moved");
+    assert(textures[c].verify != textures[d].verify &&
+           "the verify hash reads the same bytes as the key, so it adds nothing");
+    printf("hashes       : distinct textures differ; a key collision is caught "
+           "by verify  OK\n");
+  }
+
   printf("PASS\n");
   return 0;
 }

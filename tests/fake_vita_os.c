@@ -77,6 +77,73 @@ unsigned fake_store_files(void) {
   return n;
 }
 
+// Cuts a stored texture short, the way losing power partway through a write
+// does: the header survives and some of the data does not. Returns 0 if there
+// was nothing to truncate.
+int fake_tear_one_store_file(long keep_bytes) {
+  const char *base = getenv("TEXCACHE_DIR");
+  char cmd[512];
+  snprintf(cmd, sizeof(cmd), "find '%s' -name '*.tex' 2>/dev/null | head -1",
+           base ? base : ".");
+  FILE *p = popen(cmd, "r");
+  char path[512] = {0};
+  if (p) {
+    if (!fgets(path, sizeof(path), p))
+      path[0] = 0;
+    pclose(p);
+  }
+  char *nl = strchr(path, '\n');
+  if (nl)
+    *nl = 0;
+  if (!path[0])
+    return 0;
+  return truncate(path, (off_t)keep_bytes) == 0;
+}
+
+// Rewrites one stored texture's verify field, which is what a file left by a
+// different texture whose key collided with this one looks like: right name,
+// right length, right checksum over its own data, wrong texture. word_index is
+// in 32-bit words from the start of the header.
+static char scrambled_path[512];
+// The file fake_scramble_store_word last touched, so a test can check whether
+// the cache threw it away.
+const char *fake_last_scrambled_path(void) { return scrambled_path; }
+
+int fake_scramble_store_word(int word_index) {
+  const char *base = getenv("TEXCACHE_DIR");
+  char cmd[512];
+  snprintf(cmd, sizeof(cmd), "find '%s' -name '*.tex' 2>/dev/null | head -1",
+           base ? base : ".");
+  FILE *p = popen(cmd, "r");
+  char path[512] = {0};
+  if (p) {
+    if (!fgets(path, sizeof(path), p))
+      path[0] = 0;
+    pclose(p);
+  }
+  char *nl = strchr(path, '\n');
+  if (nl)
+    *nl = 0;
+  if (!path[0])
+    return 0;
+  FILE *f = fopen(path, "r+b");
+  if (!f)
+    return 0;
+  uint32_t word = 0;
+  fseek(f, (long)word_index * 4, SEEK_SET);
+  if (fread(&word, sizeof(word), 1, f) != 1) {
+    fclose(f);
+    return 0;
+  }
+  word ^= 0xA5A5A5A5u;
+  fseek(f, (long)word_index * 4, SEEK_SET);
+  int ok = fwrite(&word, sizeof(word), 1, f) == 1;
+  fclose(f);
+  if (ok)
+    snprintf(scrambled_path, sizeof(scrambled_path), "%s", path);
+  return ok;
+}
+
 SceUID sceIoOpen(const char *file, int flags, SceMode mode) {
   int f = 0;
   if ((flags & SCE_O_RDWR) == SCE_O_RDWR) f |= O_RDWR;
@@ -113,13 +180,18 @@ int sceIoRmdir(const char *dir) { return rmdir(host_path(dir)); }
 // Directory listing, used by the store's purge. SceUID is an int and DIR* is a
 // pointer, so the handles live in a small table rather than being cast.
 static DIR *open_dirs[16];
+// Kept alongside, because filling in a dirent's size needs the path it came
+// from and readdir only hands back the name.
+static char open_dir_paths[16][1024];
 SceUID sceIoDopen(const char *dirname) {
-  DIR *d = opendir(host_path(dirname));
+  const char *resolved = host_path(dirname);
+  DIR *d = opendir(resolved);
   if (!d)
     return -1;
   for (int i = 0; i < 16; i++) {
     if (!open_dirs[i]) {
       open_dirs[i] = d;
+      snprintf(open_dir_paths[i], sizeof(open_dir_paths[i]), "%s", resolved);
       return i;
     }
   }
@@ -133,6 +205,15 @@ int sceIoDread(SceUID fd, SceIoDirent *dir) {
   if (!e)
     return 0;
   snprintf(dir->d_name, sizeof(dir->d_name), "%s", e->d_name);
+  // The real sceIoDread fills d_stat from the same directory read, which is
+  // what lets the store scan judge a file's length without opening it. Leaving
+  // it zeroed here made every file look empty, and the scan discarded a store
+  // that was perfectly good.
+  struct stat st;
+  char full[1024];
+  snprintf(full, sizeof(full), "%s/%s", open_dir_paths[fd], e->d_name);
+  if (stat(full, &st) == 0)
+    dir->d_stat.st_size = (SceOff)st.st_size;
   return 1;
 }
 int sceIoDclose(SceUID fd) {

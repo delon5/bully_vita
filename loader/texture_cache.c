@@ -64,6 +64,11 @@
 typedef struct {
   uint32_t magic;
   uint32_t key_lo, key_hi; // the content key, split so the struct has no padding
+  // A second hash of the same texture, over bytes the key does not look at.
+  // The file is found by key, so comparing the key back is circular -- it
+  // matches by construction. This does not appear in the filename, so it is
+  // the only thing here that can actually catch the wrong file.
+  uint32_t verify_lo, verify_hi;
   uint32_t bytes;          // texture data following this header
   uint32_t checksum;
 } BackupRecord;
@@ -87,6 +92,10 @@ typedef struct {
   // asset gets the same key in every run and a store file written last session
   // is still the right file for it today.
   uint64_t key;
+  // Folded from the same uploads as key, but seeded differently and sampling
+  // the gaps the key steps over. Two textures have to agree on both, over
+  // disjoint parts of themselves, before one can be restored as the other.
+  uint64_t verify;
   uint32_t backup_bytes; // bytes of texture data saved when it was evicted
   uint8_t *ram_copy; // the saved bytes, when they fit in the heap rather than on the card
   int32_t internalformat, format, type;
@@ -373,12 +382,23 @@ static uint64_t key_fold(uint64_t h, uint32_t value) {
 // render thread while an area is loading and that is the one place a stutter
 // shows. The ends in full and a slice every few KB through the middle covers
 // what actually differs between two textures; the exact size, dimensions and
-// format are folded in alongside, so two assets would have to agree on all of
-// that and on every sampled slice to collide. The record carries the key back
-// and a restore checks it, so a collision would be caught rather than drawn.
+// format are folded in alongside.
+//
+// A sample can still be fooled, and not only by chance: two textures that
+// differ solely in the gaps between slices collide every single time, not once
+// in a billion. Checking the key back out of the record does not help -- the
+// file was found by that key, so it matches by construction, and a note here
+// used to claim that circular check would catch a collision.
+//
+// So every texture gets a second hash as well, seeded differently and sampling
+// the midpoints between the key's slices: disjoint bytes, and the record is the
+// only place it is written. A file reached by a colliding key carries the other
+// texture's verify hash, the restore refuses it, and the texture is re-uploaded
+// rather than drawn as something else.
 #define KEY_ENDS_BYTES 8192
 #define KEY_STRIDE 8192
 #define KEY_SLICE 128
+#define VERIFY_SEED 0x9ae16a3b2f90404full
 
 static uint64_t key_words(uint64_t h, const uint8_t *bytes, uint32_t n) {
   uint32_t i = 0;
@@ -392,7 +412,11 @@ static uint64_t key_words(uint64_t h, const uint8_t *bytes, uint32_t n) {
   return h;
 }
 
-static uint64_t key_sample(uint64_t h, const void *data, uint32_t size) {
+// first_slice is where the run of slices through the middle begins. The key
+// starts them at the end of the leading block; the verify hash starts them half
+// a stride later, so the two look at bytes the other never reads.
+static uint64_t key_sample_from(uint64_t h, const void *data, uint32_t size,
+                                uint32_t first_slice) {
   const uint8_t *bytes = data;
   h = key_fold(h, size);
   if (size <= 2 * KEY_ENDS_BYTES) {
@@ -402,9 +426,17 @@ static uint64_t key_sample(uint64_t h, const void *data, uint32_t size) {
 
   key_bytes_hashed += 2 * KEY_ENDS_BYTES + (size / KEY_STRIDE) * KEY_SLICE;
   h = key_words(h, bytes, KEY_ENDS_BYTES);
-  for (uint32_t at = KEY_ENDS_BYTES; at + KEY_SLICE <= size - KEY_ENDS_BYTES; at += KEY_STRIDE)
+  for (uint32_t at = first_slice; at + KEY_SLICE <= size - KEY_ENDS_BYTES; at += KEY_STRIDE)
     h = key_words(h, bytes + at, KEY_SLICE);
   return key_words(h, bytes + size - KEY_ENDS_BYTES, KEY_ENDS_BYTES);
+}
+
+static uint64_t key_sample(uint64_t h, const void *data, uint32_t size) {
+  return key_sample_from(h, data, size, KEY_ENDS_BYTES);
+}
+
+static uint64_t verify_sample(uint64_t h, const void *data, uint32_t size) {
+  return key_sample_from(h, data, size, KEY_ENDS_BYTES + KEY_STRIDE / 2);
 }
 
 /*
@@ -448,6 +480,31 @@ static int store_has(uint64_t key, uint32_t bytes) {
       return e->bytes == bytes;
   }
   return 0;
+}
+
+// Takes a file back out of the index, for one that turned out not to be
+// readable. The texture is unbacked for now, but level 0 arriving again
+// recomputes that, and the eviction after it writes a fresh file instead of
+// trusting the corpse for the rest of the session.
+static void store_forget(uint64_t key) {
+  if (!key)
+    return;
+  uint32_t i = store_slot(key);
+  for (uint32_t probe = 0; probe < 32; probe++) {
+    StoreEntry *e = &store_index[(i + probe) & STORE_MASK];
+    if (!e->key)
+      return;
+    if (e->key == key) {
+      store_bytes -= e->bytes < store_bytes ? e->bytes : store_bytes;
+      store_files -= store_files ? 1 : 0;
+      // Not cleared: the probe chain runs through this slot, and emptying it
+      // would hide every entry stored past it. A zero size matches no lookup,
+      // since store_has compares the size too, and store_add reuses the slot
+      // for this key when the file is written again.
+      e->bytes = 0;
+      return;
+    }
+  }
 }
 
 static void store_add(uint64_t key, uint32_t bytes) {
@@ -586,8 +643,31 @@ static void scan_store(void) {
       char tail = 0;
       int fields = sscanf(entry.d_name, "%8x%8x_%8x.tex%c", &hi, &lo, &bytes, &tail);
       uint64_t key = ((uint64_t)hi << 32) | lo;
+      // A file has to be longer than its own header and no longer than a
+      // restore could read back, or it was torn -- the console lost power
+      // partway through the write and what is on the card is a header and
+      // some of a texture. Indexing one of those is worse than not having it:
+      // the next eviction of that texture sees the store already holds it,
+      // frees the pixels without writing, and the restore then fails.
+      //
+      // Only bounds, not an exact length. The name carries the size estimate
+      // the writer chose before binding the texture; the record carries what
+      // vitaGL really allocated, and the two are not the same number. The
+      // exact check belongs where both are known, which is the read at
+      // restore -- and a file of the right length but wrong inside is caught
+      // there too, by the checksum.
+      SceOff floor_size = (SceOff)sizeof(BackupRecord);
+      SceOff ceil_size = floor_size + (SceOff)TEXTURE_BACKUP_MAX_KB * 1024;
       int usable = fields == 3 && key && bytes >= TEXTURE_BACKUP_MIN_BYTES &&
                    bytes <= (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024 &&
+                   // Only judged when a size is actually reported. A platform
+                   // that leaves this zero would otherwise have its entire
+                   // store discarded on the first boot, which is far worse than
+                   // keeping a torn file -- and a torn one is caught anyway
+                   // when the read at restore comes up short.
+                   (entry.d_stat.st_size <= 0 ||
+                    (entry.d_stat.st_size > floor_size &&
+                     entry.d_stat.st_size <= ceil_size)) &&
                    store_bytes + bytes <= cap && !store_has(key, bytes);
       if (usable) {
         store_add(key, bytes);
@@ -781,6 +861,10 @@ static int backup_stage(TextureInfo *info, GLuint id, GLint level, GLsizei width
                                            (uint32_t)format),
                                   (uint32_t)type),
                          (uint32_t)compressed);
+    info->verify = key_fold(key_fold(key_fold(key_fold(VERIFY_SEED, (uint32_t)internalformat),
+                                              (uint32_t)format),
+                                     (uint32_t)type),
+                            (uint32_t)compressed);
   } else if (info->levels != (uint8_t)level) {
     // Levels have to arrive in order and exactly once: restoring walks them
     // from zero, and a gap or a repeat would rebuild a different texture.
@@ -793,6 +877,8 @@ static int backup_stage(TextureInfo *info, GLuint id, GLint level, GLsizei width
   info->levels++;
   info->key = key_sample(key_fold(key_fold(info->key, (uint32_t)width), (uint32_t)height),
                          data, size);
+  info->verify = verify_sample(
+      key_fold(key_fold(info->verify, (uint32_t)width), (uint32_t)height), data, size);
   return 1;
 }
 
@@ -858,15 +944,28 @@ static int backup_capture(TextureInfo *info, GLuint id) {
   if (!pixels)
     return 0;
 
+  // How many bytes there actually are, asked of the allocator that made them.
+  //
+  // resident_size is an estimate -- bytes_per_pixel guesses from the format and
+  // the rows are rounded by a rule of thumb -- and it says so where it is
+  // defined: close enough to drive the budget, not meant to match vitaGL to the
+  // byte. Every use below is a memcpy or a write of exactly this many bytes out
+  // of vitaGL's buffer. Too high and it reads past the end of the allocation;
+  // GL_RGBA4 is one where the estimate and vitaGL's own tex_format_to_bytespp
+  // disagree. The estimate stays where it belongs, on the budget.
+  uint32_t real_bytes = (uint32_t)vglMallocUsableSize((void *)pixels);
+  if (!real_bytes || real_bytes > (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
+    return 0; // nothing to save, or more than a restore could ever read back
+
   if (!to_card) {
     // malloc failing is the heap telling us it has no more to give, whatever
     // our own ceiling says. Fall through to the card rather than insisting.
-    uint8_t *copy = malloc(info->resident_size);
+    uint8_t *copy = malloc(real_bytes);
     if (copy) {
-      memcpy(copy, pixels, info->resident_size);
+      memcpy(copy, pixels, real_bytes);
       info->ram_copy = copy;
-      info->backup_bytes = info->resident_size;
-      ram_cache_bytes += info->resident_size;
+      info->backup_bytes = real_bytes;
+      ram_cache_bytes += real_bytes;
       ram_evicted_count++;
       return 1;
     }
@@ -883,20 +982,22 @@ static int backup_capture(TextureInfo *info, GLuint id) {
   record.magic = BACKUP_MAGIC;
   record.key_lo = (uint32_t)info->key;
   record.key_hi = (uint32_t)(info->key >> 32);
-  record.bytes = info->resident_size;
-  record.checksum = checksum(pixels, info->resident_size);
+  record.verify_lo = (uint32_t)info->verify;
+  record.verify_hi = (uint32_t)(info->verify >> 32);
+  record.bytes = real_bytes;
+  record.checksum = checksum(pixels, real_bytes);
 
   SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
   if (fd < 0)
     return -1;
   int ok = sceIoWrite(fd, &record, sizeof(record)) == (int)sizeof(record) &&
-           sceIoWrite(fd, pixels, info->resident_size) == (int)info->resident_size;
+           sceIoWrite(fd, pixels, real_bytes) == (int)real_bytes;
   sceIoClose(fd);
   if (!ok) {
     sceIoRemove(path); // a short write must not be mistaken for a usable copy
     return -1;
   }
-  info->backup_bytes = info->resident_size;
+  info->backup_bytes = real_bytes;
   store_add(info->key, info->resident_size);
   card_evicted_count++;
   return 1;
@@ -931,7 +1032,9 @@ static int restore_texture(GLuint id) {
   uint32_t saved_bytes = info->backup_bytes;
   if (!saved) {
     char path[160];
-    texture_path(path, sizeof(path), info->key, info->backup_bytes);
+    // resident_size, not backup_bytes: this has to rebuild the same name
+    // backup_capture wrote, and that one is chosen before the texture is bound.
+    texture_path(path, sizeof(path), info->key, info->resident_size);
     if (!restore_scratch) {
       restore_scratch = malloc((size_t)TEXTURE_BACKUP_MAX_KB * 1024);
       if (!restore_scratch)
@@ -948,24 +1051,36 @@ static int restore_texture(GLuint id) {
     memset(&record, 0, sizeof(record));
     int header = sceIoRead(fd, &record, sizeof(record));
     int got = 0;
-    // The key as well as the size, because a file reached across a restart is
-    // only the right file if it is for this texture. Everything else here
-    // guards against a torn or truncated write; this guards against the wrong
-    // texture being drawn, which is the failure that would not announce itself.
+    // The verify hash is the one that means anything. The file was found by
+    // key, so comparing the key back matches by construction and catches
+    // nothing; the verify hash is written only inside the record, over bytes
+    // the key never reads, so a file left by a colliding texture fails here
+    // instead of being drawn as this one. The key is still checked, because a
+    // file whose name and contents disagree is corrupt whatever else is true.
     uint64_t stored_key = ((uint64_t)record.key_hi << 32) | record.key_lo;
+    uint64_t stored_verify = ((uint64_t)record.verify_hi << 32) | record.verify_lo;
     if (header == (int)sizeof(record) && record.magic == BACKUP_MAGIC &&
-        stored_key == info->key && record.bytes == info->backup_bytes &&
+        stored_key == info->key && stored_verify == info->verify &&
         record.bytes <= (uint32_t)TEXTURE_BACKUP_MAX_KB * 1024)
       got = sceIoRead(fd, restore_scratch, record.bytes);
     uint32_t t_read = upload_now_us();
     restore_read_us += t_read - t_opened; // opening is counted on its own above
     sceIoClose(fd);
-    if (got != (int)record.bytes)
+    int bad = got != (int)record.bytes;
+    if (!bad) {
+      bad = checksum(restore_scratch, record.bytes) != record.checksum;
+      restore_sum_us += upload_now_us() - t_read;
+    }
+    if (bad) {
+      // Torn, truncated, or left by a texture whose key collided with this
+      // one. Whichever it is, this file will never read back, and leaving it
+      // indexed means every future eviction of this texture is told the store
+      // already has it and frees the pixels without writing. Take it out, so
+      // the next one writes a good one.
+      sceIoRemove(path);
+      store_forget(info->key);
       return 0;
-    int bad = checksum(restore_scratch, record.bytes) != record.checksum;
-    restore_sum_us += upload_now_us() - t_read;
-    if (bad)
-      return 0;
+    }
     saved = restore_scratch;
     saved_bytes = record.bytes;
   }
@@ -995,6 +1110,15 @@ static int restore_texture(GLuint id) {
     // The caller marks this texture unbacked, so the copy will never be asked
     // for again. Give the heap back rather than holding it for nothing and
     // leaving ram_cache_bytes claiming it forever.
+    backup_release(info);
+    install_placeholder(id);
+    return 0;
+  }
+  // The buffer vitaGL has just handed back has to be the size the one we read
+  // out of was, or this copy runs off the end of it. They are allocated from
+  // the same request for the same shape, so a disagreement means the texture is
+  // not what was saved -- refuse rather than write past it.
+  if ((uint32_t)vglMallocUsableSize(pixels) != saved_bytes) {
     backup_release(info);
     install_placeholder(id);
     return 0;
